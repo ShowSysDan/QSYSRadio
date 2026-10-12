@@ -1,7 +1,7 @@
 --[[---------------------------------------------------------------------------
   Q-SYS Radio Automation :: Deck Controller
   File:     qsys/radio/radio.lua
-  Version:  0.2.0
+  Version:  0.3.0-dev
   Requires: Q-SYS Core (tested on Core 8 Flex, build 1-2603002), a Text
             Controller, two Audio Players and a 2-channel meter with Script
             Access enabled. Player A -> meter.1, Player B -> meter.2.
@@ -14,6 +14,15 @@
     silence / peak level, and never leaves dead air. The server (0.3) will
     override SETTINGS and supply "what's next"; everything here keeps working
     without it.
+
+  SERVER / PLAY LOG
+    Set CFG.SERVER_URL (e.g. "http://10.0.0.20:5410") and every event (track
+    and bumper start/end, transitions, unsupported files, dead-air guard) is
+    POSTed to /api/v1/events, where the server keeps a timestamped play log.
+    Events carry a boot id + sequence number and wait in an outbox
+    (media/_radio/outbox.json) until the server accepts them, so a server
+    outage or a script restart loses nothing; the server ignores repeats.
+    Playback never waits on the server.
 
   OPERATOR CONTROLS (optional)
     Either name controls on a Control Script component, or set the Text
@@ -31,13 +40,16 @@
     - Fades step gain every tick (50 ms), linear in dB.
 -----------------------------------------------------------------------------]]
 
-RADIO_VERSION = "0.2.0"
+RADIO_VERSION = "0.3.0-dev"
 
 CFG = {
   PLAYER_A  = "Audio_Player_01", METER_A = 1,
   PLAYER_B  = "Audio_Player_02", METER_B = 2,
   METER     = "PlayerOutput01",
   AUTOSTART = true,
+  SERVER_URL   = "",   -- app server, e.g. "http://10.0.0.20:5410"; "" = no server
+  SERVER_TOKEN = "",   -- must match RADIO_API_TOKEN in the server's .env (if set)
+  STATION_ID   = "",   -- name in the play log; "" = the design name
 }
 
 -- Defaults. The server will push overrides in 0.3; these keep the Core alive alone.
@@ -62,6 +74,11 @@ SETTINGS = {
   learned_path           = "media/_radio/learned.json",
   heartbeat_s            = 30,
   log_ring               = 200,
+  post_interval_s        = 2,      -- how often queued events are sent to the server
+  post_batch             = 100,    -- events per POST
+  post_timeout_s         = 5,
+  outbox_max             = 5000,   -- events kept while the server is unreachable (oldest dropped)
+  outbox_path            = "media/_radio/outbox.json",
 }
 
 SUPPORTED_EXT = { flac = true, mp3 = true, wav = true, aac = true, m4a = true, ogg = true, aif = true, aiff = true }
@@ -100,17 +117,22 @@ local function log(fmt, ...)
   if #LOG > SETTINGS.log_ring then table.remove(LOG, 1) end
 end
 
-EVENTS = {}          -- for the server (0.3): { t = utc, kind = ..., ... }
+EVENTS = {}          -- last 500 events: { boot, seq, t = utc, at, kind = ..., ... }
+BOOT_ID, EVENT_SEQ = "-", 0
+local META = { kind = true, t = true, at = true, boot = true, seq = true }
 local function emit(kind, data)
   data = data or {}
   data.kind = kind
   data.t = utc()
   data.at = round(now(), 2)      -- Core clock (Timer.Now), for ordering within a second
+  EVENT_SEQ = EVENT_SEQ + 1
+  data.boot, data.seq = BOOT_ID, EVENT_SEQ   -- unique per event; the server dedupes on it
   EVENTS[#EVENTS + 1] = data
   if #EVENTS > 500 then table.remove(EVENTS, 1) end
+  if Server then Server.queue(data) end
   local parts = {}
   for k, v in pairs(data) do
-    if k ~= "kind" and k ~= "t" and k ~= "at" then parts[#parts + 1] = k .. "=" .. tostring(v) end
+    if not META[k] then parts[#parts + 1] = k .. "=" .. tostring(v) end
   end
   table.sort(parts)
   log("%-14s %s", kind, table.concat(parts, "  "))
@@ -459,8 +481,9 @@ end
 function Station.finishTrack(d, reason)
   local tr = d.track
   if not tr then return end
+  local played = d.playStart and round(now() - d.playStart, 1) or nil
   if tr.kind ~= "music" then
-    emit("bumper_end", { deck = d.id, file = tr.name, reason = reason })
+    emit("bumper_end", { deck = d.id, file = tr.name, dir = tr.dir, reason = reason, played = played })
     return
   end
   local L = LEARNED[tr.key] or {}
@@ -475,7 +498,7 @@ function Station.finishTrack(d, reason)
   L.last_played = utc()
   LEARNED[tr.key] = L
   learnedSave()
-  emit("track_end", { deck = d.id, file = tr.name, reason = reason,
+  emit("track_end", { deck = d.id, file = tr.name, dir = tr.dir, reason = reason, played = played,
     lead_in = L.lead_in_s, trail = L.trail_s, peak = L.peak_dbfs })
 end
 
@@ -495,7 +518,7 @@ function Station.startTrack(deck, track, opts, attempt)
       LEARNED[track.key].status = tostring(err)
       learnedSave()
       Library.remove(track)
-      emit("file_unsupported", { file = track.name, status = tostring(err) })
+      emit("file_unsupported", { file = track.name, dir = track.dir, status = tostring(err) })
       if attempt < 5 then
         local nxt = (track.kind == "imaging") and Station.pickBumper() or Station.pickNext()
         if track.kind == "imaging" and not nxt then
@@ -516,11 +539,13 @@ function Station.startTrack(deck, track, opts, attempt)
       Station.live = d
       Station.other = (d == DeckA) and DeckB or DeckA
       Station.state = "playing"
-      emit("track_start", { deck = d.id, file = track.name, duration = round(d.duration or 0, 1) })
+      emit("track_start", { deck = d.id, file = track.name, dir = track.dir, artist = track.artist,
+        title = track.title, duration = round(d.duration or 0, 1) })
     else
       Station.bumperDeck = d
       Station.state = "bumper"
-      emit("bumper_start", { deck = d.id, file = track.name, duration = round(d.duration or 0, 1) })
+      emit("bumper_start", { deck = d.id, file = track.name, dir = track.dir, title = track.title,
+        duration = round(d.duration or 0, 1) })
     end
   end)
 end
@@ -564,11 +589,15 @@ function Station.onDeckEnded(d, reason)
     Station.state = "crossfading"
     Station.startTrack(Station.other, Station.pickNext(), {})
   elseif Station.state == "bumper" and d == Station.bumperDeck then
-    emit("bumper_end", { deck = d.id, reason = "eof" })
+    local tr = d.track
+    emit("bumper_end", { deck = d.id, file = tr and tr.name, dir = tr and tr.dir, reason = "eof",
+      played = d.playStart and round(now() - d.playStart, 1) or nil })
     d.track = nil
     Station.state = "crossfading"
     Station.startTrack(Station.freeDeck, Station.pickNext(), {})
   else
+    -- a bumper whose tail the next track already started under ends here
+    if d.track and d.track.kind == "imaging" then Station.finishTrack(d, "end") end
     d.track = nil
     emit("deck_idle", { deck = d.id })
   end
@@ -708,6 +737,95 @@ function UI.refresh(t)
 end
 
 -------------------------------------------------------------------------------
+-- SERVER (event outbox -> POST /api/v1/events). Never blocks playback.
+-------------------------------------------------------------------------------
+Server = { outbox = {}, inFlight = false, dirty = false, dropped = 0, failures = 0, nextTry = 0 }
+
+function Server.enabled() return type(CFG.SERVER_URL) == "string" and CFG.SERVER_URL ~= "" end
+
+function Server.queue(ev)
+  if not Server.enabled() then return end
+  local box = Server.outbox
+  box[#box + 1] = ev
+  if #box > SETTINGS.outbox_max then
+    table.remove(box, 1)
+    Server.dropped = Server.dropped + 1
+  end
+  Server.dirty = true
+end
+
+function Server.load()
+  if not (json and Server.enabled()) then return end
+  local ok, data = pcall(function()
+    local f = io.open(SETTINGS.outbox_path, "r")
+    if not f then return nil end
+    local s = f:read("*a")
+    f:close()
+    return json.decode(s)
+  end)
+  if ok and type(data) == "table" and #data > 0 then
+    Server.outbox = data
+    log("server: %d unsent events from the last run queued for replay", #data)
+  end
+end
+
+function Server.save()
+  if not (json and Server.dirty) then return end
+  Server.dirty = false
+  pcall(function() dir.create("media/_radio") end)
+  local ok, err = pcall(function()
+    local f = assert(io.open(SETTINGS.outbox_path, "w"))
+    f:write(json.encode(Server.outbox))
+    f:close()
+  end)
+  if not ok then log("! outbox save failed: %s", tostring(err)) end
+end
+
+function Server.tick()
+  if not Server.enabled() then return end
+  Server.save()
+  if Server.inFlight or #Server.outbox == 0 or now() < Server.nextTry then return end
+  if not (json and HttpClient) then return end
+  local batch = {}
+  for i = 1, math.min(SETTINGS.post_batch, #Server.outbox) do batch[i] = Server.outbox[i] end
+  local station = CFG.STATION_ID ~= "" and CFG.STATION_ID or STATION_NAME
+  local body = json.encode({ station = station, radio_version = RADIO_VERSION,
+    dropped = Server.dropped, events = batch })
+  local headers = { ["Content-Type"] = "application/json" }
+  if CFG.SERVER_TOKEN ~= "" then headers["X-Radio-Token"] = CFG.SERVER_TOKEN end
+  Server.inFlight = true
+  local ok, err = pcall(HttpClient.Upload, {
+    Url = CFG.SERVER_URL:gsub("/+$", "") .. "/api/v1/events",
+    Method = "POST", Data = body, Headers = headers, Timeout = SETTINGS.post_timeout_s,
+    EventHandler = function(_, code, data, httpErr)
+      Server.inFlight = false
+      if code and code >= 200 and code < 300 then
+        -- drop exactly the events that were sent (the head may have been trimmed meanwhile)
+        local sent = {}
+        for _, e in ipairs(batch) do sent[e] = true end
+        local keep = {}
+        for _, e in ipairs(Server.outbox) do if not sent[e] then keep[#keep + 1] = e end end
+        Server.outbox = keep
+        Server.dropped = 0
+        Server.dirty = true
+        if Server.failures > 0 then log("server: reachable again, sending backlog") end
+        Server.failures, Server.nextTry = 0, 0
+      else
+        Server.failures = Server.failures + 1
+        Server.nextTry = now() + math.min(60, SETTINGS.post_interval_s * 2 ^ math.min(Server.failures, 5))
+        if Server.failures == 1 or Server.failures % 20 == 0 then
+          log("! server: POST failed (%s %s); %d events queued", tostring(code), tostring(httpErr or ""), #Server.outbox)
+        end
+      end
+    end,
+  })
+  if not ok then
+    Server.inFlight = false
+    log("! server: HttpClient error: %s", tostring(err))
+  end
+end
+
+-------------------------------------------------------------------------------
 -- STARTUP
 -------------------------------------------------------------------------------
 local function boot()
@@ -731,7 +849,10 @@ local function boot()
   SETTINGS.music_dir = normDir(SETTINGS.music_dir)
   SETTINGS.imaging_dir = normDir(SETTINGS.imaging_dir)
   math.randomseed(os.time())
+  BOOT_ID = os.date("!%Y%m%dT%H%M%SZ") .. string.format("-%04x", math.random(0, 0xffff))
+  STATION_NAME = tostring(st.DesignName or "core")
   learnedLoad()
+  Server.load()
   Library.scan()
   UI.init()
 
@@ -745,6 +866,15 @@ local function boot()
   Heartbeat = Timer.New()
   Heartbeat.EventHandler = function() log("heartbeat: %s", Station.statusLine(now())) end
   Heartbeat:Start(SETTINGS.heartbeat_s)
+
+  Poster = Timer.New()
+  Poster.EventHandler = function()
+    local ok, err = pcall(Server.tick)
+    if not ok then Server.inFlight = false; log("! server tick error: %s", tostring(err)) end
+  end
+  Poster:Start(SETTINGS.post_interval_s)
+  emit("boot", { version = RADIO_VERSION, platform = tostring(st.Platform), design = STATION_NAME,
+    server = Server.enabled() and CFG.SERVER_URL or "-" })
 
   if CFG.AUTOSTART then
     Station.state = "crossfading"

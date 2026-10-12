@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **0.2.0** · see [CHANGELOG.md](CHANGELOG.md)
+Version **0.3.0-dev** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ learning, logging) and hosts the web UI.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **0.2.0** — standalone, passes the MockCore scenario, awaiting first run on the Core |
-| `qsys/test` — MockCore simulator | **0.2.0** — offline Core stand-in for the Lua state machine |
-| `server` — Flask API + scheduler + Postgres | install / update / migration scaffold in place (own `qsysradio` schema, `/api/v1/health`); API in 0.3 |
+| `qsys/radio` — deck controller | **0.3.0-dev** — standalone; posts every event to the server through a persistent outbox when `CFG.SERVER_URL` is set; awaiting first run on the Core |
+| `qsys/test` — MockCore simulator | **0.3.0-dev** — offline Core stand-in, with a fake HttpClient for server outages |
+| `server` — Flask API + scheduler + Postgres | **0.3.0-dev** — own `qsysradio` schema, migrate-on-start, event ingest + timestamped play log, play log API, remote syslog |
 | Web UI | not started (0.5) |
 
 ## Architecture
@@ -140,8 +140,9 @@ both decks; everything else hangs off it.
   `LastEvent` on a Control Script, or set the Text Controller to 3 inputs /
   6 outputs and they map by index in that order.
 
-`EVENTS` (ring of 500, each with UTC `t` and Core-clock `at`) and `LOG` are
-the data the 0.3 server will receive.
+Every event carries UTC `t`, Core-clock `at`, and a `boot` id + `seq`
+number that identify it uniquely. `EVENTS` keeps the last 500 in memory; with
+`CFG.SERVER_URL` set they also go to the server (see *Play log* below).
 
 ### Offline testing (MockCore)
 
@@ -152,7 +153,14 @@ plain Lua; the runner needs `pip install lupa`.
 
 ```
 python3 qsys/test/run_mock.py qsys/test/scenario_basic.lua
+python3 qsys/test/run_mock.py qsys/test/scenario_server.lua
 ```
+
+`scenario_server.lua` points the station at a fake server that times out and
+then returns 503 for 90 s, and checks that events queue, persist to
+`outbox.json`, and all arrive once the server is back. With
+`MOCK_EVENTS_OUT=/path.json` it also writes every POST body, which can be
+replayed into a real server for an end-to-end test.
 
 `scenario_basic.lua` plays 8 short tracks (one with a silent tail, one corrupt)
 and 2 bumpers for 260 simulated seconds, presses Skip at t=65, and asserts
@@ -247,6 +255,73 @@ unit itself changes (the changelog will say so).
 
 `python -m server.migrate --status` (from the venv) lists applied and pending
 migrations without changing anything.
+
+## Play log: what played when
+
+Every time something goes to air the server records it in
+`qsysradio.play_log`: one row per play with `started_at` / `ended_at`
+(timestamptz, from the Core's clock), `kind` (`music` / `imaging`), `file`,
+`directory`, `artist`, `title`, `deck`, `duration_s`, `played_s` and
+`end_reason` (`end`, `silence`, `cut`, `eof`, `core_restart`). During a
+crossfade two rows overlap, as on air. Every raw event (transitions,
+unsupported files, dead-air guard, boots) is kept in `qsysradio.core_events`.
+
+**How it gets there.** Set `CFG.SERVER_URL` (and `CFG.SERVER_TOKEN` if the
+server has `RADIO_API_TOKEN`) at the top of `radio.lua`. The Core POSTs
+events to `/api/v1/events` every 2 s. Unsent events wait in an outbox saved to
+`media/_radio/outbox.json` (up to 5000), so a server outage, network drop or
+script restart loses nothing; they are sent with their original times when
+the server is back. Each event has a unique boot id + sequence number, so a
+resend is ignored. Playback never waits on any of this.
+
+**Ask the API** (times without an offset are read in `TIMEZONE` from `.env`):
+
+```
+GET /api/v1/now                                  on air now + last 20 plays
+GET /api/v1/plays?from=2026-10-12&to=2026-10-13  plays in a range (default: last 24 h)
+GET /api/v1/plays?q=beatles&kind=music           search file / artist / title
+GET /api/v1/plays/at?t=2026-10-12T14:03          what was on air at that moment
+```
+
+**Or query the DB directly:**
+
+```sql
+SET TimeZone = 'America/New_York';
+-- everything that aired on a day
+SELECT started_at, ended_at, kind, artist, title, file, end_reason
+FROM qsysradio.play_log
+WHERE started_at >= '2026-10-12' AND started_at < '2026-10-13'
+ORDER BY started_at;
+
+-- what was on air at 2:03 pm
+SELECT * FROM qsysradio.play_log
+WHERE started_at <= '2026-10-12 14:03' AND ended_at > '2026-10-12 14:03';
+
+-- most played this month
+SELECT artist, title, count(*) FROM qsysradio.play_log
+WHERE kind = 'music' AND started_at >= date_trunc('month', now())
+GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 25;
+```
+
+## Syslog
+
+Set `SYSLOG_HOST` in `.env` and restart to send the server's log to your
+syslog server as well as journald: every play and end, unsupported files,
+dead-air guard, Core restarts, version mismatches, rejected POSTs and
+database errors. Options (all in `.env.example`): `SYSLOG_PORT` (514),
+`SYSLOG_PROTOCOL` (`udp` / `tcp`), `SYSLOG_FORMAT` (`rfc3164` / `rfc5424`),
+`SYSLOG_FACILITY` (`local0`), `SYSLOG_LEVEL` (`INFO`), `SYSLOG_APP_NAME`
+(`QSYSRadio`). The header carries the timestamp, hostname and app name so
+the collector can file it; the event's own time is in the message as `at=`
+(it differs when a backlog is replayed, which also adds `replayed=1`).
+
+```
+<134>Oct 12 19:40:21 radio-srv QSYSRadio[3066]: PLAY music "Bravo - Two" station=Main artist=Bravo deck=A dir=Test/Tuning/ duration=28 file=Bravo - Two.mp3 title=Two at=2026-10-12T23:40:21Z
+```
+
+Syslog is best effort (UDP can drop; a TCP collector going away loses the
+message in flight, then the server reconnects every 30 s). The database is the
+complete record.
 
 ## Versioning
 

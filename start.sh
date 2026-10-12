@@ -28,7 +28,7 @@ fi
 
 # ── Web server ───────────────────────────────────────────────────────────────
 PORT="$("${VENV}/bin/python" -m server.config APP_PORT 5410)"
-WORKERS="$("${VENV}/bin/python" -m server.config WEB_WORKERS 1)"
+WORKERS="$("${VENV}/bin/python" -m server.config WEB_WORKERS 4)"
 THREADS="$("${VENV}/bin/python" -m server.config WEB_THREADS 8)"
 echo "[qsysradio] $(cat VERSION) starting on port ${PORT} (${WORKERS}x${THREADS})"
 

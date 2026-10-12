@@ -18,6 +18,32 @@ versions follow [Semantic Versioning](https://semver.org/).
   `schema_migrations`, advisory-locked, one transaction per file);
   `0001_app_settings`.
 - `GET /api/v1/health`: version, schema, applied vs expected migration.
+- Play log. `radio.lua` gives every event a `boot` id + `seq`, keeps unsent
+  events in an outbox persisted to `media/_radio/outbox.json` (cap 5000),
+  and POSTs them to `/api/v1/events` every 2 s when `CFG.SERVER_URL` is set
+  (`CFG.SERVER_TOKEN`, `CFG.STATION_ID`); emits a `boot` event; start/end
+  events now carry `dir`, `artist`, `title`, `played`. Server migration
+  `0002_core_events_play_log`: `core_events` (every event once, keyed by
+  boot + seq) and `play_log` (one row per airing with start/end times). A
+  new boot closes plays left open as `core_restart`.
+- Play log API: `GET /api/v1/now`, `/api/v1/plays` (range, search, kind),
+  `/api/v1/plays/at` (what was on air at a moment). `TIMEZONE` in `.env`.
+- `RADIO_API_TOKEN` (`X-Radio-Token`) to restrict who may post events.
+- Remote syslog (`SYSLOG_*` in `.env`): UDP or TCP, RFC 3164 or 5424, full
+  header with app name `QSYSRadio`; plays, ends, warnings and errors.
+- `scenario_server.lua`: server outage, outbox persistence and replay checks;
+  MockCore gains a fake `HttpClient` and a simulated wall clock.
+
+### Changed
+- gunicorn defaults to 4 workers x 8 threads (`WEB_WORKERS` / `WEB_THREADS`)
+  so many viewers and the Core are served at once.
+- `VERSION` and `radio.lua` are `0.3.0-dev`.
+
+### Fixed
+- A bumper that the next track started under never logged `bumper_end`.
+- MockCore now keeps the scenario seed (radio.lua reseeded from the clock,
+  so runs differed); `scenario_basic` uses seed 1 and checks it actually
+  covers the silent-tail track.
 
 ## [0.2.0] - 2026-10-12
 

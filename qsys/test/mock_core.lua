@@ -281,7 +281,13 @@ function MockCore.setup(spec)
   MockCore.dirs = spec.dirs or {}
   MockCore.clock = 0
   MockCore.timers, MockCore.pending, MockCore.actions, MockCore.log = {}, {}, {}, {}
-  if spec.seed then math.randomseed(spec.seed) end
+  if spec.seed then
+    -- keep runs repeatable: radio.lua's own math.randomseed(os.time()) re-applies the scenario seed
+    local seed, reseed = spec.seed, MockCore.realRandomseed or math.randomseed
+    MockCore.realRandomseed = reseed
+    reseed(seed)
+    math.randomseed = function() reseed(seed) end
+  end
 
   -- meter: meter.N / peak.N / rms.N follow the deck's level
   local meter = {}
@@ -314,6 +320,12 @@ function MockCore.setup(spec)
     GetControls = function() return {} end,
   }
   Timer = { Now = function() return MockCore.clock end }
+  -- wall clock follows the simulated clock, so event times are realistic
+  MockCore.epoch = MockCore.epoch or os.time()
+  MockCore.realDate = MockCore.realDate or os.date
+  os.date = function(fmt, when)
+    return MockCore.realDate(fmt, when or (MockCore.epoch + math.floor(MockCore.clock)))
+  end
   function Timer.New()
     local t = { running = false }
     function t:Start(iv) self.running = true; self.iv = iv; self.next = MockCore.clock + iv
@@ -324,6 +336,19 @@ function MockCore.setup(spec)
     return t
   end
   function Timer.CallAfter(fn, s) MockCore.at(MockCore.clock + s, fn) end
+  -- HttpClient: requests are answered after 50 ms by MockCore.httpHandler(req)
+  -- (default: 200), and every request is recorded in MockCore.http.
+  MockCore.http = {}
+  MockCore.httpHandler = function() return 200, '{"ok":true}' end
+  HttpClient = {
+    Upload = function(req)
+      MockCore.http[#MockCore.http + 1] = { at = MockCore.clock, req = req }
+      MockCore.pending[#MockCore.pending + 1] = { at = MockCore.clock + 0.05, fn = function()
+        local code, body, err = MockCore.httpHandler(req)
+        req.EventHandler(req, code, body, err, {})
+      end }
+    end,
+  }
   Design = { GetStatus = function() return { Platform = "MockCore", DesignName = "mock", IsRedundant = false } end }
   System = { BuildVersion = "mock", IsEmulating = true }
   Network = { Interfaces = function() return { { Interface = "LAN A", Address = "127.0.0.1" } } end }

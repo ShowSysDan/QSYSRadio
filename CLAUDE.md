@@ -31,6 +31,28 @@ commit. At release, roll it into a numbered section and bump `VERSION`
 - Test against a real PostgreSQL (16 is installed in the cloud sandbox):
   fresh schema, then upgrade from the previous version.
 
+## Web workers and background jobs
+gunicorn runs several workers x threads (default 4 x 8) so many browsers can
+watch at once. Never assume one process: anything that must run once
+(scheduler, "what's next" decisions) takes a PostgreSQL advisory lock
+(`pg_try_advisory_lock(hashtext('qsysradio:<job>'))`) and skips when another
+process holds it. Pages that show live state poll short GETs (`/api/v1/now`);
+no long-held connections or websockets.
+
+## Core events and the play log
+- radio.lua events carry `boot` + `seq` (unique); the server stores each
+  once in `core_events` (ON CONFLICT DO NOTHING) and only NEW events touch
+  `play_log` or syslog, so outbox replays are harmless. Keep it idempotent.
+- Adding an event field: emit it in radio.lua, read it in server/events.py;
+  raw JSON is always kept in `core_events.data`.
+- Run both MockCore scenarios after any radio.lua change.
+
+## Logging / syslog
+Log through `server.logs.log` (logger `qsysradio`). It goes to stderr
+(journald) and, when `SYSLOG_HOST` is set, to remote syslog with a full
+RFC 3164/5424 header (app name `QSYSRadio`, English month names). A dead
+syslog server must never break a request.
+
 ## Config
 Per-machine settings are `.env` keys (document them in `.env.example`), read
 via `server.config.get()`: process env first (systemd `EnvironmentFile=`),

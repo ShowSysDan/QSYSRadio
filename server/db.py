@@ -20,6 +20,7 @@ DEFAULT_APP_SCHEMA = 'qsysradio'
 DEFAULT_SHARED_SCHEMA = 'shared'
 
 _IDENT = re.compile(r'^[a-z_][a-z0-9_]{0,62}$')
+_TZ = re.compile(r'^[A-Za-z][A-Za-z0-9_+\-/]{0,63}$')
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -64,9 +65,17 @@ def connect(search_path=True, connect_timeout=10):
     kwargs = dict(settings(), connect_timeout=connect_timeout,
                   application_name='qsysradio',
                   cursor_factory=psycopg2.extras.DictCursor)
+    options = []
     if search_path:
         app_schema, shared_schema = schemas()
-        kwargs['options'] = f'-c search_path="{app_schema}","{shared_schema}"'
+        options.append(f'-c search_path="{app_schema}","{shared_schema}"')
+    tz = config.get('TIMEZONE')
+    if tz:
+        if not _TZ.match(tz):
+            raise ValueError(f'TIMEZONE {tz!r} is not a time zone name (e.g. America/New_York)')
+        options.append(f'-c TimeZone={tz}')
+    if options:
+        kwargs['options'] = ' '.join(options)
     try:
         return psycopg2.connect(**kwargs)
     except psycopg2.OperationalError as exc:

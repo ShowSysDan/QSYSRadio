@@ -3,7 +3,7 @@
 dofile("qsys/test/mock_core.lua")
 
 MockCore.setup{
-  seed = 7,
+  seed = 1,
   dirs = {
     ["Test/Tuning/"] = {
       { name = "Alpha - One.flac",     duration = 30, lead = 1.0, trail = 0.5, level = -10 },
@@ -69,7 +69,14 @@ for _, tr in ipairs(transitions) do
 end
 check(sawEnd, "normal end-of-track crossfade happened")
 check(sawSkip, "operator skip caused a transition")
-check(sawSilence or (LEARNED["Test/Tuning/Bravo - Three.mp3"] and LEARNED["Test/Tuning/Bravo - Three.mp3"].trail_s), "silent tail was detected or learned on 'Bravo - Three'")
+-- only meaningful if 'Bravo - Three' (8 s silent tail) ran to its end at least once, not just skipped
+local bravoEnded = false
+for _, ev in ipairs(EVENTS) do
+  if ev.kind == "track_end" and ev.file == "Bravo - Three.mp3" and ev.reason ~= "cut" then bravoEnded = true end
+end
+local bravo = LEARNED["Test/Tuning/Bravo - Three.mp3"]
+check(bravoEnded, "'Bravo - Three' played to its end (scenario coverage; pick another seed if not)")
+check(sawSilence or (bravo and bravo.trail_s and bravo.trail_s > 5), "silent tail was detected or learned on 'Bravo - Three'")
 check(LEARNED["Test/Tuning/Foxtrot - Seven.mp3"] and LEARNED["Test/Tuning/Foxtrot - Seven.mp3"].unsupported and unsupported == 1, "unsupported file was tried once, learned and excluded")
 
 local artistRepeat = false
