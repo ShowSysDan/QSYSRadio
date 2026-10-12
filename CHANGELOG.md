@@ -6,6 +6,19 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- App server scaffold, set up like the other apps on the shared PostgreSQL
+  server: own `qsysradio` schema (`PG_APP_SCHEMA`) with the cross-app
+  `shared` schema second on the search path; config in `.env`
+  (`.env.example`); `install.sh` (venv, dependencies, `SECRET_KEY`, schema +
+  migrations, systemd unit running as the sudo user from the home-folder
+  clone); `start.sh` (deps sync when `requirements.txt` changes, migrations,
+  gunicorn) so updates are `git pull && sudo systemctl restart qsysradio`.
+- Numbered SQL migrations (`server/migrations/`, tracked in
+  `schema_migrations`, advisory-locked, one transaction per file);
+  `0001_app_settings`.
+- `GET /api/v1/health`: version, schema, applied vs expected migration.
+
 ## [0.2.0] - 2026-10-12
 
 ### Added

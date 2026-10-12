@@ -15,7 +15,7 @@ learning, logging) and hosts the web UI.
 | `qsys/probe` — discovery script | **0.1.1** — done |
 | `qsys/radio` — deck controller | **0.2.0** — standalone, passes the MockCore scenario, awaiting first run on the Core |
 | `qsys/test` — MockCore simulator | **0.2.0** — offline Core stand-in for the Lua state machine |
-| `server` — Flask API + scheduler + Postgres | not started (0.3) |
+| `server` — Flask API + scheduler + Postgres | install / update / migration scaffold in place (own `qsysradio` schema, `/api/v1/health`); API in 0.3 |
 | Web UI | not started (0.5) |
 
 ## Architecture
@@ -166,8 +166,17 @@ qsys/
   probe/probe.lua     discovery script (run once per site / design)
   radio/radio.lua     deck controller (standalone station)
   test/               MockCore simulator, scenarios, runner
-server/               Flask app, scheduler, DB migrations (0.3)
+server/
+  app.py              Flask app (gunicorn: server.app:app)
+  config.py           .env reader (process env first, then .env)
+  db.py               PostgreSQL connection, app + shared schema search_path
+  migrate.py          applies server/migrations/NNNN_*.sql on every start
+  migrations/         numbered SQL migrations (never edit one once merged)
 docs/                 design notes, API contract
+install.sh            first install (venv, .env, DB, systemd unit)
+start.sh              service launcher: deps sync, migrate, gunicorn
+.env.example          server config template (copy to .env)
+requirements.txt
 CHANGELOG.md
 VERSION
 ```
@@ -192,6 +201,52 @@ VERSION
 file in the player's folder silently (status, duration, load time), then plays
 one at −20 dB for ~20 s, fades, stops and restores the player. Set
 `RUN_PLAYBACK_PROBE = false` for a silent run.
+
+## App server: install and update
+
+The Flask server installs into a clone in the service user's home folder
+and keeps all of its data in its **own PostgreSQL schema** (`qsysradio` by
+default) inside the same database the other apps use. The cross-app `shared`
+schema is on the search path for the shared user table (web UI logins, 0.5)
+but QSYSRadio never creates anything there.
+
+### First install
+
+```
+cd ~
+git clone https://github.com/ShowSysDan/QSYSRadio.git
+cd QSYSRadio
+cp .env.example .env          # fill in PG_HOST / PG_DBNAME / PG_USER / PG_PASSWORD
+sudo ./install.sh
+```
+
+`install.sh` creates `venv/`, installs `requirements.txt`, generates
+`SECRET_KEY`, creates the `qsysradio` schema and applies the migrations, then
+writes `/etc/systemd/system/qsysradio.service` running as the user who ran
+sudo, from this folder, with `.env` as its `EnvironmentFile`. Check it at
+`http://<server>:5410/api/v1/health` (port is `APP_PORT` in `.env`).
+
+If the PG user may not create schemas in the database, have a DBA run
+`CREATE SCHEMA qsysradio AUTHORIZATION <pg user>;` once; the app only creates
+the schema when it is missing.
+
+### Updates
+
+```
+cd ~/QSYSRadio && git pull && sudo systemctl restart qsysradio
+```
+
+Every start (`start.sh`) reinstalls Python dependencies if
+`requirements.txt` changed, applies any new `server/migrations/NNNN_*.sql`
+in order (each in one transaction, recorded in
+`qsysradio.schema_migrations`, serialised by an advisory lock), then starts
+gunicorn. A failed migration rolls back and the service does not start
+(`journalctl -u qsysradio -n 50`); an unreachable database does the same and
+systemd retries every 5 s. Re-run `sudo ./install.sh` only when the systemd
+unit itself changes (the changelog will say so).
+
+`python -m server.migrate --status` (from the venv) lists applied and pending
+migrations without changing anything.
 
 ## Versioning
 
