@@ -52,6 +52,10 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- Install is now: fill in `.env`, run `sudo ./install.sh`. The database,
+  the `qsysradio` role and schema are assumed to exist; the setup SQL moved to
+  a "Database access" reference section and the steps are renumbered (1–13).
+  The installer asks only for `PG_PASSWORD` (and host/port if remote).
 - Install guide assumes 321Theater is already installed: the separate
   "new PostgreSQL / no sign-in" path is gone; `.env.example` now defaults to
   `PG_DBNAME=321theater` and `PG_USER=qsysradio`.
@@ -84,6 +88,9 @@ versions follow [Semantic Versioning](https://semver.org/).
   (`RADIO_ALLOW_NO_TOKEN=1` for a lab).
 
 ### Fixed
+- migrate: a missing or unwritable `qsysradio` schema stops with the one SQL
+  line to run (`CREATE SCHEMA … AUTHORIZATION …` / `ALTER SCHEMA … OWNER TO …`)
+  instead of a psycopg2 traceback.
 - radio.lua: a fade left on a deck could dip or stop the next track loaded on
   it (dead air) and record a bogus trail; `track_end` was lost when a track
   ended during a fade; skip / bumper requests could stick and cut a later

@@ -112,6 +112,28 @@ def shared_problems(cur):
     return problems
 
 
+def _create_schema(cur, schema):
+    try:
+        cur.execute(f'CREATE SCHEMA "{schema}"')
+    except db.psycopg2.errors.InsufficientPrivilege:
+        cur.execute('SELECT current_user')
+        role = cur.fetchone()[0]
+        raise SystemExit(f'migrate: schema "{schema}" does not exist and role "{role}" may not create it. '
+                         f'As the PostgreSQL superuser, in this database: '
+                         f'CREATE SCHEMA "{schema}" AUTHORIZATION "{role}";') from None
+
+
+def _check_can_create(cur, schema):
+    """Fail with the fix, not a traceback, when a pre-made schema is not writable."""
+    cur.execute('SELECT current_user, has_schema_privilege(%s, %s), has_schema_privilege(%s, %s)',
+                (schema, 'USAGE', schema, 'CREATE'))
+    role, usage, create = cur.fetchone()
+    if not (usage and create):
+        raise SystemExit(f'migrate: role "{role}" may not create tables in schema "{schema}". '
+                         f'As the PostgreSQL superuser, in this database: '
+                         f'ALTER SCHEMA "{schema}" OWNER TO "{role}";')
+
+
 def run(log=print):
     """Apply every pending migration. Returns the number applied."""
     app_schema, _ = db.schemas()
@@ -125,15 +147,17 @@ def run(log=print):
                 # Create the app schema only when missing, so a PG user without
                 # CREATE on the database still works once a DBA has made it.
                 if not _schema_exists(cur, app_schema):
-                    cur.execute(f'CREATE SCHEMA "{app_schema}"')
+                    _create_schema(cur, app_schema)
                     log(f'migrate: created schema "{app_schema}"')
+                applied = _applied(cur, app_schema)
+                if any(m[0] not in applied for m in migrations):
+                    _check_can_create(cur, app_schema)
                 if not _table_exists(cur, app_schema, 'schema_migrations'):
                     cur.execute(f'''CREATE TABLE IF NOT EXISTS "{app_schema}".schema_migrations (
                         version    INTEGER PRIMARY KEY,
                         name       TEXT NOT NULL,
                         checksum   TEXT NOT NULL,
                         applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())''')
-                applied = _applied(cur, app_schema)
                 count = 0
                 for version, name, path, sha in migrations:
                     row = applied.get(version)

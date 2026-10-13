@@ -50,7 +50,7 @@ step "Configuration..."
 if [ ! -f "$ENV_FILE" ]; then
     as_user cp "${APP_DIR}/.env.example" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
-    error "Created ${ENV_FILE} from .env.example. Fill in PG_DBNAME / PG_USER / PG_PASSWORD, then re-run."
+    error "Created ${ENV_FILE} from .env.example. Fill in PG_PASSWORD (and PG_HOST / PG_PORT if the database is elsewhere), then re-run."
 fi
 if ! grep -q '^SECRET_KEY=.' "$ENV_FILE"; then
     KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
