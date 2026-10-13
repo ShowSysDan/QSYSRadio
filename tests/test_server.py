@@ -811,6 +811,18 @@ def test_settings_spec_matches_radio_lua():
         assert (lua[name] == default) if isinstance(default, str) else float(lua[name]) == float(default), name
 
 
+def test_version_matches_everywhere():
+    """Every change is its own version: VERSION, radio.lua and the changelog's top section agree."""
+    import re
+    root = os.path.join(os.path.dirname(__file__), '..')
+    version = open(os.path.join(root, 'VERSION')).read().strip()
+    assert re.fullmatch(r'\d+\.\d+\.\d+', version)
+    lua = open(os.path.join(root, 'qsys', 'radio', 'radio.lua')).read()
+    assert re.search(r'^RADIO_VERSION = "([^"]+)"', lua, re.M).group(1) == version
+    changelog = open(os.path.join(root, 'CHANGELOG.md')).read()
+    assert re.search(r'^## \[([^\]]+)\]', changelog, re.M).group(1) == version
+
+
 # ── Queries and robustness ───────────────────────────────────────────────────
 
 def test_plays_queries_are_per_station_and_find_open_plays(app):

@@ -2,9 +2,10 @@
 
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
-versions follow [Semantic Versioning](https://semver.org/).
+versions follow [Semantic Versioning](https://semver.org/). Every change
+ships as its own version: the top section always matches `VERSION`.
 
-## [Unreleased]
+## [0.3.0] - 2026-10-13
 
 ### Added
 - **See and adjust each file's quiet start and end.** On the Music, Imaging &
