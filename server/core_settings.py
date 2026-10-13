@@ -65,6 +65,12 @@ SPEC = [
     ('fade_out_drop_db', 'Fade-out level', 'Silence detection', 'float', 6, 40, 1, 20,
      'The end counts as faded once it stays this far below the file\'s own peak for half a second (dB).'),
 
+    ('analyze_at', 'Analyze new files daily at', 'Silence detection', 'choice',
+     ('off',) + tuple(f'{h:02d}:00' for h in range(24)), None, None, '04:00',
+     'Each day at this time (server time) the Core measures the quiet start and end of every file not analyzed yet, '
+     'on the deck that is off air (its PlayerSum input muted), between songs. Analyzed figures are final: plays no '
+     'longer learn over them. The library pages can also start a run.'),
+
     ('artist_separation', 'Artist separation', 'Rotation', 'int', 0, 20, 1, 2,
      'Avoid repeating an artist within the last N songs.'),
     ('ident_schedule', 'Station ID schedule', 'Bumpers & advertisements', 'choice',
@@ -81,7 +87,7 @@ SPEC = [
 ]
 BY_NAME = {s[0]: s for s in SPEC}
 REQUIRED = {'music_dir'}
-SERVER_ONLY = {'ad_fit_tolerance_s', 'ident_schedule', 'ident_window_min'}   # the server's own; not sent to the Core
+SERVER_ONLY = {'ad_fit_tolerance_s', 'ident_schedule', 'ident_window_min', 'analyze_at'}   # the server's own; not sent to the Core
 PREFIX = 'core.'
 
 

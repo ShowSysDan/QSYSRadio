@@ -191,6 +191,9 @@ button.ghost-danger:hover:not(:disabled) { color: var(--danger); border-color: r
 .dk.imaging .bar i { background: var(--purple); }
 .dk.ad .bar i { background: var(--warning); }
 .dk-idle { margin: auto; color: var(--text-muted); font: 11px var(--mono); letter-spacing: 2px; padding-bottom: 14px; }
+.dk.analyzing .dk-idle { letter-spacing: 0; text-align: center; padding: 0 8px 14px; overflow-wrap: anywhere; }
+.analysis { font-size: 12px; color: var(--text-dim); margin: 0 0 10px; display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+.analysis b { color: var(--text); font-weight: 600; }
 
 /* ── Up next / queue / activity ─────────────────────────────────────────── */
 .next .t { font-weight: 600; font-size: 17px; line-height: 1.25; }

@@ -71,6 +71,10 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   One advisory lock per station serialises sync and `add_command`.
 - `POST /api/v1/core/library` after every scan (bulk `execute_values`);
   reply: `learned` {key: {trail, lead} | {unsupported}} for the Core.
+- File analysis (`analysis.py`): the server sends `analyze` [keys] when `analyze_rev` differs
+  (only to a Core that sends `analyze_rev`, i.e. has the PlayerSum mixer); the Core measures
+  them on the off-air deck (its mixer input muted; every on-air `Deck:play` unmutes) and
+  reports `analysis` events. Analyzed figures are final (plays don't learn over them).
 - Ads: the server sends `ads` {due, mix, next, next_why, ident, no_bumpers} when `ads_rev` differs
   (`ads.py`); the Core only plays the plan (without one, every ad is a mix-in).
   `next` is the song to play next, picked on the server (`next_song`: least

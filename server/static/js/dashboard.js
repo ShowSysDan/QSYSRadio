@@ -12,7 +12,7 @@
   const core = () => (last && last.station && last.station.online ? last.station.state : null);
   // seconds since the Core measured elapsed/remaining (server-side age + time since we fetched)
   const age = () => (num(last && last.station && last.station.state_age_s) || 0) + (Date.now() - (last ? last.receivedAt : Date.now())) / 1000;
-  const playing = (d) => d && (d.state === 'playing' || d.state === 'fading');
+  const playing = (d) => d && !d.analyzing && (d.state === 'playing' || d.state === 'fading');
 
   function liveDeck(st) {
     if (!st || !st.decks) return null;
@@ -21,6 +21,11 @@
   }
 
   function deckHtml(id, d) {
+    if (d && d.analyzing && d.file) {          // measuring a file, muted at the mixer
+      return '<div class="dk analyzing"><div class="dk-head"><span class="dk-id">DECK ' + esc(id) + '</span><span class="dk-state">analyzing · off air</span></div>' +
+        '<div class="dk-idle" title="Measuring its quiet start and end; this deck is muted at the mixer and is taken back the moment the station needs it">' +
+        esc(R.whoLine(d)) + '</div></div>';
+    }
     if (!d || !d.file || !(playing(d) || d.state === 'loading')) {
       return '<div class="dk"><div class="dk-head"><span class="dk-id">DECK ' + esc(id) + '</span><span class="dk-state">idle</span></div><div class="dk-idle">NO SIGNAL</div></div>';
     }

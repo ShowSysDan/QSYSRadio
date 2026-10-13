@@ -319,11 +319,18 @@ function MockCore.setup(spec)
     ["Audio_Player_02"] = mkPlayer("B", meterSet(2)),
   }
   MockCore.meter = meter
+  -- the players' mixer (PlayerSum): input.N.mute.1 / gain.1 / delay.1; spec.noMixer = a design without one
+  local mixer = {}
+  for i = 1, 2 do
+    mixer["input." .. i .. ".mute.1"], mixer["input." .. i .. ".gain.1"], mixer["input." .. i .. ".delay.1"] = mkctl{ b = false }, mkctl{}, mkctl{}
+  end
+  MockCore.mixer = not spec.noMixer and mixer or nil
 
   Component = {
     New = function(n)
       if MockCore.players[n] then return MockCore.players[n].comp end
       if n == "PlayerOutput01" then return meter end
+      if n == "PlayerSum" and MockCore.mixer then return MockCore.mixer end
       error("component '" .. tostring(n) .. "' not found")
     end,
     GetComponents = function()
