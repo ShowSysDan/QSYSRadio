@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **0.3.0-dev** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.0.1** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **0.3.0-dev** — standalone or server-linked; all features pass the MockCore suites; awaiting first run on the Core |
-| `qsys/test` — MockCore simulator | **0.3.0-dev** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **0.3.0-dev** — own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.0.1** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.0.1** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.0.1** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -112,8 +112,8 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   crossfade point; inside the last tick it arms `Timer.CallAfter` so the fade
   starts on time. Fades step gain every 50 ms on a timer that runs only while
   a deck is fading or loading (~3% of the time).
-- **Transitions.** Normal end (crossfade early by the learned tail), skip,
-  silence in the last `end_guard_s`, a break on the free deck (ads, then a
+- **Transitions.** Normal end (crossfade early by the learned tail), a
+  fade-out (below), skip, silence in the last `end_guard_s`, a break on the free deck (ads, then a
   bumper) with the next song starting under its tail, stop after current,
   stop now.
 - **Breaks.** A bumper every `bumper_every_n_tracks` songs; an ad break every
@@ -126,13 +126,25 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   (see [Rotation](#rotation-every-song-gets-played)); without one (server
   unreachable) a local shuffle bag with artist separation, which a rescan
   does not restart.
-- **Quiet starts skipped.** A song starts past its measured lead-in minus
+- **Fade-outs.** The meter is read every 250 ms (the meter's own
+  `response.time` smooths over ~300 ms), plenty for endings that take
+  seconds. When a song, bumper or ad stays `fade_out_drop_db` (20 dB) under
+  its own peak for half a second within `fade_out_early_s` (2 s; 0 = off) of
+  its regular hand-over point, the next item starts right then. Measured live
+  on every play, nothing stored.
+- **Break items** hand over at their learned quiet end (or fade-out): the
+  next ad starts when the last one goes quiet, not at its end of file.
+- **Quiet starts skipped.** Songs, bumpers and ads start past its measured lead-in minus
   `lead_skip_keep_s` (0.3 s), skipping at most `lead_skip_max_s` (3 s; 0 =
   off): the Core presses play, then seeks (`locate`). The first play of a
   file is from 0:00 (nothing measured yet); lead-in is always reported from
   the file start, so skipping never shrinks it.
-- **Learning** (kept on the server, `library` table): duration, lead-in,
-  minimum trailing silence, peak at unity. A file the player cannot play
+- **Learning** (kept on the server, `library` table, every kind): duration,
+  lead-in, minimum trailing silence, peak at unity; an operator's figures
+  (`lead_set_s`, `trail_set_s`) win over them. After each library upload the
+  server's figures replace the Core's (so edits and forgotten figures apply). Trailing silence counts
+  only when it was heard before any fade began (a crossfade hides the rest
+  of the file). A file the player cannot play
   ("Unsupported…") is remembered there until its size changes; any other
   load failure only skips the file until the next scan.
 - **Files on the Core** (`media/_radio/`): `settings.json` (the server's
@@ -266,7 +278,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `0.3.0-dev`.
+Expect the version, e.g. `1.0.1`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -370,7 +382,7 @@ Keep the two `CFG` lines for step 10.
   networks, use the one the Core can reach.
 - Print the token again any time: `grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`.
 - Re-running is safe: the secrets in `.env` are kept and only pending
-  migrations run (`... at version 0004 (nothing to do)`).
+  migrations run (`... at version 0009 (nothing to do)`).
 - Without sudo (`./install.sh`) it sets up the venv, `.env` and the database,
   ends with `Done (no systemd service without sudo).` and prints no `CFG`
   lines. `./start.sh` then runs the server in the foreground.
@@ -398,13 +410,13 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `migrate: schema "qsysradio" at version 0004 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 0.3.0-dev starting on port
+- In the journal: `migrate: schema "qsysradio" at version 0009 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 1.0.1 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":4,"schema_version":4,"version":"0.3.0-dev"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":9,"schema_version":9,"version":"1.0.1"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -549,7 +561,7 @@ In Q-SYS Designer, with the station's design open:
    Settings page (Music folder, Imaging folder). FLAC, MP3 and WAV are proven
    on the Core; WMA does not load. Put a few bumpers in the imaging folder,
    or set "Bumper every N songs" to 0. Ads are optional: put them in their
-   own folder and set the Ads folder on the Settings page.
+   own folder and set the Advertisements folder on the Settings page.
 5. **Script.** Add a Text Controller (or Control Script). Open its Lua
    editor, paste all of `qsys/radio/radio.lua`, and change only `CFG`:
    ```lua
@@ -568,14 +580,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 0.3.0-dev starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.0.1 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 0.3.0-dev`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.0.1`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -606,7 +618,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (8 in 0.3.0-dev).
+The last line prints the number of tables (8 in 1.0.1).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -648,7 +660,7 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 0.3.0-dev, server is 0.4.0`.
+  `station=Main runs radio.lua 1.0.1, server is 1.0.2`.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -875,7 +887,7 @@ the shared sessions table:
 SELECT tableowner FROM pg_tables WHERE schemaname = 'shared' AND tablename = 'app_sessions';
 ```
 
-If it says `qsysradio` (early 0.3.0-dev builds could create it), first run
+If it says `qsysradio` (early 0.3.0 builds could create it), first run
 `ALTER TABLE shared.app_sessions OWNER TO showadvance;`. Otherwise
 `DROP OWNED` below would drop the table the other apps use. Then:
 
@@ -921,12 +933,26 @@ MockCore scenarios and `live_core.py`.
   transport (Skip, Bumper now, Ad break now, Stop after current, Stop now /
   Start); both decks live; the queue (reorder, remove, clear);
   activity (every command, who sent it, and the Core's answer); recent plays.
-- **Library:** music, imaging and ads; search, sort (artist, title, most /
-  least recently played), length and length without the measured leading /
-  trailing silence, totals for the list, Play next, Queue, Play now; imaging files: Bumper
-  now; ads: Play now and the schedule (Mix in / Per hour with the count /
-  Off) with plays this hour and today. Rescan. The list reloads by itself
-  after the Core uploads a new scan and whenever something new plays.
+- **Music**, **Imaging & IDs** and **Advertisements** pages (one tab each): search
+  (`/` jumps to it, Esc clears), sort, quick filters (never played,
+  unsupported; station IDs; per hour / mix in / off; adjusted), all kept in
+  the URL so a view can be bookmarked. Length and length without the
+  measured silence, totals. Click the length without silence (operators) to
+  see the measured quiet start and end and set your own (blank = measured;
+  the Core never measures over a figure set here), go back to the measured
+  ones, or forget them (measured again on the next play). **Forget
+  measured** in the toolbar does that for the whole page. Changes reach the
+  Core with a rescan the server queues. Music: Play next, Queue, Play now. Imaging: Bumper now and the
+  **ID** toggle (marks a station ID). Advertisements: Play now, the schedule (Mix in /
+  Per hour with the count / Off) with plays this hour and today, and a
+  **This hour** line of every per-hour slot in time order. Rescan. Lists
+  reload by themselves after a new scan and whenever something plays.
+- **Pause ads / bumpers** (the pause button on the Next bumper / Next ad
+  break cards, operators): for 30 min, 1 hour, until a time of day (the next
+  time it comes round, server time) or until resumed; the card shows PAUSED
+  and until when. Held ads: nothing owed or mixed in (per-hour slots in the
+  meantime are skipped); held bumpers: no every-N-songs bumper. Bumper now /
+  Ad break now still play. Station IDs are not paused.
 - **Play log:** a day (search, type), what was on air at a moment, CSV.
 - **Settings** (admins): every station setting in groups (Library, Bumpers &
   ads, Fades, Levels, Silence detection, Rotation, Safety), with what the
@@ -999,9 +1025,19 @@ WHERE kind = 'ad' AND started_at >= current_date - 1 AND started_at < current_da
 GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
+### Station IDs
+
+Mark imaging files as IDs (the **ID** button on Imaging & IDs) and pick a
+**Station ID schedule** (Settings → Bumpers & advertisements): hourly (:00), half-hourly
+(:00, :30) or every quarter hour. At the first song change after each time
+(within **Station ID may be late by**, 8 min) the server names a random ID,
+never the one that played last, and the Core plays it first in that break,
+in place of the regular bumper. The song picks aim for the ID time like they
+do for ad slots. Coming up shows it as **ID**.
+
 ### Ad schedules
 
-Set on the Library page (Ads), one row per ad in `qsysradio.ad_rules`; an ad
+Set on the Advertisements page, one row per ad in `qsysradio.ad_rules`; an ad
 with no row is mixed in.
 
 | Schedule | Plays |
@@ -1079,7 +1115,11 @@ complete record.
 - [Semantic Versioning](https://semver.org/). One project version in
   `VERSION`; git tags `vX.Y.Z`. `radio.lua` carries the same version and
   reports it; the server logs a mismatch.
-- Changes are recorded in `CHANGELOG.md` under *Unreleased*.
+- Every change ships as its own version: `VERSION`, `RADIO_VERSION` in
+  radio.lua and a new top section in `CHANGELOG.md` (with what to redeploy)
+  move together, and this README is updated in the same commit. Patch for
+  fixes, minor for features, major for breaking changes.
+  `tests/test_server.py` fails if the three disagree.
 
 ## Roadmap
 
@@ -1087,10 +1127,11 @@ complete record.
 |---|---|
 | 0.1 | Probe |
 | 0.2 | Standalone deck controller |
-| 0.3 | Server: play log, control panel, settings, sign-in, syslog *(in progress)* |
-| 0.4 | Rotation rules on the server: no-repeat window, time-of-day rules, ad flights (start / end dates, dayparts) |
-| 0.5 | Learning v2: loudness normalisation from learned peak, lead-in aware starts |
-| 1.0 | Stable: alerts, docs |
+| 0.3 | Server: play log, control panel, settings, sign-in, syslog, NTP check; advertisements, fair rotation and ad-break fitting on the server; pause ads / bumpers; station IDs; quiet start / end and fade-out handling for every kind, adjustable per file |
+| 1.0.1 | Stable: everything in 0.3 |
+| 1.1 | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
+| 1.2 | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
+| 1.3 | Loudness normalisation from the learned peak |
 
 ## Network requirement
 

@@ -1,7 +1,7 @@
 -- QSYSRadio deck controller (Q-SYS Lua 5.3). Docs: README.md. Station settings are
 -- edited on the server's web page and pushed here; SETTINGS below are only the
 -- fallback until the server has been reached once.
-RADIO_VERSION = "0.3.0-dev"
+RADIO_VERSION = "1.0.1"
 
 CFG = {
   PLAYER_A = "Audio_Player_01", METER_A = 1,
@@ -18,6 +18,7 @@ SETTINGS = {
   play_gain_db = 0, imaging_gain_db = 0, ad_gain_db = 0, ad_every_n_tracks = 0, ads_per_break = 2,
   crossfade_s = 4, fade_in_s = 0, skip_fade_s = 1.5, silence_fade_s = 1, stop_fade_s = 2, bumper_fade_s = 2,
   silence_threshold_dbfs = -50, silence_hold_s = 2, end_guard_s = 20, lead_skip_max_s = 3, lead_skip_keep_s = 0.3,
+  fade_out_drop_db = 20, fade_out_early_s = 2,
   bumper_every_n_tracks = 4, bumper_tail_s = 1, artist_separation = 2, dead_air_s = 1.5,
 }
 DEFAULTS = {}
@@ -26,7 +27,7 @@ for k, v in pairs(SETTINGS) do DEFAULTS[k] = v end
 -- internals (not settings)
 local K = {
   floor_db = -100, tick_s = 0.25, fast_s = 0.05, load_timeout_s = 1.5, chores_s = 30,
-  sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000,
+  quiet_s = 0.5, sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000,
 }
 -- only what must survive a reboot while the server is unreachable; everything else lives on the server
 FILES = { outbox = "media/_radio/outbox.json", settings = "media/_radio/settings.json" }
@@ -129,7 +130,7 @@ local function emit(kind, data)
 end
 
 -- ── LIBRARY ───────────────────────────────────────────────────────────────────
--- per file: { trail = s, lead = s, unsupported = true }, from the server after each upload + this boot's plays
+-- per file (all kinds): { trail = s, lead = s, fixed = operator's, unsupported = true }: the server's, + this boot's plays
 LEARNED = {}
 Library = { music = {}, imaging = {}, ad = {}, byKey = {}, root = "Audio/" }
 
@@ -197,14 +198,14 @@ function Library.remove(track)
   Library.byKey[track.key] = nil
 end
 
--- the server's per-file figures (reply to the library upload)
+-- the server's per-file figures (reply to the library upload): they replace this boot's (edits, forgotten figures)
 function Library.learn(map)
   if type(map) ~= "table" then return end
+  for _, L in pairs(LEARNED) do L.trail, L.lead, L.fixed = nil, nil, nil end
   for key, v in pairs(map) do
     if type(v) == "table" then
-      local L, trail = LEARNED[key] or {}, tonumber(v.trail)
-      if trail then L.trail = math.min(L.trail or trail, trail) end
-      L.lead = tonumber(v.lead) or L.lead
+      local L = LEARNED[key] or {}
+      L.trail, L.lead, L.fixed = tonumber(v.trail), tonumber(v.lead), v.fixed == true or nil
       if v.unsupported == true then L.unsupported = true end
       LEARNED[key] = L
       if L.unsupported and Library.byKey[key] then Library.remove(Library.byKey[key]) end
@@ -305,11 +306,11 @@ function Deck:play(gainDb, fadeInS, skip)
   trigger(self.c.play)
   if skip > 0 then set(self.c.locate, "Value", skip) end
   self.state, self.playStart = "playing", now() - skip   -- times stay file positions
-  self.firstAudioAt, self.lastAudioAt, self.silentSince, self.peakMax = nil, nil, nil, nil
+  self.firstAudioAt, self.lastAudioAt, self.silentSince, self.peakMax, self.loudAt, self.fadedAt = nil, nil, nil, nil, nil, nil
 end
 
 function Deck:fadeOut(seconds, onDone)
-  self.state = "fading"
+  self.state, self.fadedAt = "fading", self.fadedAt or now()
   self.fade = { from = self.gain, to = K.floor_db, t0 = now(), dur = seconds, onDone = onDone }
   Engine.wake()
 end
@@ -354,9 +355,15 @@ function Deck:sample(t)
   if unity > SETTINGS.silence_threshold_dbfs then
     self.lastAudioAt, self.firstAudioAt, self.silentSince = t, self.firstAudioAt or t, nil
     if unity > (self.peakMax or -200) then self.peakMax = unity end
+    if unity > self.peakMax - SETTINGS.fade_out_drop_db then self.loudAt = t end
   else
     self.silentSince = self.silentSince or t
   end
+end
+
+-- in its fade-out: fade_out_drop_db under its own peak for a moment (start the next item early)
+function Deck:fadingOut(t)
+  return SETTINGS.fade_out_early_s > 0 and self.loudAt ~= nil and t - self.loudAt >= K.quiet_s
 end
 
 -- ── ENGINE: the 250 ms station timer + a 50 ms timer that runs only while needed ───
@@ -391,7 +398,7 @@ Station = {
   nextBumper = nil,        -- operator-chosen bumper for the next bumper slot
   nextAd = nil,            -- operator-chosen ad for the next break
   breakList = {},          -- the rest of the break that is playing (ads, then a bumper)
-  adPlan = nil,            -- from the server: { due = {ads owed now}, mix = {ads}, next = song, why = "rotation"|"ad" }
+  adPlan = nil,            -- from the server: { due, mix (ads), next = song, why, ident = ID owed, no_bumpers }
   armed = nil,             -- the crossfade timer's target (deck + play start)
 }
 
@@ -479,11 +486,16 @@ local function adBreak()
   return list
 end
 
--- what plays between this song and the next: ads (if due), then a bumper (if due)
+-- what plays between this song and the next: the server's station ID (if owed), ads (if due),
+-- then a bumper (if due, no ID and bumpers not held)
 local function planBreak()
-  local spots = adBreak() or {}
-  if Station.bumperRequested or
-     (SETTINGS.bumper_every_n_tracks > 0 and Station.tracksSinceBumper >= SETTINGS.bumper_every_n_tracks) then
+  local plan = Station.adPlan or {}
+  local spots, ident = adBreak() or {}, Library.byKey[plan.ident or ""]
+  if ident and ident.kind == "imaging" then
+    table.insert(spots, 1, ident)
+    plan.ident, Server.adsRev = nil, ""
+  elseif Station.bumperRequested or (not plan.no_bumpers and
+     SETTINGS.bumper_every_n_tracks > 0 and Station.tracksSinceBumper >= SETTINGS.bumper_every_n_tracks) then
     spots[#spots + 1] = Station.pickBumper()
   end
   return #spots > 0 and spots or nil
@@ -501,20 +513,18 @@ function Station.finishTrack(d, reason)
   d.track = nil                        -- finish each play exactly once
   local ev = { deck = d.id, file = tr.name, dir = tr.dir, reason = reason,
                played = d.playStart and round(now() - d.playStart, 1) or nil }
-  if tr.kind == "music" then           -- this play's measurements; the server keeps them per file
-    if d.firstAudioAt and d.playStart then
-      ev.lead_in = round(d.firstAudioAt - d.playStart, 2)
-      LEARNED[tr.key] = LEARNED[tr.key] or {}
-      LEARNED[tr.key].lead = ev.lead_in
-    end
-    if (reason == "end" or reason == "silence" or reason == "eof") and d.lastAudioAt and d.playStart and d.duration then
-      ev.trail = round(math.max(0, d.duration - (d.lastAudioAt - d.playStart)), 2)
-      local L = LEARNED[tr.key] or {}
-      L.trail = math.min(L.trail or ev.trail, ev.trail)
-      LEARNED[tr.key] = L
-    end
-    if d.peakMax then ev.peak = round(d.peakMax, 1) end
+  local L = LEARNED[tr.key] or {}       -- this play's measurements; the server keeps them per file
+  LEARNED[tr.key] = L
+  if d.firstAudioAt and d.playStart then
+    ev.lead_in = round(d.firstAudioAt - d.playStart, 2)
+    if not L.fixed then L.lead = ev.lead_in end
   end
+  -- the silent tail counts only if the silence was heard before any fade (a fade hides the rest of the file)
+  if reason ~= "cut" and d.lastAudioAt and d.playStart and d.duration and (d.fadedAt or 1e9) - d.lastAudioAt >= K.quiet_s then
+    ev.trail = round(math.max(0, d.duration - (d.lastAudioAt - d.playStart)), 2)
+    if not L.fixed then L.trail = math.min(L.trail or ev.trail, ev.trail) end
+  end
+  if d.peakMax then ev.peak = round(d.peakMax, 1) end
   emit(KINDS[tr.kind].event .. "_end", ev)
 end
 
@@ -549,7 +559,7 @@ function Station.startTrack(deck, track, opts, attempt)
       end
       return
     end
-    local L = track.kind == "music" and LEARNED[track.key] or {}
+    local L = LEARNED[track.key] or {}
     local skip = L.lead and math.min(SETTINGS.lead_skip_max_s, math.max(0, L.lead - SETTINGS.lead_skip_keep_s)) or 0
     d:play(SETTINGS[KINDS[track.kind].gain], opts.fadeIn or 0, skip)
     if track.kind == "music" then
@@ -604,7 +614,7 @@ function Station.transition(reason)
   if spots then
     Station.freeDeck, Station.breakList = live, spots
     Station.startTrack(other, table.remove(spots, 1), {})
-    if reason == "end" then fadeS = SETTINGS.bumper_fade_s end   -- the song dips under the break
+    if reason == "end" or reason == "fade" then fadeS = SETTINGS.bumper_fade_s end   -- the song dips under the break
   else
     Station.startTrack(other, Station.nextSong(true), { fadeIn = SETTINGS.fade_in_s })
   end
@@ -615,16 +625,16 @@ end
 -- the rest of the break back to back, then the next song (under the last item's tail)
 local function afterSpot(ended)
   local free = Station.freeDeck
-  if free.state == "fading" then
+  if free.state == "fading" or free.state == "playing" then   -- the song under the break, or a break item's quiet end
     free.fade = nil
-    Station.finishTrack(free, "end")
+    Station.finishTrack(free, free.state == "fading" and "end" or "cut")
     free:stop()
   end
   if Station.stopAfter then return Station.goOff("stop_after_current") end   -- the break item plays out
   Station.state = "crossfading"
-  local nxt = ended and table.remove(Station.breakList, 1)
+  local nxt = table.remove(Station.breakList, 1)
   if nxt then
-    Station.freeDeck = ended
+    Station.freeDeck = ended or Station.spotDeck
     return Station.startTrack(free, nxt, {})
   end
   Station.startTrack(free, Station.nextSong(true), { fadeIn = ended and 0 or SETTINGS.fade_in_s })
@@ -674,6 +684,7 @@ local function crossfadeCheck(live, t)
   local L = (live.track and LEARNED[live.track.key]) or {}
   local due = (live:remainingEst(t) or 999) - (SETTINGS.crossfade_s + (L.trail or 0) + 0.25)
   if due <= 0 then return Station.transition("end") end
+  if due <= SETTINGS.fade_out_early_s and live:fadingOut(t) then return Station.transition("fade") end
   if due < K.tick_s and Station.armed ~= live.playStart then
     Station.armed = live.playStart
     local start = live.playStart
@@ -703,9 +714,11 @@ function Station.tick(t)
     elseif playedFor > 5 then
       crossfadeCheck(live, t)
     end
-  elseif isSpot(Station.state) and spot and spot.state == "playing" and #Station.breakList == 0
-         and (spot:remainingEst(t) or 0) <= SETTINGS.bumper_tail_s then
-    afterSpot(nil)
+  elseif isSpot(Station.state) and spot and spot.state == "playing" then
+    -- hand over at the quiet end (silent tail, or a fade-out); under the tail of the break's last item
+    local L, rem = (spot.track and LEARNED[spot.track.key]) or {}, spot:remainingEst(t) or 0
+    local due = rem - (L.trail or 0) - (#Station.breakList == 0 and SETTINGS.bumper_tail_s or 0)
+    if due <= 0 or (due <= SETTINGS.fade_out_early_s and spot:fadingOut(t)) then afterSpot(nil) end
   end
 
   -- dead-air guard (backs off while the library is empty)
@@ -989,7 +1002,8 @@ function Server.applyAdPlan(p, rev)
     return out
   end
   Station.adPlan = { due = keys(p.due), mix = keys(p.mix), next = type(p.next) == "string" and p.next or nil,
-                     why = tostring(p.next_why or "") }
+                     why = tostring(p.next_why or ""), ident = type(p.ident) == "string" and p.ident or nil,
+                     no_bumpers = p.no_bumpers == true }
   Server.adsRev = tostring(rev or "")
   STATE_REV = STATE_REV + 1
 end

@@ -439,6 +439,99 @@ def test_forecast_fits_later_songs_to_ad_slots(app):
     assert 'ad_fit_tolerance_s' not in (sync(app, station='FF', settings_rev='').json.get('settings') or {})
 
 
+def test_quiet_start_and_end_can_be_adjusted_and_forgotten(app):
+    items = [{'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music'},
+             {'key': 'I/b.wav', 'dir': 'I/', 'file': 'b.wav', 'kind': 'imaging'}]
+    library_post(app, 'T1', items)
+    sync(app, station='T1', events=[
+        ev(1, 'track_start', deck='A', file='a.mp3', dir='M/', duration=200.0),
+        ev(2, 'track_end', deck='A', file='a.mp3', dir='M/', reason='end', lead_in=0.8, trail=6.0),
+        ev(3, 'bumper_start', deck='B', file='b.wav', dir='I/', duration=8.0),
+        ev(4, 'bumper_end', deck='B', file='b.wav', dir='I/', reason='end', lead_in=0.2, trail=1.0)])
+    assert library_post(app, 'T1', items).json['learned'] == {'M/a.mp3': {'trail': 6.0, 'lead': 0.8},
+                                                           'I/b.wav': {'trail': 1.0, 'lead': 0.2}}   # every kind
+    op, viewer = signed_in(app, 'operator'), signed_in(app, 'viewer')
+    trim = lambda c, **b: c.post('/api/v1/library/trim', json=dict(station='T1', **b), headers=WEB)
+    forget = lambda c, **b: c.post('/api/v1/library/forget', json=dict(station='T1', **b), headers=WEB)
+    assert trim(viewer, key='M/a.mp3', lead=None, trail=0.5).status_code == 403
+    assert trim(op, key='M/a.mp3', lead=None, trail=-1).status_code == 400
+    assert trim(op, key='M/nope.mp3', lead=None, trail=1).status_code == 400
+    assert trim(op, key='M/a.mp3', lead=None, trail=0.5).status_code == 200
+    assert [c['cmd'] for c in sync(app, station='T1').json['commands']][-1] == 'rescan'      # the Core picks it up
+    assert library_post(app, 'T1', items).json['learned']['M/a.mp3'] == {'trail': 0.5, 'lead': 0.8, 'fixed': True}
+    row = next(i for i in op.get('/api/v1/library?station=T1&only=adjusted').json['items'])
+    assert (row['key'], row['trail_s'], row['trail_set_s'], row['audible_s']) == ('M/a.mp3', 6.0, 0.5, pytest.approx(198.7))
+    sync(app, station='T1', events=[                     # still measured underneath, never over the operator's figure
+        ev(5, 'track_start', deck='A', file='a.mp3', dir='M/', duration=200.0),
+        ev(6, 'track_end', deck='A', file='a.mp3', dir='M/', reason='end', lead_in=0.7, trail=5.0)])
+    assert library_post(app, 'T1', items).json['learned']['M/a.mp3'] == {'trail': 0.5, 'lead': 0.7, 'fixed': True}
+    assert forget(op).status_code == 400
+    assert forget(op, kind='music').json['files'] == 1
+    assert library_post(app, 'T1', items).json['learned']['M/a.mp3'] == {'trail': 0.5, 'fixed': True}   # the operator's stays
+    assert trim(op, key='M/a.mp3', lead=None, trail=None).status_code == 200                       # back to measured
+    assert forget(op, key='I/b.wav').json['files'] == 1
+    assert library_post(app, 'T1', items).json['learned'] == {}
+
+
+def test_holds_and_station_ids(app):
+    items = [{'key': 'Ads/m.wav', 'dir': 'Ads/', 'file': 'm.wav', 'kind': 'ad'},
+             {'key': 'I/id1.wav', 'dir': 'I/', 'file': 'id1.wav', 'kind': 'imaging'},
+             {'key': 'I/id2.wav', 'dir': 'I/', 'file': 'id2.wav', 'kind': 'imaging'},
+             {'key': 'I/sweep.wav', 'dir': 'I/', 'file': 'sweep.wav', 'kind': 'imaging'},
+             {'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music'}]
+    library_post(app, 'H1', items, ads_dir='Ads/')
+    op, viewer, admin = signed_in(app, 'operator'), signed_in(app, 'viewer'), signed_in(app, 'admin')
+    hold = lambda c, **b: c.post('/api/v1/hold', json=dict(station='H1', **b), headers=WEB)
+    plan = lambda: sync(app, station='H1', ads_rev='').json['ads']
+    assert plan()['mix'] == ['Ads/m.wav'] and 'no_bumpers' not in plan()
+    assert hold(viewer, what='ads', until=None).status_code == 403
+    assert hold(op, what='music', until=None).status_code == 400
+    assert hold(op, what='ads', until='2001-01-01T00:00:00Z').status_code == 400          # in the past
+    later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    assert hold(op, what='ads', until=later).status_code == 200
+    assert hold(op, what='bumpers', until=None).status_code == 200                       # until resumed
+    p = plan()
+    assert p['mix'] == [] and p['due'] == [] and p['no_bumpers'] is True
+    holds = op.get('/api/v1/now?station=H1').json['station']['holds']
+    assert holds['ads']['until'] and holds['bumpers']['until'] is None and holds['ads']['by'] == 'operator'
+    assert hold(op, what='ads', until='off').status_code == 200 and hold(op, what='bumpers', until='off').status_code == 200
+    assert plan()['mix'] == ['Ads/m.wav'] and 'no_bumpers' not in plan()
+    sql("INSERT INTO qsr_test.station_holds (station, what, until) VALUES ('H1', 'ads', NOW() - INTERVAL '1 minute')")
+    assert plan()['mix'] == ['Ads/m.wav']                                                  # an expired hold is no hold
+
+    # station IDs: two marked, every quarter hour with a 15 min window (so one is always owed until played)
+    mark = lambda key, on=True: op.post('/api/v1/library/ident', json={'station': 'H1', 'key': key, 'ident': on}, headers=WEB)
+    assert mark('M/a.mp3').status_code == 400 and viewer.post('/api/v1/library/ident', json={'station': 'H1', 'key': 'I/id1.wav',
+                                                                                         'ident': True}, headers=WEB).status_code == 403
+    assert mark('I/id1.wav').status_code == 200 and mark('I/id2.wav').status_code == 200
+    assert 'ident' not in plan()                                                           # schedule off
+    settings = lambda **v: admin.post('/api/v1/settings', json={'settings': v}, headers=WEB)
+    assert settings(ident_schedule='often').status_code == 400
+    assert settings(ident_schedule='quarter-hourly', ident_window_min=15).status_code == 200
+    try:
+        owed = plan().get('ident')
+        assert owed in ('I/id1.wav', 'I/id2.wav')
+        assert 'ident_schedule' not in (sync(app, station='H1', settings_rev='').json.get('settings') or {})  # server-only
+        hold(op, what='ads', until=None)
+        sync(app, station='H1', state=dict(STATE, decks={'A': {'state': 'playing', 'live': True, 'kind': 'music', 'key': 'M/x.mp3',
+                                                              'file': 'x.mp3', 'remaining': 60, 'duration': 200}},
+                                           settings={'ad_every_n_tracks': 1, 'bumper_every_n_tracks': 1}))
+        ahead = op.get('/api/v1/now?station=H1&ahead=6').json['station']['ahead']
+        assert (ahead[0]['kind'], ahead[0]['why'], ahead[0]['key']) == ('imaging', 'ident', owed)   # the ID first
+        assert not any(x['kind'] == 'ad' for x in ahead)                                         # ads held
+        hold(op, what='ads', until='off')
+        sync(app, station='H1', events=[ev(1, 'bumper_start', deck='B', file=owed.split('/')[1], dir='I/', duration=5.0)])
+        assert 'ident' not in plan()                                                       # played: nothing owed
+        lib = op.get('/api/v1/library?station=H1&kind=imaging&only=ident').json['items']
+        assert sorted(i['key'] for i in lib) == ['I/id1.wav', 'I/id2.wav'] and all(i['ident'] for i in lib)
+        never = op.get('/api/v1/library?station=H1&kind=imaging&only=never').json['items']
+        assert owed not in [i['key'] for i in never] and len(never) == 2
+        nxt = op.get('/api/v1/now?station=H1').json['station']['ident']
+        assert nxt['count'] == 2 and nxt['next_at'] and nxt['due'] is None
+    finally:
+        settings(ident_schedule=None, ident_window_min=None)
+
+
 def test_ads_plan_rules_and_play_log(app):
     items = [{'key': f'Ads/{n}.wav', 'dir': 'Ads/', 'file': f'{n}.wav', 'kind': 'ad'} for n in ('m1', 'm2', 'h', 'off')]
     assert library_post(app, 'A1', items, ads_dir='Ads/').status_code == 200
@@ -488,6 +581,16 @@ def test_login_rules(app):
     r = c.post('/login', data={'username': 'admin', 'password': 'pw'}, headers={'Origin': 'http://evil.example'})
     assert r.status_code == 403
     assert c.post('/login?next=//evil.com', data={'username': 'admin', 'password': 'pw'}).headers['Location'] == '/'
+
+
+def test_library_pages(app):
+    c = signed_in(app, 'viewer')
+    assert c.get('/library').headers['Location'].endswith('/library/music')
+    assert c.get('/library/nope').headers['Location'].endswith('/library/music')
+    for which, title in (('music', b'Music'), ('imaging', b'Imaging &amp; IDs'), ('ads', b'Advertisements')):
+        r = c.get('/library/' + which)
+        assert r.status_code == 200 and b'<title>' + title in r.data, which
+    assert app.test_client().get('/library/music').status_code == 302                # signed out
 
 
 def test_permissions(app):
@@ -706,6 +809,18 @@ def test_settings_spec_matches_radio_lua():
             continue
         default = spec[7]
         assert (lua[name] == default) if isinstance(default, str) else float(lua[name]) == float(default), name
+
+
+def test_version_matches_everywhere():
+    """Every change is its own version: VERSION, radio.lua and the changelog's top section agree."""
+    import re
+    root = os.path.join(os.path.dirname(__file__), '..')
+    version = open(os.path.join(root, 'VERSION')).read().strip()
+    assert re.fullmatch(r'\d+\.\d+\.\d+', version)
+    lua = open(os.path.join(root, 'qsys', 'radio', 'radio.lua')).read()
+    assert re.search(r'^RADIO_VERSION = "([^"]+)"', lua, re.M).group(1) == version
+    changelog = open(os.path.join(root, 'CHANGELOG.md')).read()
+    assert re.search(r'^## \[([^\]]+)\]', changelog, re.M).group(1) == version
 
 
 # ── Queries and robustness ───────────────────────────────────────────────────

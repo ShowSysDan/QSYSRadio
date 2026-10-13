@@ -7,7 +7,7 @@ pick, shown here without a name), and the list is rebuilt on every poll.
 """
 from datetime import datetime, timedelta, timezone
 
-from . import ads, core_settings
+from . import ads, breaks, core_settings
 
 SONG_GUESS_S = 210         # length assumed for a file never played
 SPOT_GUESS_S = 30
@@ -26,11 +26,13 @@ def _num(v, default=0):
 
 def forecast(cur, station, state, age_s, n=10):
     """[{kind, key, file, artist, title, why, at (ISO), duration}]: the next n items after the one on air.
-    why: queue | rotation | for_ad (song) · hourly | mix | requested (ad) · bumper · stop."""
+    why: queue | rotation | for_ad (song) · hourly | mix | requested (ad) · bumper | ident · stop.
+    Holds and the station ID schedule are followed."""
     if not state.get('automation'):
         return []
     s = _settings(cur, state)
-    cur.execute("""SELECT key, kind, file, artist, title, duration_s, trail_s, lead_in_s, last_played FROM library
+    cur.execute("""SELECT key, kind, file, artist, title, duration_s, COALESCE(trail_set_s, trail_s) AS trail_s,
+                          COALESCE(lead_set_s, lead_in_s) AS lead_in_s, last_played FROM library
                    WHERE station = %s AND present AND NOT unsupported""", (station,))
     lib = {r['key']: dict(r) for r in cur.fetchall()}
     sched, hour_start = ads.schedule(cur, station)
@@ -41,20 +43,42 @@ def forecast(cur, station, state, age_s, n=10):
         return r.get('duration_s') or guess
 
     song_air = ads.airtime({n: float(s[n]) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})
+    spot_air = ads.airtime({n: float(s[n]) if n != 'crossfade_s' else 0.0
+                            for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})   # no crossfade, quiet ends skipped
 
     def air(key):                      # a song: start to the next item's start (quiet start skipped, crossfade early)
         r = lib.get(key) or {}
         return song_air(dict(r, duration_s=length(key, SONG_GUESS_S), lead_in_s=r.get('lead_in_s'), trail_s=r.get('trail_s')))
 
-    def next_slot(at):                 # the next per-hour slot opening after `at`: (datetime, window s) or None
+    hold = breaks.holds(cur, station)
+    ids = breaks.idents(cur, station)
+    every = breaks.EVERY_MIN.get(s['ident_schedule'], 0) if ids['keys'] else 0
+    taken_idents = set()
+
+    def ident_slot(at):                # the ID slot open at `at` and not yet played, as minutes past hour_start, or None
+        if not every:
+            return None
         minute = (at - hour_start).total_seconds() / 60
-        later = [(m + hour, r['per_hour']) for key, r in sched.items() for m, st in zip(r.get('slots', ()), r.get('states', ()))
-                 for hour in (0, 60) if (hour or st not in ('done', 'missed')) and m + hour > minute
-                 and (key, m + hour) not in taken_slots]
+        m = minute // every * every
+        if minute - m > ids['window_s'] / 60 or m in taken_idents:
+            return None
+        if at - timedelta(minutes=minute - m) <= now and not ids['due']:
+            return None                # the slot already open now: owed only if the server says so (not played yet)
+        return m
+
+    def next_slot(at):                 # the next ad / ID slot opening after `at`: (datetime, window s) or None
+        minute = (at - hour_start).total_seconds() / 60
+        later = [] if breaks.held(hold.get('ads'), at) else [
+            (m + hour, ads.window_minutes(r['per_hour']) * 60) for key, r in sched.items()
+            for m, st in zip(r.get('slots', ()), r.get('states', ()))
+            for hour in (0, 60) if (hour or st not in ('done', 'missed')) and m + hour > minute
+            and (key, m + hour) not in taken_slots]
+        if every:
+            later.append((minute // every * every + every, ids['window_s']))
         if not later:
             return None
-        m, per_hour = min(later)
-        return hour_start + timedelta(minutes=m), ads.window_minutes(per_hour) * 60
+        m, window = min(later)
+        return hour_start + timedelta(minutes=m), window
 
     # when the next item starts: the live song's (or break's) time left, less the crossfade and its tail
     decks = [d for d in (state.get('decks') or {}).values() if isinstance(d, dict)]
@@ -106,21 +130,32 @@ def forecast(cur, station, state, age_s, n=10):
             spots = []
             if ad_req and not out:
                 spots.append(('ad', (state.get('next_ad') or {}).get('key'), 'requested'))
+            if breaks.held(hold.get('ads'), t):
+                owed = []                      # held: nothing owed or mixed in (the slots are skipped)
             for _, key, slot in sorted(owed):
                 taken_slots.add(slot)
                 spots.append(('ad', key, 'hourly'))
-            if ad_req or (s['ad_every_n_tracks'] > 0 and since_ad >= s['ad_every_n_tracks']):
+            if (ad_req and not out) or (s['ad_every_n_tracks'] > 0 and since_ad >= s['ad_every_n_tracks']
+                                        and not breaks.held(hold.get('ads'), t)):
                 spots += [('ad', None, 'mix')] * (int(s['ads_per_break']) - len(spots)) if mixes else []
             spots = spots[:int(s['ads_per_break'])]
-            if bumper_req and not out or (s['bumper_every_n_tracks'] > 0 and since_bumper >= s['bumper_every_n_tracks']):
+            id_m = ident_slot(t)
+            if id_m is not None:               # the station ID: first, and instead of the regular bumper
+                taken_idents.add(id_m)
+                due_now = t - timedelta(minutes=(t - hour_start).total_seconds() / 60 - id_m) <= now
+                spots.insert(0, ('imaging', ids['due'] if due_now else None, 'ident'))
+            elif bumper_req and not out or (s['bumper_every_n_tracks'] > 0 and since_bumper >= s['bumper_every_n_tracks']
+                                            and not breaks.held(hold.get('bumpers'), t)):
                 spots.append(('imaging', (state.get('next_bumper') or {}).get('key') if bumper_req and not out else None,
                               'bumper'))
             for i, (kind, key, why) in enumerate(spots):
                 guess = SPOT_GUESS_S
                 dur = length(key, guess) if key else guess
-                add(key, kind, why, dur, None if key else ('Mix-in ad' if kind == 'ad' else 'Bumper'))
+                add(key, kind, why, dur, None if key else {'ad': 'Mix-in ad', 'ident': 'Station ID'}.get(
+                    kind if kind == 'ad' else why, 'Bumper'))
                 last = i == len(spots) - 1
-                t += timedelta(seconds=max(0, dur - (s['bumper_tail_s'] if last else 0)))
+                plays = spot_air(dict(lib[key], duration_s=dur)) if key in lib else dur
+                t += timedelta(seconds=max(0, plays - (s['bumper_tail_s'] if last else 0)))
                 if kind == 'ad':
                     since_ad = 0
                 else:

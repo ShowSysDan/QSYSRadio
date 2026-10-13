@@ -18,7 +18,7 @@ import hashlib
 import json
 from datetime import timedelta
 
-from . import core_settings
+from . import breaks, core_settings
 from .db import text
 from .events import BadRequest
 
@@ -118,7 +118,7 @@ def next_song(cur, station, slot=None):
     Stable while one song plays (seeded by its play). None when the operator queue has songs,
     automation is off or nothing qualifies. slot: (datetime the next per-hour
     slot opens, its window in seconds) or None. See choose()."""
-    cur.execute("""SELECT s.state, p.id, p.started_at, p.duration_s, l.trail_s, l.lead_in_s, l.key
+    cur.execute("""SELECT s.state, p.id, p.started_at, p.duration_s, COALESCE(l.trail_set_s, l.trail_s) AS trail_s, COALESCE(l.lead_set_s, l.lead_in_s) AS lead_in_s, l.key
                    FROM stations s
                    LEFT JOIN LATERAL (SELECT * FROM play_log WHERE station = s.station AND kind = 'music' AND ended_at IS NULL
                                       ORDER BY started_at DESC LIMIT 1) p ON TRUE
@@ -128,7 +128,8 @@ def next_song(cur, station, slot=None):
     state = (on_air and on_air['state']) or {}
     if not on_air or state.get('queue') or state.get('automation') is not True:
         return None, None
-    cur.execute("""SELECT key, duration_s, trail_s, lead_in_s, count(*) OVER () AS n FROM library
+    cur.execute("""SELECT key, duration_s, COALESCE(trail_set_s, trail_s) AS trail_s,
+                          COALESCE(lead_set_s, lead_in_s) AS lead_in_s, count(*) OVER () AS n FROM library
                    WHERE station = %s AND present AND NOT unsupported AND kind = 'music' AND key IS DISTINCT FROM %s
                      AND lower(COALESCE(artist, '')) NOT IN (
                          SELECT lower(artist) FROM (SELECT artist FROM play_log WHERE station = %s AND kind = 'music'
@@ -195,17 +196,29 @@ def choose(rotation, quarter, half, gap, tolerance, window):
 
 
 def plan(cur, station):
-    """({'due': [keys, longest waiting first], 'mix': [keys], 'next': key of the
-    song to play next, 'next_why': 'rotation' | 'ad'}, rev) for the Core."""
+    """The Core's plan, and its rev: {'due': [ads owed, longest waiting first], 'mix': [ads],
+    'next': song to play next, 'next_why': 'rotation' | 'ad', 'ident': station ID owed,
+    'no_bumpers': True while bumpers are held}. Held ads: none owed or mixed in."""
     rows, hour_start = schedule(cur, station)
     rows = rows.values()
-    mix = [r['key'] for r in rows if r['mode'] == 'mix']
-    due = sorted((r['slots'][r['states'].index('due')], r['key']) for r in rows if 'due' in r.get('states', ()))
-    upcoming = [(m, r['per_hour']) for r in rows for m, st in zip(r.get('slots', ()), r.get('states', ())) if st == 'next']
-    upcoming += [(r['slots'][0] + 60, r['per_hour']) for r in rows if r.get('slots')]   # the next hour's first ones
-    out = {'due': [k for _, k in due], 'mix': mix}
-    m, per_hour = min(upcoming) if upcoming else (None, None)
-    song, why = next_song(cur, station, (hour_start + timedelta(minutes=m), window_minutes(per_hour) * 60) if m is not None else None)
+    hold = breaks.holds(cur, station)
+    ids = breaks.idents(cur, station)
+    out = {'due': [], 'mix': []}
+    upcoming = []                      # (datetime a slot opens, its window s): the next song is timed for the first
+    if 'ads' not in hold:
+        out['mix'] = [r['key'] for r in rows if r['mode'] == 'mix']
+        due = sorted((r['slots'][r['states'].index('due')], r['key']) for r in rows if 'due' in r.get('states', ()))
+        out['due'] = [k for _, k in due]
+        upcoming = [(hour_start + timedelta(minutes=m + hour), window_minutes(r['per_hour']) * 60)
+                    for r in rows for m, st in zip(r.get('slots', ()), r.get('states', ()))
+                    for hour in (0, 60) if (st == 'next' and not hour) or (hour and m == r['slots'][0])]
+    if ids['next_at']:
+        upcoming.append((ids['next_at'], ids['window_s']))
+    if ids['due']:
+        out['ident'] = ids['due']
+    if 'bumpers' in hold:
+        out['no_bumpers'] = True
+    song, why = next_song(cur, station, min(upcoming) if upcoming else None)
     if song:
         out['next'], out['next_why'] = song, why
     return out, hashlib.sha1(json.dumps(out).encode()).hexdigest()[:12]

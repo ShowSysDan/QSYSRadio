@@ -146,6 +146,18 @@ check(Library.byKey["Test/Tuning/B - Song2.flac"] == nil and #Library.music == 3
 Library.scan()
 check(Library.byKey["Test/Tuning/B - Song2.flac"] == nil, "and stays out after a rescan")
 
+print("-- the server's figures replace this boot's; the operator's (fixed) are not learned over")
+boot(songs(2, 30), {})
+SETTINGS.bumper_every_n_tracks, SETTINGS.artist_separation = 0, 0
+Library.learn({ ["Test/Tuning/A - Song1.flac"] = { trail = 2.5, lead = 0.1, fixed = true } })
+MockCore.run(130)
+local fixedA, freeB = LEARNED["Test/Tuning/A - Song1.flac"], LEARNED["Test/Tuning/B - Song2.flac"]
+check(fixedA.trail == 2.5 and fixedA.lead == 0.1, "operator's figures kept through plays")
+check(freeB and freeB.lead and freeB.lead > 0, "other files still learned this boot")
+Library.learn({})
+check(LEARNED["Test/Tuning/A - Song1.flac"].trail == nil and LEARNED["Test/Tuning/B - Song2.flac"].lead == nil
+  and not LEARNED["Test/Tuning/A - Song1.flac"].fixed, "forgotten on the server: forgotten on the Core")
+
 print("-- the outbox is written only while the server is unreachable")
 boot(songs(4, 20), BUMPERS, function()
   MockCore.httpHandler = function(req)
@@ -209,6 +221,54 @@ MockCore.run(60)
 local off = true
 for i, e in ipairs(evs("track_start")) do if i > before and e.skip then off = false end end
 check(off, "lead_skip_max_s = 0: every song from the start")
+
+print("-- a crossfade is not a silent tail: learned trail stays the file's own, songs play to their crossfade point")
+boot(songs(3, 30), {})
+SETTINGS.bumper_every_n_tracks = 0
+MockCore.run(200)
+local maxTrail, minPlayed = 0, 99
+for _, e in ipairs(evs("track_end")) do
+  if e.trail and e.trail > maxTrail then maxTrail = e.trail end
+  if e.played and e.played < minPlayed then minPlayed = e.played end
+end
+check(maxTrail < 2, string.format("no crossfade learned as a trail (largest %.2f s, files have 0.5 s)", maxTrail))
+check(minPlayed > 29, string.format("every song plays ~30 s (shortest %.1f s)", minPlayed))
+
+print("-- a fade-out at the end starts the next song early, by at most fade_out_early_s")
+boot({ { name = "A - Fades.flac", duration = 30, lead = 0.2, trail = 0.5, level = -10, fade = 10 },
+       { name = "B - Song.flac", duration = 30, lead = 0.2, trail = 0.5, level = -10 } }, {})
+SETTINGS.bumper_every_n_tracks, SETTINGS.artist_separation = 0, 0
+MockCore.run(200)
+local fades, fadePlayed = 0, nil
+for _, e in ipairs(evs("transition")) do if e.reason == "fade" then fades = fades + 1 end end
+for _, e in ipairs(evs("track_end")) do if e.file == "A - Fades.flac" then fadePlayed = e.played end end
+check(fades >= 2, string.format("fading song handed over early (%d times)", fades))
+check(fadePlayed and fadePlayed >= 27.5 and fadePlayed < 29.5,
+  string.format("early by at most 2 s (played %s s of 30, crossfade included)", tostring(fadePlayed)))
+boot({ { name = "A - Fades.flac", duration = 30, lead = 0.2, trail = 0.5, level = -10, fade = 10 },
+       { name = "B - Song.flac", duration = 30, lead = 0.2, trail = 0.5, level = -10 } }, {})
+SETTINGS.bumper_every_n_tracks, SETTINGS.artist_separation, SETTINGS.fade_out_early_s = 0, 0, 0
+MockCore.run(120)
+fades = 0
+for _, e in ipairs(evs("transition")) do if e.reason == "fade" then fades = fades + 1 end end
+check(fades == 0, "fade_out_early_s = 0: off")
+
+print("-- break items: quiet start / end learned and skipped like songs")
+boot(songs(4, 30), {}, function()
+  MockCore.dirs["Test/Ads/"] = { { name = "ad1.wav", duration = 12, lead = 0.2, trail = 3, level = -8 },
+                                 { name = "ad2.wav", duration = 12, lead = 0.2, trail = 3, level = -8 } }
+end)
+SETTINGS.ads_dir, SETTINGS.ad_every_n_tracks, SETTINGS.ads_per_break, SETTINGS.bumper_every_n_tracks = "Test/Ads/", 1, 2, 0
+Library.scan()
+MockCore.run(240)
+local adStarts, learnedAd = evs("ad_start"), LEARNED["Test/Ads/ad1.wav"] or {}
+local gaps = {}
+for i = 2, #adStarts do
+  local g = adStarts[i].at - adStarts[i - 1].at
+  if g < 15 then gaps[#gaps + 1] = g end          -- back to back in one break
+end
+check(learnedAd.trail and math.abs(learnedAd.trail - 3) < 0.6, "an ad's silent tail is learned (" .. tostring(learnedAd.trail) .. " s)")
+check(#gaps >= 2 and gaps[#gaps] <= 10.5, string.format("the next ad starts at the quiet end (last gap %.1f s of a 12 s ad)", gaps[#gaps] or -1))
 
 print("-- lightweight: fast timer only while fading/loading")
 boot(songs(6, 60), BUMPERS)

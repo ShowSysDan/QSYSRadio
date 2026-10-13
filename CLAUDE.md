@@ -5,9 +5,13 @@ a Flask + PostgreSQL server (`server/`) does everything else (play log, web
 control panel, settings, library, sign-in, syslog). README.md has the design.
 
 ## Every change
-- Record it under `## [Unreleased]` in CHANGELOG.md in the same commit.
-  At release, roll it into a numbered section and bump `VERSION` and
-  `RADIO_VERSION` in radio.lua (semver).
+- Every change (each commit the user gets) is its own version: bump `VERSION`
+  and `RADIO_VERSION` in radio.lua together (semver: patch = fix, minor =
+  feature, major = breaking) and add a new top section
+  `## [X.Y.Z] - YYYY-MM-DD` to CHANGELOG.md. No `[Unreleased]` section.
+  `test_version_matches_everywhere` fails if they disagree.
+- Document it in the same commit: README.md (design, settings, panel,
+  deploy steps) wherever the change shows, plus `.env.example` for new keys.
 - Tell the user what to redeploy: the Core (paste radio.lua), the server
   (`git pull && sudo systemctl restart qsysradio`), both, or neither.
 - No duplicated code: reuse the helpers (Lua: `push`, `shuffled`, `set`/`trigger`,
@@ -67,7 +71,7 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   One advisory lock per station serialises sync and `add_command`.
 - `POST /api/v1/core/library` after every scan (bulk `execute_values`);
   reply: `learned` {key: {trail, lead} | {unsupported}} for the Core.
-- Ads: the server sends `ads` {due, mix, next, next_why} when `ads_rev` differs
+- Ads: the server sends `ads` {due, mix, next, next_why, ident, no_bumpers} when `ads_rev` differs
   (`ads.py`); the Core only plays the plan (without one, every ad is a mix-in).
   `next` is the song to play next, picked on the server (`next_song`: least
   recently played, or by length to land the break on an ad slot); the Core

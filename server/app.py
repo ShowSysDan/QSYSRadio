@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, g, jsonify, redirect, render_template, request, session, url_for
 
-from . import ads, auth, clock, config, control, db, forecast, logs, plays
+from . import ads, auth, breaks, clock, config, control, db, forecast, logs, plays
 from .events import BadRequest
 from .migrate import discover
 
@@ -194,10 +194,23 @@ def dashboard():
     return _page('dashboard.html', 'dashboard')
 
 
+LIBRARY_PAGES = {'music': ('music', 'Music'), 'imaging': ('imaging', 'Imaging & IDs'), 'ads': ('ad', 'Advertisements')}
+
+
 @app.get('/library')
 @auth.login_required
 def library_page():
-    return _page('library.html', 'library')
+    return redirect(url_for('library_kind', which='music'))
+
+
+@app.get('/library/<which>')
+@auth.login_required
+def library_kind(which):
+    """One page per kind of file: Music, Imaging & IDs, Advertisements."""
+    if which not in LIBRARY_PAGES:
+        return redirect(url_for('library_kind', which='music'))
+    kind, title = LIBRARY_PAGES[which]
+    return render_template('library.html', page=kind, kind=kind, title=title)
 
 
 @app.get('/log')
@@ -294,8 +307,63 @@ def get_library():
     if not station:
         return jsonify(ok=True, total=0, items=[])
     total, items, totals = control.library(dbconn(), station, q=_arg('q'), kind=_arg('kind'), sort=_arg('sort', 'artist'),
-                                   limit=_int_arg('limit', 200, 1, 1000), offset=_int_arg('offset', 0, 0, 10 ** 7))
+                                   limit=_int_arg('limit', 200, 1, 1000), offset=_int_arg('offset', 0, 0, 10 ** 7),
+                                   only=_arg('only'))
     return jsonify(ok=True, station=station, total=total, items=items, totals=totals)
+
+
+@app.post('/api/v1/hold')
+@auth.operator_required
+def post_hold():
+    """{station, what: ads|bumpers, until: ISO time | null (until resumed) | 'off' (resume)}."""
+    body = _json_body()
+    station = _station(body.get('station'))
+    if not station:
+        raise BadRequest('no station has connected yet')
+    write_logs([breaks.set_hold(dbconn(), station, body.get('what'), body.get('until'), auth.current_user())])
+    return jsonify(ok=True)
+
+
+@app.post('/api/v1/library/ident')
+@auth.operator_required
+def post_ident():
+    """{station, key, ident: true|false}: mark an imaging file as a station ID."""
+    body = _json_body()
+    station = _station(body.get('station'))
+    if not station:
+        raise BadRequest('no station has connected yet')
+    breaks.set_ident(dbconn(), station, body.get('key'), body.get('ident') is True)
+    write_logs([(20, f'IDENT station={station} key="{body.get("key")}" ident={body.get("ident") is True} '
+                     f'by={auth.current_user().get("username")}')])
+    return jsonify(ok=True)
+
+
+@app.post('/api/v1/library/trim')
+@auth.operator_required
+def post_trim():
+    """{station, key, lead, trail}: the quiet start / end in seconds (null = use the measured one)."""
+    body = _json_body()
+    station = _station(body.get('station'))
+    if not station:
+        raise BadRequest('no station has connected yet')
+    conn, user = dbconn(), auth.current_user()
+    line = control.set_trim(conn, station, body.get('key'), body.get('lead'), body.get('trail'), user)
+    write_logs([line, control.add_command(conn, station, 'rescan', {}, user)[1]])   # the Core picks it up
+    return jsonify(ok=True)
+
+
+@app.post('/api/v1/library/forget')
+@auth.operator_required
+def post_forget():
+    """{station, key} or {station, kind}: forget the measured quiet start / end (measured again on the next play)."""
+    body = _json_body()
+    station = _station(body.get('station'))
+    if not station:
+        raise BadRequest('no station has connected yet')
+    conn, user = dbconn(), auth.current_user()
+    n, line = control.forget_measured(conn, station, body.get('key'), body.get('kind'), user)
+    write_logs([line, control.add_command(conn, station, 'rescan', {}, user)[1]])
+    return jsonify(ok=True, files=n)
 
 
 @app.post('/api/v1/ads')

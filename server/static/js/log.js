@@ -23,7 +23,7 @@
       const d = await R.api(R.withStation('/api/v1/plays?' + qs));
       const n = (k) => d.plays.filter((p) => p.kind === k).length;
       show(d.plays, d.plays.length + ' plays on ' + new Date(day + 'T12:00:00Z').toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' }) +
-        ' (' + n('music') + ' music, ' + n('imaging') + ' imaging, ' + n('ad') + ' ads)', false, 'playlog-' + day);
+        ' (' + n('music') + ' music, ' + n('imaging') + ' imaging, ' + n('ad') + ' advertisements)', false, 'playlog-' + day);
     } catch (err) { $('log-summary').textContent = 'Error: ' + err.message; }
   }
 

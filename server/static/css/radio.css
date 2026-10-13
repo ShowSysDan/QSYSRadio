@@ -232,8 +232,13 @@ table.plays { width: 100%; border-collapse: collapse; font-size: 13px; }
 .plays tr:hover td { background: rgba(255,255,255,.025); }
 .plays td.t, .plays td.num { font-family: var(--mono); font-size: 12px; white-space: nowrap; color: var(--text-dim); }
 .plays .file { display: block; color: var(--text-muted); font: 11px var(--mono); }
-.plays tr.open td { background: linear-gradient(90deg, rgba(239,68,68,.12), transparent 60%); }
+.plays tr.open td { background: rgba(239,68,68,.07); }          /* one even tint: a gradient per cell made stripes */
+.plays tr.open td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
 .plays td.acts { white-space: nowrap; text-align: right; }
+.trim { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 6px 0; }
+.trim label { display: inline-flex; gap: 6px; align-items: center; }
+.trim input { width: 76px; padding: 4px 8px; font-size: 12px; }
+.trim .small { flex-basis: 100%; }
 .plays td.acts button { margin-left: 4px; }
 .tag { display: inline-block; font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: .5px; border-radius: 3px; padding: 1px 6px;
   color: var(--text-dim); background: var(--surface2); border: 1px solid var(--border); white-space: nowrap; text-transform: uppercase; }
@@ -314,7 +319,14 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 * { scrollbar-width: thin; scrollbar-color: var(--border-hover) transparent; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--border-hover); border-radius: 4px; }
+/* long titles slide back and forth (common.js R.marquee) */
+.marq { overflow: hidden; white-space: nowrap; text-overflow: clip; display: block; }
+.marq > span { display: inline-block; white-space: nowrap; }
+.marq.scroll > span { animation: marq var(--dur, 8s) ease-in-out infinite alternate; }
+@keyframes marq { 0%, 15% { transform: translateX(0); } 85%, 100% { transform: translateX(calc(-1 * var(--dist, 0px))); } }
 @media (prefers-reduced-motion: reduce) {
+  .marq.scroll > span { animation: none; }
+  .marq { text-overflow: ellipsis; }
   * { transition-duration: .01ms !important; animation-duration: .01ms !important; }
   button:hover { transform: none; }
 }
@@ -338,3 +350,27 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   .set-row { grid-template-columns: 1fr; }
   .plays td.acts button span { display: none; }
 }
+
+/* pause ads / bumpers */
+.hold-btn { font-size: 9px; padding: 1px 6px; margin-left: 6px; line-height: 1.4; letter-spacing: -1px; vertical-align: middle; }
+.hold-menu { position: absolute; z-index: 60; width: 230px; display: flex; flex-direction: column; gap: 6px; padding: 12px;
+  background: var(--raised); border: 1px solid var(--border-hover); border-radius: var(--radius); box-shadow: var(--lift); }
+.hold-menu .hm-title { font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 1px; color: var(--text-dim); }
+.hold-menu .hm-held { font-size: 12px; color: var(--warning); }
+.hold-menu .hm-held:empty { display: none; }
+.hold-menu button { justify-content: flex-start; }
+.hold-menu .hm-until { display: flex; gap: 6px; }
+.hold-menu .hm-until input { flex: 1; padding: 4px 8px; }
+
+/* library pages */
+.tag.ident { color: var(--purple); border-color: rgba(167,139,250,.5); background: rgba(167,139,250,.12); }
+.id-btn { font-family: var(--mono); font-weight: 700; }
+.id-btn.on { color: #000; background: var(--purple); border-color: var(--purple); }
+.hour-line { display: flex; flex-wrap: wrap; gap: 6px; }
+.hour-line .hl { font-size: 12px; padding: 3px 8px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface2); color: var(--text-dim); }
+.hour-line .hl b { font-family: var(--mono); color: var(--text); margin-right: 4px; }
+.hour-line .hl.done { opacity: .55; text-decoration: line-through; }
+.hour-line .hl.due { color: #000; background: var(--warning); border-color: var(--warning); }
+.hour-line .hl.due b { color: #000; }
+.hour-line .hl.missed { color: var(--danger); text-decoration: line-through; border-color: rgba(239,68,68,.3); }
+#hour-tile { margin-bottom: 16px; }

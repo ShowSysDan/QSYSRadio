@@ -43,6 +43,21 @@
   };
   R.who = (p) => ({ title: String(p.title || p.file || '?'), artist: p.artist ? String(p.artist) : '' });
   R.whoLine = (p) => { const w = R.who(p); return (w.artist ? w.artist + ' – ' : '') + w.title; };
+  // text that slides back and forth when it is wider than its box (el gets class "marq")
+  R.marquee = (el, text) => {
+    if (!el) return;
+    if (el.dataset.text !== text) {
+      el.dataset.text = text;
+      el.classList.add('marq');
+      el.innerHTML = '<span>' + R.esc(text) + '</span>';
+    }
+    const over = el.firstChild.scrollWidth - el.clientWidth;
+    el.classList.toggle('scroll', over > 2);
+    if (over > 2) {
+      el.style.setProperty('--dist', over + 'px');
+      el.style.setProperty('--dur', Math.max(6, over / 25 + 4) + 's');   // ~25 px/s, with pauses at each end
+    }
+  };
   // write innerHTML only when it changed (keeps buttons alive under the cursor)
   R.setHTML = (el, html) => { if (el && el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; } };
 

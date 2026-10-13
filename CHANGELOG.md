@@ -2,11 +2,43 @@
 
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
-versions follow [Semantic Versioning](https://semver.org/).
+versions follow [Semantic Versioning](https://semver.org/). Every change
+ships as its own version: the top section always matches `VERSION`.
 
-## [Unreleased]
+## [1.0.1] - 2026-10-13
+
+First stable version: the same code as 0.3.0, declared solid. From here on
+every change ships as its own version (patch = fix, minor = feature).
+Redeploy: the Core (paste radio.lua, so it reports 1.0.1) and the server
+(`git pull && sudo systemctl restart qsysradio`).
+
+## [0.3.0] - 2026-10-13
 
 ### Added
+- **See and adjust each file's quiet start and end.** On the Music, Imaging &
+  IDs and Advertisements pages, click the length without silence: the
+  measured figures, your own (the Core never measures over them), "Use
+  measured" and "Forget measured" (measured again on the next play). A
+  "Forget measured" button does a whole page; an "Adjusted" filter lists the
+  files you set. The server queues a rescan so the Core applies the change.
+  Migration 0009.
+- **Pause ads and bumpers**, for 30 min, 1 hour, until a time ("no more
+  ads till 05:00") or until resumed: a pause button on the Next bumper /
+  Next ad break cards, PAUSED and until when shown on the card. Server side
+  (`station_holds`, `POST /api/v1/hold`): held ads leave the plan, held
+  bumpers set `no_bumpers` (one check in radio.lua). Operator Bumper now /
+  Ad break now still play.
+- **Station IDs**: mark imaging files as IDs (Imaging & IDs page,
+  `library.ident`, `POST /api/v1/library/ident`) and set **Station ID
+  schedule** (off / hourly / half-hourly / quarter-hourly) and **Station ID
+  may be late by**. The server names a random ID when one is owed (`ident`
+  in the plan); the Core plays it first in that break instead of the regular
+  bumper. Song picks and Coming up account for ID times; the bumper card
+  shows the next ID time.
+- **Library split into Music, Imaging & IDs and Ads tabs** with quick
+  filters (`?only=never|unsupported|ident|hourly|mix|off`), search on `/`,
+  view kept in the URL, and on Ads a "This hour" line of every per-hour slot
+  in time order. `/library` now opens Music. Migration `0007_holds_and_idents`.
 - **Fair rotation first, ad timing second.** The server keeps the fair
   pick (random among the least recently played quarter) unless it would
   start a per-hour ad more than **Ad timing tolerance** late (new setting,
@@ -131,6 +163,21 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- **Fade-outs start the next item early.** When the end of a song, bumper or
+  ad fades away (a ringing note, a dying beat) and stays 20 dB under the
+  file's own peak for half a second, the next item starts up to 2 s before
+  the regular crossfade point. Settings → Silence detection: "Start early
+  over a fade-out, at most" (0 = off) and "Fade-out level".
+- **Bumpers and ads get the silence handling songs have**: their quiet start
+  is skipped and the next break item starts at the quiet end, not at the end
+  of the file. The library shows "Without silence" for imaging too.
+- **"Ads" is spelled out as "Advertisements"** wherever the panel has room:
+  the tab and page title, the Settings group and labels, the pause menu, the
+  play log filter. Short tags ("AD", "Next ad break") stay short.
+- Dashboard: long titles in Up next slide back and forth instead of being
+  cut off (still when the system asks for reduced motion); the Next ad
+  break card shows the full time (17:32, not :32); the on-air row in Recent
+  plays has one even red tint with a red edge (a fade per cell made stripes).
 - radio.lua is ~1100 lines (was ~1220): the optional Q-SYS panel controls
   are gone (inputs `Skip`, `BumperNow`, `Automation`; outputs `Status`,
   `NowPlaying`, `NextUp`, `DeckA`, `DeckB`, `LastEvent`): the station is
@@ -195,6 +242,12 @@ versions follow [Semantic Versioning](https://semver.org/).
   (`RADIO_ALLOW_NO_TOKEN=1` for a lab).
 
 ### Fixed
+- **Songs crossfaded about 4 s early from their second play.** The Core
+  counted the crossfade itself as the song's silent tail (it measured after
+  the fade had begun), so every learned tail was about the crossfade length.
+  Tails now count only when the silence was heard before any fade; migration
+  0008 forgets the wrong ones (real silent tails are learned again on the
+  next play).
 - radio.lua: a rescan restarted the shuffle bag, so with regular rescans
   some songs could go unplayed for a long time (the server now picks songs,
   and the bag keeps its cycle across rescans).
