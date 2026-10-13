@@ -7,6 +7,23 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Pause ads and bumpers**, for 30 min, 1 hour, until a time ("no more
+  ads till 05:00") or until resumed: a pause button on the Next bumper /
+  Next ad break cards, PAUSED and until when shown on the card. Server side
+  (`station_holds`, `POST /api/v1/hold`): held ads leave the plan, held
+  bumpers set `no_bumpers` (one check in radio.lua). Operator Bumper now /
+  Ad break now still play.
+- **Station IDs**: mark imaging files as IDs (Imaging & IDs page,
+  `library.ident`, `POST /api/v1/library/ident`) and set **Station ID
+  schedule** (off / hourly / half-hourly / quarter-hourly) and **Station ID
+  may be late by**. The server names a random ID when one is owed (`ident`
+  in the plan); the Core plays it first in that break instead of the regular
+  bumper. Song picks and Coming up account for ID times; the bumper card
+  shows the next ID time.
+- **Library split into Music, Imaging & IDs and Ads tabs** with quick
+  filters (`?only=never|unsupported|ident|hourly|mix|off`), search on `/`,
+  view kept in the URL, and on Ads a "This hour" line of every per-hour slot
+  in time order. `/library` now opens Music. Migration `0007_holds_and_idents`.
 - **Fair rotation first, ad timing second.** The server keeps the fair
   pick (random among the least recently played quarter) unless it would
   start a per-hour ad more than **Ad timing tolerance** late (new setting,

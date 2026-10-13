@@ -67,7 +67,7 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   One advisory lock per station serialises sync and `add_command`.
 - `POST /api/v1/core/library` after every scan (bulk `execute_values`);
   reply: `learned` {key: {trail, lead} | {unsupported}} for the Core.
-- Ads: the server sends `ads` {due, mix, next, next_why} when `ads_rev` differs
+- Ads: the server sends `ads` {due, mix, next, next_why, ident, no_bumpers} when `ads_rev` differs
   (`ads.py`); the Core only plays the plan (without one, every ad is a mix-in).
   `next` is the song to play next, picked on the server (`next_song`: least
   recently played, or by length to land the break on an ad slot); the Core

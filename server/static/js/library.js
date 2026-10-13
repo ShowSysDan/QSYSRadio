@@ -1,19 +1,26 @@
-// Library: search the Core's files, play next / queue / play now / bumper now,
-// schedule ads. Reloads itself when the Core uploads a new scan or something plays.
+// Library pages (Music, Imaging & IDs, Ads): search, filter, play next / queue /
+// play now / bumper now, mark station IDs, schedule ads. Reloads itself when the
+// Core uploads a new scan or something plays. Search, sort and filter live in the URL.
 (function () {
   'use strict';
   const R = window.Radio, $ = R.$, esc = R.esc;
   const PAGE = 100;
-  let kind = 'music', offset = 0, seq = 0, timer = null, loading = false, stale = false, seen = null;
+  const kind = $('lib-tile').dataset.kind;
+  let offset = 0, seq = 0, timer = null, loading = false, stale = false, seen = null, only = '';
   const ICON = {
     next: '<svg viewBox="0 0 24 24"><path d="M4 6h10v2H4zm0 5h10v2H4zm0 5h6v2H4zm12-3v-3h2v3h3v2h-3v3h-2v-3h-3v-2z"/></svg>',
     queue: '<svg viewBox="0 0 24 24"><path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h10v2H4z"/></svg>',
     play: '<svg viewBox="0 0 24 24"><path d="M7 5v14l11-7z"/></svg>',
   };
   const NOUN = { music: 'songs', imaging: 'imaging files', ad: 'ads' };
+  const FILTERS = {
+    music: [['', 'All'], ['never', 'Never played'], ['unsupported', 'Unsupported']],
+    imaging: [['', 'All'], ['ident', 'Station IDs'], ['never', 'Never played'], ['unsupported', 'Unsupported']],
+    ad: [['', 'All'], ['hourly', 'Per hour'], ['mix', 'Mix in'], ['off', 'Off'], ['never', 'Never played']],
+  };
   const HEAD = {
     music: ['Artist – Title', 'Length', 'Without silence', 'Plays', 'Last played', ''],
-    imaging: ['Artist – Title', 'Length', 'Plays', 'Last played', ''],
+    imaging: ['Artist – Title', 'Length', 'Plays', 'Last played', ''],     // the ID toggle sits with the actions
     ad: ['Artist – Title', 'Length', 'Schedule', 'This hour', 'Today', 'Last played', ''],
   };
   const button = (action, icon, text, title, primary) =>
@@ -26,7 +33,9 @@
         button('now', 'play', 'Play now', 'Fade to this now', true);
     }
     return it.kind === 'ad' ? button('ad', 'play', 'Play now', 'Fade to an ad break with this ad, now', true)
-      : button('bumper', 'play', 'Bumper now', 'Play this at the next transition, now', true);
+      : '<button class="sm id-btn' + (it.ident ? ' on' : '') + '" data-a="ident" title="' +
+          (it.ident ? 'A station ID: click to make it an ordinary bumper' : 'Mark as a station ID (played on the ID schedule)') + '">ID</button>' +
+        button('bumper', 'play', 'Bumper now', 'Play this at the next transition, now', true);
   }
 
   // this hour's times for an hourly ad
@@ -55,7 +64,8 @@
   }
 
   function row(it) {
-    const name = esc(R.whoLine(it)) + (it.unsupported ? ' <span class="tag bad" title="The player cannot load this file">unsupported</span>' : '') +
+    const name = esc(R.whoLine(it)) + (it.ident ? ' <span class="tag ident" title="Station ID">ID</span>' : '') +
+      (it.unsupported ? ' <span class="tag bad" title="The player cannot load this file">unsupported</span>' : '') +
       '<span class="file">' + esc(it.directory + it.file) + '</span>';
     const last = '<td class="num" title="' + esc(R.timeOf(it.last_played, true)) + '">' + esc(R.ago(it.last_played)) + '</td>';
     const len = '<td class="num">' + (R.num(it.duration_s) ? R.clock(it.duration_s) : '–') + '</td>';
@@ -77,6 +87,12 @@
     const qs = new URLSearchParams({ kind, sort: $('lib-sort').value, limit, offset });
     const q = $('lib-q').value.trim();
     if (q) qs.set('q', q);
+    if (only) qs.set('only', only);
+    const here = new URLSearchParams();               // remembered in the URL (back button, links, reload)
+    if (q) here.set('q', q);
+    if (only) here.set('only', only);
+    if ($('lib-sort').value !== 'artist') here.set('sort', $('lib-sort').value);
+    history.replaceState(null, '', location.pathname + (here.toString() ? '?' + here : ''));
     try {
       const d = await R.api(R.withStation('/api/v1/library?' + qs));
       if (my !== seq) return;              // a newer search replaced this one
@@ -86,7 +102,8 @@
         $('lib').insertAdjacentHTML('beforeend', html);
         delete $('lib').dataset.html;
       } else {
-        R.setHTML($('lib'), html || '<tr><td colspan="' + HEAD[kind].length + '" class="empty-state">' + (q ? 'Nothing matches “' + esc(q) + '”.'
+        if (kind === 'ad' && !q && !only) hourLine(d.items);
+        R.setHTML($('lib'), html || '<tr><td colspan="' + HEAD[kind].length + '" class="empty-state">' + (q || only ? 'Nothing matches.'
           : kind === 'ad' ? 'No ads yet. Set the Ads folder in Settings; the Core uploads its files after each scan.'
           : 'No files yet. The Core uploads its library after each scan.') + '</td></tr>');
       }
@@ -94,7 +111,7 @@
       $('lib-more').hidden = offset >= d.total;
       $('lib-info').textContent = d.total + ' ' + NOUN[kind] + (d.station ? ' on ' + d.station : '');
       const t = d.totals || {};
-      $('lib-totals').textContent = !t.n ? '' : (q ? 'Matching: ' : 'Total: ') + t.n + ' ' + NOUN[kind] + ' · ' + R.clock(t.duration_s) +
+      $('lib-totals').textContent = !t.n ? '' : (q || only ? 'Matching: ' : 'Total: ') + t.n + ' ' + NOUN[kind] + ' · ' + R.clock(t.duration_s) +
         (kind === 'music' ? ' (' + R.clock(t.audible_s) + ' without leading / trailing silence)' : '') +
         (t.unknown ? ' · ' + t.unknown + ' not measured yet (length known once played)' : '') +
         (kind === 'music' && t.n ? ' · rotation: ' + (t.never_played ? t.never_played + ' never played' : 'every song played') +
@@ -126,12 +143,41 @@
     refresh();
   }
 
-  $('kind-tabs').addEventListener('click', (e) => {
-    const b = e.target.closest('button[data-kind]');
+  // every per-hour ad's slots this hour, in time order (Ads page)
+  function hourLine(items) {
+    const all = [];
+    items.forEach((it) => (it.slots || []).forEach((x) => all.push({ at: x.at, state: x.state, name: R.whoLine(it) })));
+    all.sort((a, b) => a.at.localeCompare(b.at));
+    $('hour-tile').hidden = !all.length;
+    R.setHTML($('hour'), all.map((x) => '<span class="hl ' + esc(x.state) + '" title="' + esc(SLOT_TIP[x.state] || '') + '"><b>' +
+      esc(R.serverHM(x.at)) + '</b> ' + esc(x.name) + '</span>').join(''));
+  }
+
+  async function setIdent(tr, on) {
+    try {
+      await R.post('/api/v1/library/ident', { station: R.station || undefined, key: tr.dataset.key, ident: on });
+      R.toast(tr.dataset.label + (on ? ': station ID' : ': ordinary bumper'), 'ok');
+    } catch (e) { R.toast(tr.dataset.label + ': ' + e.message, 'bad'); }
+    refresh();
+  }
+
+  // filters, then whatever the URL remembered
+  const url = new URLSearchParams(location.search);
+  only = FILTERS[kind].some(([v]) => v === url.get('only')) ? url.get('only') : '';
+  $('lib-q').value = url.get('q') || '';
+  if (url.get('sort')) $('lib-sort').value = url.get('sort');
+  $('lib-filters').innerHTML = FILTERS[kind].map(([v, t]) => '<button type="button" class="chip' + (v === only ? ' active' : '') +
+    '" data-only="' + v + '">' + t + '</button>').join('');
+  $('lib-filters').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-only]');
     if (!b) return;
-    kind = b.dataset.kind;
-    document.querySelectorAll('#kind-tabs .chip').forEach((x) => x.classList.toggle('active', x === b));
+    only = b.dataset.only;
+    document.querySelectorAll('#lib-filters .chip').forEach((x) => x.classList.toggle('active', x === b));
     load(false);
+  });
+  document.addEventListener('keydown', (e) => {         // "/" jumps to the search box
+    if (e.key === '/' && !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) { e.preventDefault(); $('lib-q').focus(); }
+    if (e.key === 'Escape' && document.activeElement === $('lib-q') && $('lib-q').value) { $('lib-q').value = ''; load(false); }
   });
   $('lib-q').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => load(false), 250); });
   $('lib-sort').addEventListener('change', () => load(false));
@@ -148,12 +194,15 @@
     else if (a === 'queue') R.command('queue_add', { key, position: 'end' }, 'Queue: ' + label);
     else if (a === 'now' && confirm('Fade to “' + label + '” now?')) R.command('play_now', { key }, 'Play now: ' + label);
     else if (a === 'bumper') R.command('bumper_now', { key }, 'Bumper now: ' + label);
+    else if (a === 'ident') setIdent(tr, !b.classList.contains('on'));
     else if (a === 'ad' && confirm('Fade to an ad break with “' + label + '” now?')) R.command('play_now', { key }, 'Play now: ' + label);
   });
 
-  load(false);
-  // a new scan from the Core (library_at) or a new play (counts, last played): reload what is shown
+  // the first poll brings the server's clock (times are shown in its zone): load then; after that, a new
+  // scan from the Core (library_at) or a new play (counts, last played) reloads what is shown
+  let started = false;
   R.status(3000, 1, (d) => {
+    if (!started) { started = true; load(false); }
     const s = d && d.station;
     if (!s) return;
     const now = s.library_at + '|' + ((d.recent[0] && d.recent[0].id) || '');

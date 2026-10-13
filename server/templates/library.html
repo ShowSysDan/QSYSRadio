@@ -1,18 +1,20 @@
 {% extends 'base.html' %}
-{% block title %}Library · QSYSRadio{% endblock %}
+{% block title %}{{ title }} · QSYSRadio{% endblock %}
 {% block main %}
 <div class="section-header">
-  <div class="section-title">Library</div>
+  <div class="section-title">{{ title }}</div>
   <span id="lib-info" class="dim small"></span>
 </div>
-<section class="tile blue">
+{% if kind == 'ad' %}
+<section class="tile amber" id="hour-tile" hidden>
+  <div class="t-head"><div class="t-label">This hour</div><span class="dim small">per-hour ads in time order · played · owed now · missed (skipped) · to come</span></div>
+  <div id="hour" class="hour-line"></div>
+</section>
+{% endif %}
+<section class="tile blue" data-kind="{{ kind }}" id="lib-tile">
   <form id="lib-form" class="toolbar" onsubmit="return false">
-    <div class="chip-group" id="kind-tabs">
-      <button type="button" class="chip active" data-kind="music">Music</button>
-      <button type="button" class="chip" data-kind="imaging">Imaging</button>
-      <button type="button" class="chip" data-kind="ad">Ads</button>
-    </div>
-    <label class="grow">Search <input type="search" id="lib-q" placeholder="artist, title or file"></label>
+    <div class="chip-group" id="lib-filters"></div>
+    <label class="grow">Search <input type="search" id="lib-q" placeholder="artist, title or file   ( / )"></label>
     <label>Sort
       <select id="lib-sort">
         <option value="artist">Artist</option><option value="title">Title</option>

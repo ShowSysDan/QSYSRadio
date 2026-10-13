@@ -90,6 +90,7 @@
     rotation: ['rotation', 'ROTATION', 'One of the least recently played songs'], hourly: ['ad', 'AD', 'Owed by its per-hour schedule'],
     mix: ['ad', 'AD', 'A mix-in ad (the Core picks which)'], requested: ['ad', 'AD', 'Ad break now'],
     bumper: ['bumper', 'BUMPER', 'Bumper (the Core picks which unless one was chosen)'], stop: ['stop', 'STOP', 'Stop after current'],
+    ident: ['bumper', 'ID', 'Station ID on its schedule'],
   };
   const tag = (why) => { const t = TAGS[why] || TAGS.rotation; return '<span class="src ' + t[0] + '" title="' + t[2] + '">' + t[1] + '</span>'; };
   const ahead = () => (last && last.station && last.station.ahead) || [];
@@ -100,6 +101,52 @@
     return n && Object.assign({}, n, { why: n.queued ? 'queue' : (n.pick === 'ad' ? 'for_ad' : 'rotation') });
   }
   const srcTag = (n) => tag(n && n.why);
+
+  const heldUntil = (h) => (h.until ? 'until ' + R.serverHM(h.until) : 'until resumed') + (h.by ? ' (' + h.by + ')' : '');
+
+  // ── pause ads / bumpers: one small menu for both cards ──
+  const menu = $('hold-menu');
+  let menuFor = null;
+  document.querySelectorAll('.hold-btn').forEach((b) => {
+    b.hidden = !R.canOperate;
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      menuFor = b.dataset.hold;
+      const h = ((last && last.station && last.station.holds) || {})[menuFor];
+      menu.querySelector('.hm-title').textContent = 'Pause ' + (menuFor === 'ads' ? 'ads' : 'bumpers');
+      menu.querySelector('.hm-held').textContent = h ? 'Paused ' + heldUntil(h) : '';
+      menu.querySelector('[data-resume]').hidden = !h;
+      const r = b.getBoundingClientRect();
+      menu.style.top = (window.scrollY + r.bottom + 6) + 'px';
+      menu.style.left = Math.max(8, window.scrollX + r.right - 230) + 'px';
+      menu.hidden = false;
+    });
+  });
+  document.addEventListener('click', (e) => { if (!menu.contains(e.target)) menu.hidden = true; });
+  async function setHold(until, label) {
+    menu.hidden = true;
+    try {
+      await R.post('/api/v1/hold', { station: R.station || undefined, what: menuFor, until });
+      R.toast((menuFor === 'ads' ? 'Ads ' : 'Bumpers ') + label, 'ok');
+      R.refresh();
+    } catch (err) { R.toast('Pause: ' + err.message, 'bad'); }
+  }
+  menu.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.resume !== undefined) return setHold('off', 'resumed');
+    if (b.dataset.for !== undefined) {
+      const min = +b.dataset.for;
+      return setHold(min ? new Date(Date.now() + min * 60000).toISOString() : null, min ? 'paused for ' + min + ' min' : 'paused until resumed');
+    }
+    if (b.dataset.until !== undefined) {
+      const v = $('hold-time').value;              // a time of day on the server's clock: the next time it comes round
+      if (!v) return;
+      let at = R.fromServer(R.serverDay() + 'T' + v);
+      if (at.getTime() <= Date.now()) at = R.fromServer(R.serverDay() + 'T' + v, 1);
+      return setHold(at.toISOString(), 'paused until ' + v);
+    }
+  });
 
   function renderKpis() {
     const s = last && last.station, st = core(), lv = liveDeck(st);
@@ -124,30 +171,43 @@
       const lib = st.library, imaging = num(lib.imaging) || 0, adCount = num(lib.ad) || 0;
       const bumper = countdown(st.bumper_every, st.tracks_since_bumper, st.bumper_requested || st.next_bumper ||
         ahead().slice(0, 1 + ahead().findIndex((x) => x.kind === 'music')).some((x) => x.kind === 'imaging'), imaging);
-      R.setHTML($('bump-big'), bumper.big);
-      $('bump-sub').textContent = (st.next_bumper ? R.who(st.next_bumper).title + ' · ' : '') + bumper.sub + ' · ' + plural(imaging, 'bumper') + ' in the pool';
-      $('bump-meter').style.width = bumper.pct;
+      const holds = s.holds || {}, id = s.ident || {};
+      const idNote = id.count && id.next_at ? (id.due ? 'station ID next' : 'ID at ' + R.serverHM(id.next_at)) : '';
+      if (holds.bumpers) {
+        R.setHTML($('bump-big'), 'PAUSED');
+        R.marquee($('bump-sub'), [heldUntil(holds.bumpers), idNote && idNote + ' (IDs still play)'].filter(Boolean).join(' · '));
+        $('bump-meter').style.width = '0';
+      } else {
+        R.setHTML($('bump-big'), bumper.big);
+        R.marquee($('bump-sub'), [st.next_bumper ? R.who(st.next_bumper).title : '', bumper.sub, idNote,
+          plural(imaging, 'bumper') + ' in the pool'].filter(Boolean).join(' · '));
+        $('bump-meter').style.width = bumper.pct;
+      }
       const na = s.next_ad || {}, due = Math.max(num(st.ads_due) || 0, num(na.owed) || 0);
       const adNext = ahead()[0] && ahead()[0].kind === 'ad';    // a slot opens before this song ends
       const ad = countdown(st.ad_every, st.tracks_since_ad, st.ad_requested || st.next_ad || due > 0 || adNext, adCount);
       const mins = na.at ? Math.max(0, Math.round((new Date(na.at) - Date.now()) / 60000)) : null;
-      if (adCount && ad.big === 'OFF' && na.at) {            // only hourly ads: the next one by the clock
+      if (holds.ads) {
+        R.setHTML($('ad-big'), 'PAUSED');
+        R.marquee($('ad-sub'), heldUntil(holds.ads) + ' · per-hour slots meanwhile are skipped');
+        $('ad-meter').style.width = '0';
+      } else if (adCount && ad.big === 'OFF' && na.at) {            // only hourly ads: the next one by the clock
         R.setHTML($('ad-big'), esc(R.serverHM(na.at)) + ' <small>in ' + mins + ' min</small>');
-        $('ad-sub').textContent = na.title + ' · at the first song change after';
+        R.marquee($('ad-sub'), na.title + ' · at the first song change after');
         $('ad-meter').style.width = Math.max(0, 100 - mins / 60 * 100) + '%';
       } else {
         R.setHTML($('ad-big'), adCount ? ad.big : 'NONE');
-        $('ad-sub').textContent = !adCount ? 'No ads (set the Ads folder in Settings)' : [
+        R.marquee($('ad-sub'), !adCount ? 'No ads (set the Ads folder in Settings)' : [
           st.next_ad ? R.who(st.next_ad).title : '', due ? plural(due, 'hourly ad') + ' owed' : '', ad.big === 'OFF' ? 'no ad schedule' : ad.sub,
           !due && na.at ? 'hourly: ' + na.title + ' at ' + R.serverHM(na.at) : '',
-        ].filter(Boolean).join(' · ');
+        ].filter(Boolean).join(' · '));
         $('ad-meter').style.width = ad.pct;
       }
       R.setHTML($('lib-big'), (num(lib.music) || 0) + ' <small>songs</small>');
       $('lib-sub').textContent = plural(imaging, 'bumper') + ' · ' + plural(adCount, 'ad') + ' · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
       $('core-meter').style.width = '100%';
     } else {
-      ['bump', 'ad', 'lib'].forEach((k) => { $(k + '-big').textContent = '–'; $(k + '-sub').textContent = ' '; });
+      ['bump', 'ad', 'lib'].forEach((k) => { $(k + '-big').textContent = '–'; R.marquee($(k + '-sub'), ' '); });
       $('core-meter').style.width = '0';
     }
     $('core-info').textContent = s ? '· ' + s.station + ' · radio.lua ' + (s.version || '?') + (s.online ? '' : ' · offline')
@@ -185,7 +245,7 @@
     R.setHTML($('queue'), q.length ? q.map((t, i) => '<li><span class="n">' + (i + 1) + '</span><span class="nm" title="' + esc((t.dir || '') + t.file) + '">' +
       esc(R.whoLine(t)) + '</span>' + (op ? '<span class="acts">' + btn('up', i, t, 'Move up', i === 0) + btn('down', i, t, 'Move down', i === q.length - 1) +
       btn('rm', i, t, 'Remove') + '</span>' : '<span></span>') + '</li>').join('')
-      : '<li class="empty-q">Empty: the rotation picks (see Coming up).<br>Add songs from the <a href="/library">Library</a>.</li>');
+      : '<li class="empty-q">Empty: the rotation picks (see Coming up).<br>Add songs from the <a href="/library/music">Music</a> page.</li>');
     const a = ahead();
     R.setHTML($('ahead'), a.length ? a.map((x) => '<li class="k-' + esc(x.kind) + '"><span class="n">' + esc(R.serverHM(x.at)) + '</span>' +
       '<span class="nm" title="' + esc(x.file || '') + '">' + tag(x.why) + ' ' + esc(x.kind === 'music' ? R.whoLine(x) : (x.title || x.file || '')) + '</span>' +

@@ -921,12 +921,21 @@ MockCore scenarios and `live_core.py`.
   transport (Skip, Bumper now, Ad break now, Stop after current, Stop now /
   Start); both decks live; the queue (reorder, remove, clear);
   activity (every command, who sent it, and the Core's answer); recent plays.
-- **Library:** music, imaging and ads; search, sort (artist, title, most /
-  least recently played), length and length without the measured leading /
-  trailing silence, totals for the list, Play next, Queue, Play now; imaging files: Bumper
-  now; ads: Play now and the schedule (Mix in / Per hour with the count /
-  Off) with plays this hour and today. Rescan. The list reloads by itself
-  after the Core uploads a new scan and whenever something new plays.
+- **Music**, **Imaging & IDs** and **Ads** pages (one tab each): search
+  (`/` jumps to it, Esc clears), sort, quick filters (never played,
+  unsupported; station IDs; per hour / mix in / off), all kept in the URL so
+  a view can be bookmarked. Length and length without the measured silence,
+  totals. Music: Play next, Queue, Play now. Imaging: Bumper now and the
+  **ID** toggle (marks a station ID). Ads: Play now, the schedule (Mix in /
+  Per hour with the count / Off) with plays this hour and today, and a
+  **This hour** line of every per-hour slot in time order. Rescan. Lists
+  reload by themselves after a new scan and whenever something plays.
+- **Pause ads / bumpers** (the pause button on the Next bumper / Next ad
+  break cards, operators): for 30 min, 1 hour, until a time of day (the next
+  time it comes round, server time) or until resumed; the card shows PAUSED
+  and until when. Held ads: nothing owed or mixed in (per-hour slots in the
+  meantime are skipped); held bumpers: no every-N-songs bumper. Bumper now /
+  Ad break now still play. Station IDs are not paused.
 - **Play log:** a day (search, type), what was on air at a moment, CSV.
 - **Settings** (admins): every station setting in groups (Library, Bumpers &
   ads, Fades, Levels, Silence detection, Rotation, Safety), with what the
@@ -998,6 +1007,16 @@ FROM qsysradio.play_log
 WHERE kind = 'ad' AND started_at >= current_date - 1 AND started_at < current_date
 GROUP BY 1, 2 ORDER BY 1, 2;
 ```
+
+### Station IDs
+
+Mark imaging files as IDs (the **ID** button on Imaging & IDs) and pick a
+**Station ID schedule** (Settings → Bumpers & ads): hourly (:00), half-hourly
+(:00, :30) or every quarter hour. At the first song change after each time
+(within **Station ID may be late by**, 8 min) the server names a random ID,
+never the one that played last, and the Core plays it first in that break,
+in place of the regular bumper. The song picks aim for the ID time like they
+do for ad slots. Coming up shows it as **ID**.
 
 ### Ad schedules
 
