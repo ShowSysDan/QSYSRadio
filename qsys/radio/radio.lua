@@ -25,8 +25,8 @@ for k, v in pairs(SETTINGS) do DEFAULTS[k] = v end
 
 -- internals (not settings)
 local K = {
-  floor_db = -100, tick_s = 0.25, fast_s = 0.05, load_timeout_s = 1.5, chores_s = 30, log_ring = 200,
-  sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000, outbox_save_s = 30,
+  floor_db = -100, tick_s = 0.25, fast_s = 0.05, load_timeout_s = 1.5, chores_s = 30,
+  sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000,
 }
 -- only what must survive a reboot while the server is unreachable; everything else lives on the server
 FILES = { outbox = "media/_radio/outbox.json", settings = "media/_radio/settings.json" }
@@ -71,7 +71,7 @@ local function push(list, item, max)
   if #list > max then table.remove(list, 1) return true end
   return false
 end
-local function shuffled(list)
+local function shuffled(list)               -- a shuffled copy
   local out = {}
   for i, v in ipairs(list) do
     local j = math.random(i)
@@ -81,12 +81,7 @@ local function shuffled(list)
   return out
 end
 
-LOG = {}
-local function log(fmt, ...)
-  local line = os.date("!%H:%M:%S") .. " " .. string.format(fmt, ...)
-  print(line)
-  push(LOG, line, K.log_ring)
-end
+local function log(fmt, ...) print(os.date("!%H:%M:%S") .. " " .. string.format(fmt, ...)) end
 
 -- control writes without a closure per call
 local function assign(obj, field, value) obj[field] = value end
@@ -100,51 +95,28 @@ local function trigger(ctl)
 end
 
 -- ── FILES (JSON on the Core's media drive) ────────────────────────────────────
-local function readFile(path)
-  local f = io.open(path, "r")
-  if not f then return nil end
-  local s = f:read("*a")
-  f:close()
-  return s
-end
-
-local function writeFile(path, s)
-  pcall(dir.create, "media/_radio")
+local function writeJson(path, data, raw)
   local ok, err = pcall(function()
+    raw = raw or json.encode(data)
+    pcall(dir.create, "media/_radio")
     local f = assert(io.open(path, "w"))
-    f:write(s)
+    f:write(raw)
     f:close()
   end)
   if not ok then log("! save %s failed: %s", path, tostring(err)) end
 end
 
--- A file that exists but does not decode is kept as <path>.bad, never overwritten.
+-- a file that exists but does not decode is kept as <path>.bad, never overwritten
 local function readJson(path)
-  if not json then return nil end
-  local ok, raw = pcall(readFile, path)
-  if not ok or not raw or raw == "" then return nil end
-  local okDecode, data = pcall(json.decode, raw)
-  if okDecode and type(data) == "table" then return data end
-  log("! %s is unreadable; kept as %s.bad", path, path)
-  writeFile(path .. ".bad", raw)
-  return nil
-end
-
-local function writeJson(path, data)
-  if not json then return end
-  local ok, s = pcall(json.encode, data)
-  if ok then writeFile(path, s) else log("! encode %s failed: %s", path, tostring(s)) end
-end
-
--- A file written at most every `every` seconds (or on flush(true)).
-Store = {}
-Store.__index = Store
-function Store.new(path, every, get) return setmetatable({ path = path, every = every, get = get, dirty = false, at = -1e9 }, Store) end
-function Store:touch() self.dirty = true end
-function Store:flush(force)
-  if self.dirty and (force or now() - self.at >= self.every) then
-    self.dirty, self.at = false, now()
-    writeJson(self.path, self.get())
+  local f = json and io.open(path, "r")
+  if not f then return nil end
+  local raw = f:read("*a")
+  f:close()
+  local ok, data = pcall(json.decode, raw)
+  if ok and type(data) == "table" then return data end
+  if raw ~= "" then
+    log("! %s is unreadable; kept as %s.bad", path, path)
+    writeJson(path .. ".bad", nil, raw)
   end
 end
 
@@ -460,19 +432,14 @@ local function bagChoice()
   return #Station.bag                  -- nothing satisfies separation; take one anyway
 end
 
-function Station.peekNext()
-  for _, q in ipairs(Station.queue) do if Library.byKey[q.key] then return q, true end end
+-- the next song (operator queue first, then the rotation), and whether it was queued; take = remove it
+function Station.nextSong(take)
+  local q = Station.queue
+  while q[1] and not Library.byKey[q[1].key] do table.remove(q, 1) end
+  if q[1] then return take and table.remove(q, 1) or q[1], true end
   if #Library.music == 0 then return nil end
-  return Station.bag[bagChoice()], false
-end
-
-function Station.pickNext()
-  while #Station.queue > 0 do
-    local q = table.remove(Station.queue, 1)
-    if Library.byKey[q.key] then return q end
-  end
-  if #Library.music == 0 then return nil end
-  return table.remove(Station.bag, bagChoice())
+  local i = bagChoice()
+  return take and table.remove(Station.bag, i) or Station.bag[i], false
 end
 
 function Station.pickBumper()
@@ -584,7 +551,7 @@ function Station.startTrack(deck, track, opts, attempt)
       if attempt < 5 then
         local nxt = (track.kind == "imaging" and Station.pickBumper()) or
                     (track.kind == "ad" and table.remove(Station.breakList, 1)) or nil
-        Station.startTrack(deck, nxt or Station.pickNext(), opts, attempt + 1)
+        Station.startTrack(deck, nxt or Station.nextSong(true), opts, attempt + 1)
       else
         Station.state = "idle"
       end
@@ -608,7 +575,7 @@ end
 
 -- start the next track on a free deck (boot, start, dead-air guard)
 function Station.kick(why)
-  local nxt = Station.pickNext()
+  local nxt = Station.nextSong(true)
   if not nxt then
     if not Station.emptyNoted then emit("library_empty", { music_dir = SETTINGS.music_dir }) end
     Station.emptyNoted, Station.state = true, "idle"
@@ -645,7 +612,7 @@ function Station.transition(reason)
     Station.startTrack(other, table.remove(spots, 1), {})
     if reason == "end" then fadeS = SETTINGS.bumper_fade_s end   -- the song dips under the break
   else
-    Station.startTrack(other, Station.pickNext(), { fadeIn = SETTINGS.fade_in_s })
+    Station.startTrack(other, Station.nextSong(true), { fadeIn = SETTINGS.fade_in_s })
   end
   fadeAndFinish(live, fadeS, outReason)
 end
@@ -666,7 +633,7 @@ local function afterSpot(ended)
     Station.freeDeck = ended
     return Station.startTrack(free, nxt, {})
   end
-  Station.startTrack(free, Station.pickNext(), { fadeIn = ended and 0 or SETTINGS.fade_in_s })
+  Station.startTrack(free, Station.nextSong(true), { fadeIn = ended and 0 or SETTINGS.fade_in_s })
 end
 
 function Station.onDeckEnded(d)
@@ -675,7 +642,7 @@ function Station.onDeckEnded(d)
     Station.finishTrack(d, "eof")
     if Station.stopAfter then Station.goOff("stop_after_current") return end
     Station.state = "crossfading"
-    Station.startTrack(Station.other, Station.pickNext(), {})
+    Station.startTrack(Station.other, Station.nextSong(true), {})
   elseif isSpot(Station.state) and d == Station.spotDeck then
     Station.finishTrack(d, "end")      -- a break item plays to its end by design
     afterSpot(d)
@@ -830,7 +797,8 @@ end
 
 Control.handlers = {
   skip = function()
-    if not Station.automation then return false, "automation is off" end
+    local ok, err = running()
+    if not ok then return false, err end
     if Station.state ~= "playing" then return false, "nothing to skip right now (" .. Station.state .. ")" end
     Station.skipRequested = true
     return true
@@ -927,7 +895,7 @@ function Station.snapshot(t)
     info.duration = d.duration and round(d.duration, 1) or info.duration
     return info
   end
-  local nxt, queued = Station.peekNext()
+  local nxt, queued = Station.nextSong()
   local nextUp = trackInfo(nxt)
   if nextUp then nextUp.queued = queued end
   local queue, settings = {}, {}
@@ -989,7 +957,7 @@ function UI.refresh(t)
   show("Status", Station.statusLine(t))
   show("NowPlaying", (np and live and live.playStart) and string.format("%s  %s / %s", label(np),
     fmtClock(t - live.playStart), fmtClock(live.duration)) or "-")
-  show("NextUp", label((Station.peekNext())))
+  show("NextUp", label((Station.nextSong())))
   show("DeckA", DeckA:describe(t))
   show("DeckB", DeckB:describe(t))
   show("LastEvent", UI.lastEvent)
@@ -997,19 +965,21 @@ end
 
 -- ── SERVER: one sync request a second, plus the library after each scan ───────
 Server = { outbox = {}, dropped = 0, lastCmd = 0, settingsRev = "", adsRev = "", fails = 0, nextTry = 0,
-           busy = {}, libraryDirty = false, sentRev = -1, stateAt = -1e9, onDisk = false }
--- the outbox is written only while the server is unreachable (and once more to clear it)
-Outbox = Store.new(FILES.outbox, K.outbox_save_s, function()
-  Server.onDisk = #Server.outbox > 0
-  return Server.outbox
-end)
+           busy = {}, libraryDirty = false, sentRev = -1, stateAt = -1e9, onDisk = false, outboxDirty = false }
+
+-- the outbox is written (by Chores, every 30 s) only while the server is unreachable, and once more to clear it
+function Server.saveOutbox()
+  if not Server.outboxDirty then return end
+  Server.outboxDirty, Server.onDisk = false, #Server.outbox > 0
+  writeJson(FILES.outbox, Server.outbox)
+end
 
 function Server.enabled() return type(CFG.SERVER_URL) == "string" and CFG.SERVER_URL ~= "" end
 
 function Server.queue(ev)
   if not Server.enabled() then return end
   if push(Server.outbox, ev, K.outbox_max) then Server.dropped = Server.dropped + 1 end
-  if Server.fails > 0 or Server.onDisk then Outbox:touch() end
+  Server.outboxDirty = Server.outboxDirty or Server.fails > 0 or Server.onDisk
 end
 
 local function stationName() return CFG.STATION_ID ~= "" and CFG.STATION_ID or STATION_NAME end
@@ -1116,7 +1086,7 @@ function Server.sync()
   post("sync", "/api/v1/core/sync", body, function(code, data, httpErr)
     local resp = decoded(code, data)
     if not resp then
-      if Server.fails == 0 then Outbox:touch() end
+      Server.outboxDirty = true
       Server.fails = Server.fails + 1
       Server.nextTry = now() + math.min(30, K.sync_s * 2 ^ math.min(Server.fails, 5))
       if Server.fails == 1 or Server.fails % 20 == 0 then
@@ -1136,7 +1106,7 @@ function Server.sync()
       for _, e in ipairs(batch) do sent[e] = true end
       for _, e in ipairs(Server.outbox) do if not sent[e] then keep[#keep + 1] = e end end
       Server.outbox, Server.dropped = keep, 0
-      if Server.onDisk then Outbox:touch() end
+      Server.outboxDirty = Server.onDisk
     end
     handleReply(resp)
   end)
@@ -1155,13 +1125,13 @@ function Server.loadLocal()
 end
 
 -- ── STARTUP ───────────────────────────────────────────────────────────────────
-local function every(seconds, fn, name)
+local function timer(name, fn, seconds)    -- seconds = nil: started later
   local tm = Timer.New()
   tm.EventHandler = function()
     local ok, err = pcall(fn)
     if not ok then log("! %s error: %s", name, tostring(err)) end
   end
-  tm:Start(seconds)
+  if seconds then tm:Start(seconds) end
   return tm
 end
 
@@ -1191,17 +1161,13 @@ local function boot()
   Library.scan()
   UI.init()
 
-  Fast = Timer.New()                   -- started by Engine.wake() only while fading/loading
-  Fast.EventHandler = function()
-    local okFast, err = pcall(Engine.fast)
-    if not okFast then log("! fast tick error: %s", tostring(err)) end
-  end
-  Tick = every(K.tick_s, function() Station.tick(now()) end, "tick")
-  Sync = every(K.sync_s, Server.sync, "sync")
-  Chores = every(K.chores_s, function()
+  Fast = timer("fast tick", function() Engine.fast() end)   -- started by Engine.wake() only while fading/loading
+  Tick = timer("tick", function() Station.tick(now()) end, K.tick_s)
+  Sync = timer("sync", Server.sync, K.sync_s)
+  Chores = timer("chores", function()
     log("heartbeat: %s", Station.statusLine(now()))
-    Outbox:flush()
-  end, "chores")
+    Server.saveOutbox()
+  end, K.chores_s)
   emit("boot", { version = RADIO_VERSION, platform = tostring(st.Platform), design = STATION_NAME,
     server = Server.enabled() and CFG.SERVER_URL or "-" })
 
