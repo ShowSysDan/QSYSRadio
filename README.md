@@ -402,21 +402,16 @@ service runs from this folder, so leave it where it is.
 
 ```
 cd ~
-git clone -b claude/pensive-cannon-nmas65 https://github.com/ShowSysDan/QSYSRadio.git
+git clone https://github.com/ShowSysDan/QSYSRadio.git
 cd QSYSRadio
 cat VERSION
 ```
 
 Expect the version, e.g. `0.3.0-dev`.
 
-- The server is on the branch `claude/pensive-cannon-nmas65` until it is
-  merged into `main`. So far `main` holds only LICENSE: a clone without
-  `-b …` has no server, and `cat` says `No such file or directory`. Fix that
-  with `git checkout claude/pensive-cannon-nmas65`.
-- If the clone says `Remote branch claude/pensive-cannon-nmas65 not found`,
-  the server has been merged: clone without `-b …`.
-- Later steps call this "the branch from step 3". `git branch --show-current`
-  prints it.
+- If `cat` says `No such file or directory`, the clone has no server: check
+  that you cloned `ShowSysDan/QSYSRadio` and are on `main`
+  (`git branch --show-current`).
 - A private repository needs a GitHub token or SSH key.
 - install.sh refuses a root shell ("Run as your own user via sudo (sudo
   ./install.sh), not as root directly.").
@@ -425,7 +420,7 @@ Expect the version, e.g. `0.3.0-dev`.
   own login (the first line creates the account; skip it if it exists):
   ```
   sudo adduser --disabled-password --gecos "" radio
-  sudo -u radio -H git clone -b claude/pensive-cannon-nmas65 https://github.com/ShowSysDan/QSYSRadio.git /home/radio/QSYSRadio
+  sudo -u radio -H git clone https://github.com/ShowSysDan/QSYSRadio.git /home/radio/QSYSRadio
   sudo -u radio cp /home/radio/QSYSRadio/.env.example /home/radio/QSYSRadio/.env
   sudo -u radio chmod 600 /home/radio/QSYSRadio/.env
   sudo -u radio nano /home/radio/QSYSRadio/.env
@@ -802,9 +797,6 @@ Every start (`start.sh`) does three things in order:
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
-- If `git pull` says `… but no such ref was fetched`, the branch from step 3
-  has been merged and removed: `git checkout main && git pull`, then
-  restart. From then on `main` is your branch.
 - The Core keeps playing during the restart. Its Debug Output may show one
   `! server: sync failed`, then `server: reachable again`.
 
@@ -865,13 +857,11 @@ sudo systemctl start qsysradio
 curl -s http://localhost:5410/api/v1/health; echo
 ```
 
-Expect `"ok":true` again. To return to the current code later, check out
-your branch again: the one from step 3, or `main` only if step 13 moved you
-to it (until then `main` holds only LICENSE, and the service would fail):
+Expect `"ok":true` again. To return to the current code later:
 
 ```
 cd ~/QSYSRadio
-git checkout claude/pensive-cannon-nmas65
+git checkout main
 git pull
 sudo systemctl restart qsysradio
 ```
