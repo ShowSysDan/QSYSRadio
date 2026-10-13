@@ -1,12 +1,13 @@
 -- QSYSRadio deck controller (Q-SYS Lua 5.3). Docs: README.md. Station settings are
 -- edited on the server's web page and pushed here; SETTINGS below are only the
 -- fallback until the server has been reached once.
-RADIO_VERSION = "1.0.1"
+RADIO_VERSION = "1.1.0"
 
 CFG = {
   PLAYER_A = "Audio_Player_01", METER_A = 1,
   PLAYER_B = "Audio_Player_02", METER_B = 2,
   METER = "PlayerOutput01",
+  MIXER = "PlayerSum", MIX_A = 1, MIX_B = 2,   -- the players' mixer: a deck's input is muted while it analyzes ("" = never)
   SERVER_URL = "",     -- e.g. "http://10.0.0.20:5410"; "" = run standalone
   SERVER_TOKEN = "",   -- RADIO_API_TOKEN from the server's .env
   STATION_ID = "",     -- "" = the design name
@@ -27,7 +28,7 @@ for k, v in pairs(SETTINGS) do DEFAULTS[k] = v end
 -- internals (not settings)
 local K = {
   floor_db = -100, tick_s = 0.25, fast_s = 0.05, load_timeout_s = 1.5, chores_s = 30,
-  quiet_s = 0.5, sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000,
+  quiet_s = 0.5, scan_head_s = 6, scan_tail_s = 15, scan_need_s = 30, scan_settle_s = 0.5, sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000,
 }
 -- only what must survive a reboot while the server is unreachable; everything else lives on the server
 FILES = { outbox = "media/_radio/outbox.json", settings = "media/_radio/settings.json" }
@@ -201,11 +202,11 @@ end
 -- the server's per-file figures (reply to the library upload): they replace this boot's (edits, forgotten figures)
 function Library.learn(map)
   if type(map) ~= "table" then return end
-  for _, L in pairs(LEARNED) do L.trail, L.lead, L.fixed = nil, nil, nil end
+  for _, L in pairs(LEARNED) do L.trail, L.lead, L.fixed, L.analyzed = nil, nil, nil, nil end
   for key, v in pairs(map) do
     if type(v) == "table" then
       local L = LEARNED[key] or {}
-      L.trail, L.lead, L.fixed = tonumber(v.trail), tonumber(v.lead), v.fixed == true or nil
+      L.trail, L.lead, L.fixed, L.analyzed = tonumber(v.trail), tonumber(v.lead), v.fixed == true or nil, v.analyzed == true or nil
       if v.unsupported == true then L.unsupported = true end
       LEARNED[key] = L
       if L.unsupported and Library.byKey[key] then Library.remove(Library.byKey[key]) end
@@ -239,7 +240,8 @@ function Deck.new(id, compName, meterIdx)
   return self
 end
 
-function Deck:isBusy() return self.state == "loading" or self.state == "playing" or self.state == "fading" end
+-- an analyzing deck is not busy: on-air use takes it over (Station.startTrack)
+function Deck:isBusy() return not self.job and (self.state == "loading" or self.state == "playing" or self.state == "fading") end
 
 function Deck:setGain(g)
   g = clamp(g, K.floor_db, 20)
@@ -303,9 +305,10 @@ function Deck:play(gainDb, fadeInS, skip)
     self:setGain(gainDb)
   end
   self.expectStop = false
+  if self.mix then set(self.mix, "Boolean", self.job ~= nil) end   -- off air only while analyzing
   trigger(self.c.play)
   if skip > 0 then set(self.c.locate, "Value", skip) end
-  self.state, self.playStart = "playing", now() - skip   -- times stay file positions
+  self.state, self.playStart, self.fadedIn = "playing", now() - skip, fadeInS and fadeInS > 0   -- times stay file positions
   self.firstAudioAt, self.lastAudioAt, self.silentSince, self.peakMax, self.loudAt, self.fadedAt = nil, nil, nil, nil, nil, nil
 end
 
@@ -327,6 +330,7 @@ end
 
 -- the player stopped by itself (end of file)
 function Deck:ended()
+  if self.job then return Analyzer.finish(self, true) end
   local f = self.fade
   self.fade = nil
   if f and f.onDone then f.onDone(self)      -- a fade-out was already handling this deck
@@ -348,7 +352,7 @@ end
 -- one meter read per station tick, only during clean playback (no fade), so
 -- learned lead-in / trail / peak are never skewed by the gain moving
 function Deck:sample(t)
-  if self.state ~= "playing" or self.fade then return end
+  if self.state ~= "playing" or self.fade or t < (self.settleUntil or 0) then return end
   local m = self.peak.Value
   if type(m) ~= "number" then return end
   local unity = (m > -118) and (m - self.gain) or -200
@@ -364,6 +368,91 @@ end
 -- in its fade-out: fade_out_drop_db under its own peak for a moment (start the next item early)
 function Deck:fadingOut(t)
   return SETTINGS.fade_out_early_s > 0 and self.loudAt ~= nil and t - self.loudAt >= K.quiet_s
+end
+
+-- ── ANALYZER: quiet start / end of the files the server lists, on a deck that is off air ──
+-- (its PlayerSum input muted; the meter is before the mixer): the first K.scan_head_s, then the last K.scan_tail_s
+Analyzer = { todo = {}, done = {}, rev = "" }
+
+function Analyzer.apply(list, rev)
+  local keep = {}
+  for _, key in ipairs(list) do keep[key] = true end
+  for key in pairs(Analyzer.done) do if not keep[key] then Analyzer.done[key] = nil end end   -- asked again later = analyze again
+  Analyzer.todo, Analyzer.rev = list, tostring(rev or "")
+  STATE_REV = STATE_REV + 1
+end
+
+-- may this deck analyze now? stopped: either deck; on air: the other deck, with time to spare before the next song
+local function analyzeFree(d, t)
+  if not d.mix or d.state ~= "idle" or d.job then return false end
+  if not Station.automation then return Station.state == "off" end
+  local live = Station.live
+  return Station.state == "playing" and d == Station.other and live ~= nil and (live:remainingEst(t) or 0) > K.scan_need_s
+    and not (Station.skipRequested or Station.bumperRequested or Station.adRequested)
+end
+
+function Analyzer.start(d, t)
+  local other = d == DeckA and DeckB or DeckA
+  for _, key in ipairs(Analyzer.todo) do
+    local tr = Library.byKey[key]
+    if tr and not Analyzer.done[key] and not (other.job and other.job.key == key) then
+      local job = { key = key, track = tr, started = t }
+      d.job = job
+      set(d.mix, "Boolean", true)       -- off air before anything loads
+      d:load(tr, function(x, ok, err)
+        if x.job ~= job then return end
+        if not ok then return Analyzer.finish(x, false, err) end
+        x:play(0, 0, 0)
+        job.phase = "head"
+      end)
+      return
+    end
+  end
+end
+
+function Analyzer.step(d, t)
+  local j = d.job
+  if t - j.started > (d.duration or 0) + 30 then return Analyzer.finish(d, false, "timed out") end
+  if j.phase ~= "head" or not d.playStart then return end
+  local played = t - d.playStart
+  if not d.firstAudioAt and played < K.scan_head_s and played < d.duration - 1 then return end
+  j.lead, j.phase = d.firstAudioAt and d.firstAudioAt - d.playStart or K.scan_head_s, "tail"
+  local pos = d.duration - K.scan_tail_s
+  if pos > played + 1 then             -- jump to the end (a short file just plays on)
+    set(d.c.locate, "Value", pos)
+    d.playStart, d.lastAudioAt, d.silentSince, d.settleUntil = t - pos, nil, nil, t + K.scan_settle_s
+  end
+end
+
+-- ok: played to its end; else err says why. Results go to the server, which keeps them
+function Analyzer.finish(d, ok, err)
+  local j = d.job
+  local ev = { file = j.track.name, dir = j.track.dir, ok = ok and j.lead ~= nil, status = err }
+  if ev.ok then
+    ev.lead_in, ev.duration = round(j.lead, 2), round(d.duration, 1)
+    ev.trail = round(d.lastAudioAt and math.max(0, d.duration - (d.lastAudioAt - d.playStart)) or math.min(K.scan_tail_s, d.duration), 2)
+    local L = LEARNED[j.key] or {}
+    LEARNED[j.key] = L
+    if not L.fixed then L.lead, L.trail, L.analyzed = ev.lead_in, ev.trail, true end
+  end
+  d.job, d.settleUntil = nil, nil
+  d:stop()
+  Analyzer.done[j.key] = true
+  emit("analysis", ev)
+end
+
+-- give the deck back to the station (it is muted until its next on-air play)
+function Analyzer.abort(d)
+  if not d.job then return end
+  d.job, d.settleUntil = nil, nil
+  d:stop()
+end
+
+function Analyzer.tick(t)
+  if #Analyzer.todo == 0 and not (DeckA.job or DeckB.job) then return end
+  for _, d in ipairs({ DeckA, DeckB }) do
+    if d.job then Analyzer.step(d, t) elseif analyzeFree(d, t) then Analyzer.start(d, t) end
+  end
 end
 
 -- ── ENGINE: the 250 ms station timer + a 50 ms timer that runs only while needed ───
@@ -515,14 +604,15 @@ function Station.finishTrack(d, reason)
                played = d.playStart and round(now() - d.playStart, 1) or nil }
   local L = LEARNED[tr.key] or {}       -- this play's measurements; the server keeps them per file
   LEARNED[tr.key] = L
-  if d.firstAudioAt and d.playStart then
+  local keep = L.fixed or L.analyzed    -- set by an operator or analyzed: plays don't learn over it
+  if d.firstAudioAt and d.playStart and not d.fadedIn then   -- a fade-in hides where the sound starts
     ev.lead_in = round(d.firstAudioAt - d.playStart, 2)
-    if not L.fixed then L.lead = ev.lead_in end
+    if not keep then L.lead = ev.lead_in end
   end
   -- the silent tail counts only if the silence was heard before any fade (a fade hides the rest of the file)
   if reason ~= "cut" and d.lastAudioAt and d.playStart and d.duration and (d.fadedAt or 1e9) - d.lastAudioAt >= K.quiet_s then
     ev.trail = round(math.max(0, d.duration - (d.lastAudioAt - d.playStart)), 2)
-    if not L.fixed then L.trail = math.min(L.trail or ev.trail, ev.trail) end
+    if not keep then L.trail = math.min(L.trail or ev.trail, ev.trail) end
   end
   if d.peakMax then ev.peak = round(d.peakMax, 1) end
   emit(KINDS[tr.kind].event .. "_end", ev)
@@ -540,6 +630,7 @@ function Station.startTrack(deck, track, opts, attempt)
     Station.state = "idle"
     return
   end
+  Analyzer.abort(deck)
   deck:load(track, function(d, ok, err)
     if not ok then
       local permanent = startsWith(err, "Unsupported")
@@ -668,7 +759,8 @@ function Station.setAutomation(on, why)
   clearRequests()
   if not on then
     for _, d in ipairs({ DeckA, DeckB }) do
-      if d.state == "playing" or d.state == "fading" then fadeAndFinish(d, SETTINGS.stop_fade_s, "cut")
+      if d.job then -- analyzing: off air, carries on
+      elseif d.state == "playing" or d.state == "fading" then fadeAndFinish(d, SETTINGS.stop_fade_s, "cut")
       elseif d.state == "loading" then d:stop() end
     end
     return Station.goOff(why or "control")
@@ -699,6 +791,7 @@ end
 function Station.tick(t)
   DeckA:sample(t)
   DeckB:sample(t)
+  Analyzer.tick(t)
   if not Station.automation then return end
 
   local live, spot = Station.live, Station.spotDeck
@@ -884,7 +977,7 @@ end
 function Station.snapshot(t)
   local function deck(d)
     local info = trackInfo(d.track or d.pending) or {}
-    info.state, info.live = d.state, (d == Station.live) or nil
+    info.state, info.live, info.analyzing = d.state, (d == Station.live) or nil, d.job and true or nil
     if d.playStart and (d.state == "playing" or d.state == "fading") then
       info.elapsed = round(t - d.playStart, 1)
       local rem = d:remainingEst(t)
@@ -906,6 +999,7 @@ function Station.snapshot(t)
     next_ad = trackInfo(Station.nextAd), ad_requested = Station.adRequested, tracks_since_ad = Station.tracksSinceAd,
     ad_every = SETTINGS.ad_every_n_tracks, ads_due = Station.adPlan and #Station.adPlan.due or 0,
     library = { music = #Library.music, imaging = #Library.imaging, ad = #Library.ad },
+    analyze = { can = DeckA.mix ~= nil, left = #Analyzer.todo },
     settings = SETTINGS, uptime = round(t - BOOT_T, 0), outbox = #Server.outbox,
   }
 end
@@ -1012,6 +1106,7 @@ local function handleReply(resp)
   if tonumber(resp.ack_reset) then Server.lastCmd = tonumber(resp.ack_reset) end
   if type(resp.settings) == "table" then Server.applySettings(resp.settings, resp.settings_rev) end
   if type(resp.ads) == "table" then Server.applyAdPlan(resp.ads, resp.ads_rev) end
+  if type(resp.analyze) == "table" then Analyzer.apply(resp.analyze, resp.analyze_rev) end
   for _, c in ipairs(type(resp.commands) == "table" and resp.commands or {}) do
     local id = tonumber(c.id)
     if id and id > Server.lastCmd then
@@ -1026,7 +1121,8 @@ function Server.sync()
   if Server.libraryDirty and Server.fails == 0 then Server.postLibrary() end
   local t = now()
   local body = { station = stationName(), version = RADIO_VERSION, boot = BOOT_ID,
-                 ack = Server.lastCmd, settings_rev = Server.settingsRev, ads_rev = Server.adsRev }
+                 ack = Server.lastCmd, settings_rev = Server.settingsRev, ads_rev = Server.adsRev,
+                 analyze_rev = DeckA.mix and Analyzer.rev or nil }
   local rev = STATE_REV
   if rev ~= Server.sentRev or t - Server.stateAt >= K.state_every_s then body.state = Station.snapshot(t) end
   local batch = {}
@@ -1094,8 +1190,18 @@ local function boot()
   Meter = m
   DeckA = Deck.new("A", CFG.PLAYER_A, CFG.METER_A)
   DeckB = Deck.new("B", CFG.PLAYER_B, CFG.METER_B)
+  if CFG.MIXER ~= "" then             -- analysis needs each deck's mixer input mute
+    local okM, mx = pcall(Component.New, CFG.MIXER)
+    local function mute(i) local okC, c = pcall(function() return mx["input." .. i .. ".mute.1"] end) return okC and c or nil end
+    if okM and mx and mute(CFG.MIX_A) and mute(CFG.MIX_B) then
+      DeckA.mix, DeckB.mix = mute(CFG.MIX_A), mute(CFG.MIX_B)
+    else
+      log("! mixer '%s' with input.%d/%d.mute.1 not found: file analysis is off", CFG.MIXER, CFG.MIX_A, CFG.MIX_B)
+    end
+  end
   for _, d in ipairs({ DeckA, DeckB }) do
     d:stop()
+    if d.mix then set(d.mix, "Boolean", false) end
     set(d.c.mute, "Boolean", false)
     set(d.c.loop, "Boolean", false)
     set(d.c.gain, "Value", K.floor_db)

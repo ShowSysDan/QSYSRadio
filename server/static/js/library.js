@@ -63,7 +63,8 @@
     const lead = pick(it.lead_set_s, it.lead_in_s), trail = pick(it.trail_set_s, it.trail_s);
     const known = R.num(it.duration_s) && (lead != null || trail != null);
     const inner = (known ? R.clock(it.audible_s) : '–') + (adjusted(it) ? ' <span class="tag" title="Set by an operator">adj</span>' : '');
-    const tip = known ? 'quiet start ' + (lead || 0).toFixed(1) + ' s, quiet end ' + (trail || 0).toFixed(1) + ' s' : 'not measured yet';
+    const tip = known ? 'quiet start ' + (lead || 0).toFixed(1) + ' s, quiet end ' + (trail || 0).toFixed(1) + ' s' +
+      (it.analyzed_at ? ' (analyzed)' : ' (from plays)') : 'not measured yet';
     return '<td class="num" title="' + tip + '">' + (R.canOperate && !it.unsupported
       ? '<button type="button" class="linkbtn" data-a="trim" title="' + tip + ': view or adjust">' + inner + '</button>' : inner) + '</td>';
   }
@@ -86,6 +87,8 @@
       '<button type="button" class="sm primary" data-t="save">Save</button>' +
       '<button type="button" class="sm" data-t="clear" title="Remove the figures set here">Use measured</button>' +
       '<button type="button" class="sm" data-t="forget" title="Measure again on the next play">Forget measured</button>' +
+      '<button type="button" class="sm" data-t="analyze" title="Measure it again on the off-air deck">Analyze again</button>' +
+      '<span class="dim small">' + (it.analyzed_at ? 'analyzed ' + esc(R.timeOf(it.analyzed_at, true)) : 'measured from plays') + '</span>' +
       '<button type="button" class="linkbtn" data-t="close">close</button>' +
       '<div class="dim small">Quiet start: where the sound begins, in seconds from the start of the file (the Core starts just before it, ' +
       'within Settings → Silence detection). Quiet end: seconds of silence at the end (the next item starts that much early). ' +
@@ -102,6 +105,9 @@
         body.trail = val('trail');
         await R.post('/api/v1/library/trim', body);
         R.toast(label + (t === 'clear' ? ': using the measured figures' : ': saved; the Core picks it up after its rescan'), 'ok');
+      } else if (t === 'analyze') {
+        await R.post('/api/v1/analyze', body);
+        R.toast(label + ': queued for analysis on the off-air deck', 'ok');
       } else if (t === 'forget') {
         if (!confirm('Forget the measured quiet start and end of “' + label + '”? They are measured again on its next play.')) return;
         await R.post('/api/v1/library/forget', body);
@@ -271,9 +277,37 @@
   // the first poll brings the server's clock (times are shown in its zone): load then; after that, a new
   // scan from the Core (library_at) or a new play (counts, last played) reloads what is shown
   let started = false;
+  // file analysis: progress and the buttons to start / stop it
+  function analysisLine(a) {
+    const el = $('lib-analysis');
+    el.hidden = !a;
+    if (!a) return;
+    const btn = (scope, text, title) => R.canOperate ? '<button type="button" class="sm" data-scope="' + scope + '" title="' + title + '">' + text + '</button>' : '';
+    const daily = a.at === 'off' ? 'no daily run' : 'daily at ' + esc(a.at);
+    R.setHTML(el, !a.can
+      ? '<span>File analysis needs the players\' mixer: set <b>CFG.MIXER</b> in radio.lua (the Core\'s Debug Output says why it is off).</span>'
+      : a.active
+        ? '<span><b>Analyzing</b> on the off-air deck, between songs: ' + R.num(a.left) + ' file' + (a.left === 1 ? '' : 's') + ' to go.</span>' +
+          btn('stop', 'Stop', 'Stop analyzing (what is done stays)')
+        : '<span><b>File analysis</b>: ' + (a.never ? R.num(a.never) + ' file' + (a.never === 1 ? '' : 's') + ' not analyzed yet' : 'every file analyzed') +
+          ' · ' + daily + ' (Settings).</span>' + (a.never ? btn('new', 'Analyze now', 'Measure the files not analyzed yet, on the off-air deck') : '') +
+          btn('all', 'Re-analyze all', 'Measure every file again'));
+  }
+  $('lib-analysis').addEventListener('click', async (e) => {
+    const b = e.target.closest('button[data-scope]');
+    if (!b) return;
+    const scope = b.dataset.scope;
+    if (scope === 'all' && !confirm('Measure every file again? It runs on the off-air deck between songs and can take hours for a large library.')) return;
+    try {
+      await R.post('/api/v1/analyze', { station: R.station || undefined, scope });
+      R.toast(scope === 'stop' ? 'Analysis stopped' : 'Analysis started on the off-air deck', 'ok');
+    } catch (err) { R.toast('Analysis: ' + err.message, 'bad'); }
+  });
+
   R.status(3000, 1, (d) => {
     if (!started) { started = true; load(false); }
     const s = d && d.station;
+    analysisLine(s && s.analysis);
     if (!s) return;
     const now = s.library_at + '|' + ((d.recent[0] && d.recent[0].id) || '');
     if (seen !== null && now !== seen) refresh();

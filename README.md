@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **1.0.1** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.1.0** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **1.0.1** — stable; standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **1.0.1** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **1.0.1** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.1.0** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.1.0** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.1.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -23,13 +23,16 @@ station settings, the library, syslog.
  ┌────────────────────────── Q-SYS Core ──────────────────────────┐
  │  radio.lua                                                     │
  │   • both decks: load, play, fades, crossfade timing,           │
- │     silence detection, learning (lead-in / tail / peak)        │
+ │     silence detection, learning (lead-in / tail / peak),       │
+ │     file analysis on the off-air deck                          │
  │   • keeps playing on its own if the server is gone             │
  │   • once a second: POST /api/v1/core/sync                      │
  │       → queued events, state (only when it changed)            │
- │       ← operator commands, settings, ad plan                   │
- │  Audio_Player_01 ──► PlayerOutput01 meter.1                    │
- │  Audio_Player_02 ──► PlayerOutput01 meter.2                    │
+ │       ← operator commands, settings, ad plan, files to analyze │
+ │  Audio_Player_01 ─┬─► PlayerOutput01 meter.1                   │
+ │                   └─► PlayerSum input 1 ───────┐               │
+ │  Audio_Player_02 ─┬─► PlayerOutput01 meter.2   │               │
+ │                   └─► PlayerSum input 2 ───────┴─► air chain   │
  └──────────────────────────────┬─────────────────────────────────┘
                                 │ HTTP (the Core pulls)
  ┌──────────────────────── App server ────────────────────────────┐
@@ -134,12 +137,17 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   on every play, nothing stored.
 - **Break items** hand over at their learned quiet end (or fade-out): the
   next ad starts when the last one goes quiet, not at its end of file.
-- **Quiet starts skipped.** Songs, bumpers and ads start past its measured lead-in minus
-  `lead_skip_keep_s` (0.3 s), skipping at most `lead_skip_max_s` (3 s; 0 =
-  off): the Core presses play, then seeks (`locate`). The first play of a
-  file is from 0:00 (nothing measured yet); lead-in is always reported from
-  the file start, so skipping never shrinks it.
-- **Learning** (kept on the server, `library` table, every kind): duration,
+- **Quiet starts skipped.** Songs, bumpers and ads start past their measured
+  lead-in minus `lead_skip_keep_s` (0.3 s), skipping at most
+  `lead_skip_max_s` (3 s; 0 = off): the Core presses play, then seeks
+  (`locate`). The first play of a file is from 0:00 (nothing measured yet);
+  lead-in is always reported from the file start, so skipping never shrinks
+  it. Lead-in is where the file rises above `silence_threshold_dbfs`
+  (−50 dBFS), so a file's own soft fade-in counts as sound, not silence. A
+  play the Core fades in (`fade_in_s` > 0) reports no lead-in: the meter is
+  not read while the gain moves, so the start can't be seen.
+- **Learning** (kept on the server, `library` table, every kind; see also
+  [File analysis](#file-analysis), which replaces it per file): duration,
   lead-in, minimum trailing silence, peak at unity; an operator's figures
   (`lead_set_s`, `trail_set_s`) win over them. After each library upload the
   server's figures replace the Core's (so edits and forgotten figures apply). Trailing silence counts
@@ -278,7 +286,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `1.0.1`.
+Expect the version, e.g. `1.1.0`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -382,7 +390,7 @@ Keep the two `CFG` lines for step 10.
   networks, use the one the Core can reach.
 - Print the token again any time: `grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`.
 - Re-running is safe: the secrets in `.env` are kept and only pending
-  migrations run (`... at version 0009 (nothing to do)`).
+  migrations run (`... at version 0011 (nothing to do)`).
 - Without sudo (`./install.sh`) it sets up the venv, `.env` and the database,
   ends with `Done (no systemd service without sudo).` and prints no `CFG`
   lines. `./start.sh` then runs the server in the foreground.
@@ -410,13 +418,13 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `migrate: schema "qsysradio" at version 0009 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 1.0.1 starting on port
+- In the journal: `migrate: schema "qsysradio" at version 0011 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 1.1.0 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":9,"schema_version":9,"version":"1.0.1"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":11,"schema_version":11,"version":"1.1.0"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -541,12 +549,15 @@ account that has access, the dashboard opens without asking.
 
 In Q-SYS Designer, with the station's design open:
 
-1. **Components.** You need two Audio Players and a True Peak/RMS meter with
-   2 channels. Wire Player 1 to meter input 1 and Player 2 to input 2, as
-   well as into the air chain. Their Code Names must match `CFG`:
-   `Audio_Player_01`, `Audio_Player_02`, `PlayerOutput01` (or change
-   `CFG`).
-2. **Script Access.** Select each of the three, then set **Properties** →
+1. **Components.** You need two Audio Players, a True Peak/RMS meter with
+   2 channels and a mixer that sums the players for the air chain. Wire
+   Player 1 to meter input 1 and mixer input 1, Player 2 to meter input 2
+   and mixer input 2. The meter must take the player's output directly, not
+   the mixer's: file analysis mutes a player's mixer input and still reads
+   its meter. Code Names must match `CFG`: `Audio_Player_01`,
+   `Audio_Player_02`, `PlayerOutput01`, `PlayerSum` (or change `CFG`;
+   `MIXER = ""` turns file analysis off).
+2. **Script Access.** Select each of the four, then set **Properties** →
    **Script Access** to `Script` (or `All`). With the default `None`, the
    script cannot see them.
 3. **Player root.** Keep both players' Root the same; the probe found
@@ -569,6 +580,7 @@ In Q-SYS Designer, with the station's design open:
      PLAYER_A = "Audio_Player_01", METER_A = 1,
      PLAYER_B = "Audio_Player_02", METER_B = 2,
      METER = "PlayerOutput01",
+     MIXER = "PlayerSum", MIX_A = 1, MIX_B = 2, -- mixer inputs muted while a deck analyzes
      SERVER_URL = "http://<server-ip>:5410",   -- from install.sh
      SERVER_TOKEN = "<token>",                 -- RADIO_API_TOKEN from .env
      STATION_ID = "Main",                      -- unique per Core; "" = the design name
@@ -580,14 +592,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 1.0.1 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.1.0 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 1.0.1`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.1.0`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -618,7 +630,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (8 in 1.0.1).
+The last line prints the number of tables (8 in 1.1.0).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -660,7 +672,7 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 1.0.1, server is 1.0.2`.
+  `station=Main runs radio.lua 1.0.2, server is 1.1.0`.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -778,6 +790,7 @@ sudo journalctl -u qsysradio --since "1 hour ago" --no-pager | tail -n 50
 | `meter component 'PlayerOutput01' not found`, `Deck A: component 'Audio_Player_01' not found` | The Code Name differs from `CFG` (step 10) |
 | `Deck A: 'Audio_Player_01' has no control 'gain' (Script Access on?)` | Script Access is `None`, or the Code Name differs from `CFG` (step 10) |
 | `meter 'PlayerOutput01' has no control peak.1` (or `peak.2`) | The meter's Script Access is `None`, or it has fewer than 2 channels (step 10) |
+| `! mixer 'PlayerSum' with input.1/2.mute.1 not found: file analysis is off` | The mixer's Code Name differs from `CFG.MIXER`, its Script Access is `None`, or the players are on other inputs (`MIX_A` / `MIX_B`). The station plays on; only file analysis is off |
 | `library: cannot list media/Audio/Test/Tuning/` | That folder is not on the Core: upload it, or change Music folder on the Settings page |
 | `! server: sync failed (403 ); N events queued`; journal: `/api/v1/core/sync: rejected request from <core-ip> (bad or missing X-Radio-Token)` | `CFG.SERVER_TOKEN` differs from `RADIO_API_TOKEN` (`grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`): paste it and run again |
 | Journal: `/api/v1/core/sync: refused, RADIO_API_TOKEN is not set in .env` | Re-run `sudo ./install.sh` (it generates one), then put it in `CFG.SERVER_TOKEN` |
@@ -1069,6 +1082,41 @@ when the server is unreachable.
   always by length) for tighter ad times. The Library's music totals show
   how many songs have never played and the longest any has waited.
 
+## File analysis
+
+The Core measures each file's quiet start and end on the deck that is off
+air, instead of (or before) learning them from plays:
+
+- **Off air.** The deck's PlayerSum input (`input.N.mute.1`) is muted before
+  the file loads, and the player plays at full level into its meter (the
+  meter is before the mixer). Every on-air play unmutes its deck first; a
+  restart of the script unmutes both.
+- **When.** While the station plays: on the deck that is not live, only
+  while the song on air has more than 30 s left and no skip or break is
+  asked for. Anything the station needs the deck for (crossfade, skip,
+  break, Play now, Start) takes it back at once and the file is tried again
+  later. While stopped: both decks, about twice as fast.
+- **What.** The first 6 s (where the sound starts), then a jump to 15 s
+  before the end and play to the end (where it stops). A file shorter than
+  that plays through. About 17 s per song. The quiet end reads up to ~0.7 s
+  short because the meter takes a moment to fall: the safe side, the next
+  item starts a touch later.
+- **Which files.** The server keeps the job (`stations.analyze_from`) and
+  sends the next 20 owed files in the sync reply whenever that list changes
+  (`analyze`, `analyze_rev`); each result is an `analysis` event. Short
+  imaging and ads go first. A file that fails is not retried by that job.
+  A file whose size changes (replaced) is owed again.
+- **Daily.** Settings → Silence detection → "Analyze new files daily at"
+  (default 04:00, server time; off) starts a run for files never analyzed.
+  The library pages show progress and have **Analyze now** (files not
+  analyzed yet), **Re-analyze all** and **Stop**; a file's quiet start / end
+  editor has **Analyze again**.
+- **Final.** Analyzed figures (`library.analyzed_at`) are not learned over
+  by plays, on the server or the Core. Figures set by an operator still win;
+  **Forget measured** clears the analysis too.
+- **The panel.** The analyzing deck shows "analyzing · off air" on the
+  dashboard and never counts as on air (Coming up ignores it).
+
 ## Clock
 
 Every time on the panel (header clock, plays, activity, Coming up, the play
@@ -1129,9 +1177,10 @@ complete record.
 | 0.2 | Standalone deck controller |
 | 0.3 | Server: play log, control panel, settings, sign-in, syslog, NTP check; advertisements, fair rotation and ad-break fitting on the server; pause ads / bumpers; station IDs; quiet start / end and fade-out handling for every kind, adjustable per file |
 | 1.0.1 | Stable: everything in 0.3 |
-| 1.1 | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
-| 1.2 | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
-| 1.3 | Loudness normalisation from the learned peak |
+| 1.1.0 | File analysis: quiet start / end measured on the off-air deck, daily |
+| 1.2 | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
+| 1.3 | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
+| 1.4 | Loudness normalisation from the learned peak |
 
 ## Network requirement
 

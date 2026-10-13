@@ -5,6 +5,51 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.1.0] - 2026-10-13
+
+### Added
+- **File analysis on the off-air deck.** The Core measures each file's quiet
+  start and end itself instead of learning them from plays: on the deck that
+  is not on air, with that player's PlayerSum input muted (the meter is
+  before the mixer, so it still reads full level). It plays the first 6 s,
+  then the last 15 s, about 17 s a song. While the station plays it uses the
+  idle deck between songs, and the station takes the deck back the moment it
+  needs it (crossfade, skip, break, Play now). While stopped it uses both
+  decks. Analyzed figures are final: plays no longer learn over them, which
+  ends compounding from fades. A replaced file (new size) is analyzed again.
+- **Daily run:** Settings → Silence detection → "Analyze new files daily at"
+  (default 04:00 server time, or off) analyzes the files not analyzed yet.
+- **Library pages:** progress ("Analyzing on the off-air deck: 37 files to
+  go"), **Analyze now**, **Re-analyze all**, **Stop**; **Analyze again** in a
+  file's quiet start / end editor, which also says whether its figures were
+  analyzed or measured from plays. The dashboard shows the analyzing deck as
+  "analyzing · off air".
+- radio.lua `CFG`: `MIXER = "PlayerSum", MIX_A = 1, MIX_B = 2` (`""` = no
+  analysis). Without that mixer the station plays as before and the Debug
+  Output says analysis is off. Migration 0011.
+
+Redeploy both: the Core (paste radio.lua and re-enter your `CFG` values,
+plus `MIXER` if your mixer has another name; set PlayerSum's Script Access
+to Script) and the server (`git pull && sudo systemctl restart qsysradio`,
+runs migration 0011).
+
+## [1.0.2] - 2026-10-13
+
+### Fixed
+- **With Fade in set above 0, songs lost more of their start on every
+  play.** The Core doesn't read the meter while a fade-in moves the gain, so
+  the first sound it saw came after the fade. It learned that as the song's
+  quiet start, skipped it next time, and measured again after another
+  fade-in, until the 3 s skip limit (a song starting at 0.5 s was learned at
+  5 s). Plays the Core fades in no longer report a quiet start. Migration
+  0010 forgets the measured quiet starts on stations that had Fade in above
+  0; figures set by an operator stay. With Fade in at 0 (the default)
+  nothing was affected. A file's own soft fade-in was never the problem: it
+  counts as sound from −50 dBFS up.
+
+Redeploy both: the Core (paste radio.lua) and the server (`git pull && sudo
+systemctl restart qsysradio`, runs migration 0010).
+
 ## [1.0.1] - 2026-10-13
 
 First stable version: the same code as 0.3.0, declared solid. From here on

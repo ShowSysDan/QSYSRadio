@@ -81,7 +81,7 @@ def forecast(cur, station, state, age_s, n=10):
         return hour_start + timedelta(minutes=m), window
 
     # when the next item starts: the live song's (or break's) time left, less the crossfade and its tail
-    decks = [d for d in (state.get('decks') or {}).values() if isinstance(d, dict)]
+    decks = [d for d in (state.get('decks') or {}).values() if isinstance(d, dict) and not d.get('analyzing')]
     live = next((d for d in decks if d.get('live') and d.get('state') == 'playing'), None) or \
         next((d for d in decks if d.get('state') == 'playing'), None)
     if not live or _num(live.get('remaining'), None) is None:

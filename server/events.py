@@ -106,12 +106,23 @@ def _apply(cur, station, ev):
                     (ev['_at'], number(ev.get('played')), text(ev.get('reason'), 50), ev['seq'], station, ev['boot'],
                      text(ev.get('deck'), 10), END_KINDS[kind], ev['seq'], file, file))
         if kind in END_KINDS:
-            # this play's measurements (every kind); trailing silence keeps the shortest seen (LEAST skips NULL)
-            cur.execute("""UPDATE library SET lead_in_s = COALESCE(%s, lead_in_s), trail_s = LEAST(trail_s, %s),
+            # this play's measurements (every kind); trailing silence keeps the shortest seen (LEAST skips NULL);
+            # an analyzed file keeps its analyzed figures
+            cur.execute("""UPDATE library SET lead_in_s = CASE WHEN analyzed_at IS NULL THEN COALESCE(%s, lead_in_s) ELSE lead_in_s END,
+                               trail_s = CASE WHEN analyzed_at IS NULL THEN LEAST(trail_s, %s) ELSE trail_s END,
                                peak_dbfs = COALESCE(%s, peak_dbfs)
                            WHERE station = %s AND key = %s""",
                         (number(ev.get('lead_in')), number(ev.get('trail')), number(ev.get('peak')), station,
                          (text(ev.get('dir'), 500) or '') + (file or '')))
+    elif kind == 'analysis':
+        # a file analyzed off air: its figures replace what plays learned (a failed one is not retried by the job)
+        ok = ev.get('ok') is True
+        cur.execute("""UPDATE library SET analyzed_at = NOW(),
+                           lead_in_s = CASE WHEN %s THEN %s ELSE lead_in_s END, trail_s = CASE WHEN %s THEN %s ELSE trail_s END,
+                           duration_s = COALESCE(%s, duration_s)
+                       WHERE station = %s AND key = %s""",
+                    (ok, number(ev.get('lead_in')), ok, number(ev.get('trail')), number(ev.get('duration')) if ok else None,
+                     station, (text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')))
     elif kind == 'file_unsupported':
         cur.execute('UPDATE library SET unsupported = TRUE WHERE station = %s AND key = %s',
                     (station, (text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')))

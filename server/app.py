@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, g, jsonify, redirect, render_template, request, session, url_for
 
-from . import ads, auth, breaks, clock, config, control, db, forecast, logs, plays
+from . import ads, analysis, auth, breaks, clock, config, control, db, forecast, logs, plays
 from .events import BadRequest
 from .migrate import discover
 
@@ -364,6 +364,18 @@ def post_forget():
     n, line = control.forget_measured(conn, station, body.get('key'), body.get('kind'), user)
     write_logs([line, control.add_command(conn, station, 'rescan', {}, user)[1]])
     return jsonify(ok=True, files=n)
+
+
+@app.post('/api/v1/analyze')
+@auth.operator_required
+def post_analyze():
+    """{station, scope: new|all|stop} or {station, key}: start / stop analyzing files on the off-air deck."""
+    body = _json_body()
+    station = _station(body.get('station'))
+    if not station:
+        raise BadRequest('no station has connected yet')
+    write_logs([analysis.start(dbconn(), station, body.get('scope'), db.text(body.get('key'), 1000), auth.current_user())])
+    return jsonify(ok=True)
 
 
 @app.post('/api/v1/ads')
