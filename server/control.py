@@ -127,7 +127,7 @@ def core_sync(conn, payload, now):
         newest = cur.fetchone()[0]
         if ack > newest:            # server DB was reset: tell the Core to start over
             reply['ack_reset'] = newest
-        overrides = core_settings.load(cur)
+        overrides = core_settings.for_core(core_settings.load(cur))
         rev = core_settings.rev(overrides)
         if (text(payload.get('settings_rev'), 50) or '') != rev:
             reply['settings'], reply['settings_rev'] = overrides, rev
@@ -346,9 +346,11 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
         args += [like(q)] * 3
     with conn.cursor() as cur:
         cur.execute(f"""SELECT count(*) AS n, COALESCE(sum(duration_s), 0) AS duration_s,
-                               COALESCE(sum(audible_s), 0) AS audible_s, count(*) FILTER (WHERE duration_s IS NULL) AS unknown
+                               COALESCE(sum(audible_s), 0) AS audible_s, count(*) FILTER (WHERE duration_s IS NULL) AS unknown,
+                               count(*) FILTER (WHERE last_played IS NULL) AS never_played, min(last_played) AS oldest_played
                         FROM ({sql}) x""", args)
         totals = dict(cur.fetchone())
+        totals['oldest_played'] = iso(totals['oldest_played'])
         total = totals['n']
         cur.execute(sql + f' ORDER BY {_SORTS.get(sort, _SORTS["artist"])}, l.key LIMIT %s OFFSET %s',
                     args + [limit, offset])
@@ -366,7 +368,7 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
 def _setting_rows(spec, overrides, running):
     return [{'name': n, 'label': lb, 'group': g, 'type': t, 'min': None if t == 'choice' else lo,
              'max': hi, 'step': st, 'choices': list(lo) if t == 'choice' else None, 'default': d, 'help': h,
-             'override': overrides.get(n), 'running': running.get(n)}
+             'override': overrides.get(n), 'running': running.get(n), 'server_only': n in core_settings.SERVER_ONLY}
             for n, lb, g, t, lo, hi, st, d, h in spec]
 
 
@@ -380,7 +382,9 @@ def settings_view(conn, station):
             if r:
                 running = (_clean_state(r['state']) or {}).get('settings') or {}
                 rev_core = r['settings_rev']
-    rev = core_settings.rev(overrides)
+    rev = core_settings.rev(core_settings.for_core(overrides))
+    for name in core_settings.SERVER_ONLY:          # the server's own: "running" is what it uses
+        running[name] = overrides.get(name, core_settings.BY_NAME[name][7])
     return {'rev': rev, 'core_rev': rev_core, 'in_sync': rev_core == rev,
             'settings': _setting_rows(core_settings.SPEC, overrides, running)}
 

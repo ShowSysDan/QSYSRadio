@@ -1020,13 +1020,18 @@ when the server is unreachable.
   (at most 40 songs; never-played songs first), keeping artist separation. A
   song therefore airs within about 1¼ passes through the library, whatever
   rescans, folder changes or Core restarts happen (`library.last_played`).
-- **Near an ad slot.** The server knows every song's length and trailing
-  silence (kept per file in `library`, even while a file is out of the
-  folder) and when the song on air started. When the next per-hour slot is
-  within two songs, it picks from the least recently played half the song
-  that makes the song change (and with it the break) fall just after the
-  slot opens: that song alone, or with the best follow-up. Up next shows it
-  as **FOR AD**.
+- **Near an ad slot: fairness first.** The server knows every song's
+  length and trailing silence (kept per file in `library`, even while a file
+  is out of the folder) and when the song on air started. When the next
+  per-hour slot is within two songs, it checks how late the fair pick above
+  would start the break (that song, then the best follow-up). Within **Ad
+  timing tolerance** (Settings → Rotation, 3 min) it stays. Otherwise it
+  takes the best-timed song of the same least recently played quarter, and
+  reaches into the oldest half only when that is the only way to play the ad
+  inside its window at all. Up next shows such a song as **FOR AD**. Raise
+  the tolerance for a fairer rotation (ads a little later), lower it (0 =
+  always by length) for tighter ad times. The Library's music totals show
+  how many songs have never played and the longest any has waited.
 
 ## Clock
 

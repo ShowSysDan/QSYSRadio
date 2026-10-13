@@ -251,7 +251,9 @@ def test_learned_figures_live_on_the_server(app):
     lib = op.get('/api/v1/library?station=L1&kind=music').json
     a_row = next(i for i in lib['items'] if i['key'] == 'M/a.mp3')
     assert a_row['audible_s'] == pytest.approx(200 - 0.6 - 3.0)                  # without the quiet start and end
-    assert lib['totals'] == {'n': 2, 'duration_s': 200.0, 'audible_s': pytest.approx(196.4), 'unknown': 1}
+    t = lib['totals']
+    assert (t['n'], t['duration_s'], t['audible_s'], t['unknown']) == (2, 200.0, pytest.approx(196.4), 1)
+    assert t['never_played'] == 1 and t['oldest_played']                         # rotation health: bad.wma never aired
     items[1]['size'] = 21                                       # replaced with a new file: try it again
     assert 'M/bad.wma' not in library_post(app, 'L1', items).json['learned']
 
@@ -285,9 +287,13 @@ def test_hourly_slots_never_share_a_break():
         assert min((b - a for a, b in zip(every, every[1:])), default=60) >= min(4, 60 / len(every)) - 1e-9, counts
         for n, x in zip(counts, slots):                  # an ad's own slots: no closer than half its ideal gap
             assert all(b - a >= 30 / n for a, b in zip(x, x[1:])), (counts, x)
-    assert ads.best_fit([('a', 100), ('b', 200), ('c', 251)], 250) == 'c'
-    assert ads.best_fit([('a', 100), ('b', 155)], 250) == 'a'                      # 100 + 155: 5 s late
-    assert ads.best_fit([('a', 100)], 600) is None
+    assert ads.lateness([('a', 100), ('b', 155)], 0, 250) == 5                     # 100 + 155: 5 s late
+    q, h = [('r', 300), ('q', 251)], [('r', 300), ('q', 251), ('o', 248)]
+    assert ads.choose('r', q, h, 250, 180, 600) == ('r', 'rotation')                # 50 s late: within tolerance
+    assert ads.choose('r', q, h, 250, 30, 600) == ('q', 'ad')                       # too late: the quarter's best
+    assert ads.choose('r', [('r', 300)], h, 250, 30, 20) == ('q', 'ad')             # only the half saves the slot
+    assert ads.choose('r', q, h, 1000, 0, 600) == ('r', 'rotation')                 # too far off to plan
+    assert ads.choose('x', q, h, 250, 0, 600) == ('x', 'rotation')                  # pick of unknown length
 
 
 def test_hourly_ads_are_staggered(app):
@@ -335,10 +341,13 @@ def test_next_song_least_recently_played_and_ad_fit(app):
             cur.execute("SELECT started_at FROM play_log WHERE station = 'F1' AND ended_at IS NULL")
             next_start = cur.fetchone()[0] + timedelta(seconds=200 - 4)          # crossfade 4 s, no learned tail
             assert ads.next_song(cur, 'F1') == ('M/d.mp3', 'rotation')            # never played: first
-            # 'd' (255 s, 251 s airtime) lands 1 s after the slot
-            assert ads.next_song(cur, 'F1', next_start + timedelta(seconds=250)) == ('M/d.mp3', 'ad')
+            # the fair pick 'd' (251 s airtime) lands 1 s after the slot: it stays
+            assert ads.next_song(cur, 'F1', (next_start + timedelta(seconds=250), 600)) == ('M/d.mp3', 'rotation')
+            # 201 s late (more than the 180 s tolerance) and the window is 130 s: the oldest half's
+            # best-timed song saves the slot ('g', 176 s airtime: 126 s late)
+            assert ads.next_song(cur, 'F1', (next_start + timedelta(seconds=50), 130)) == ('M/g.mp3', 'ad')
             cur.execute("UPDATE library SET last_played = NOW() WHERE station = 'F1' AND key = 'M/d.mp3'")
-            key, why = ads.next_song(cur, 'F1', next_start + timedelta(seconds=600))     # too far off: rotation
+            key, why = ads.next_song(cur, 'F1', (next_start + timedelta(seconds=600), 600))   # too far off: rotation
             assert why == 'rotation' and key in ('M/h.mp3', 'M/g.mp3')                   # the oldest quarter
             conn.rollback()
         sync(app, station='F1', state=dict(STATE, queue=[{'key': 'M/a.mp3'}]))
@@ -404,12 +413,16 @@ def test_coming_up_forecast(app):
 
 def test_forecast_fits_later_songs_to_ad_slots(app):
     """Not only the next song: every song the forecast lists is picked as the server will, by length near a slot."""
-    songs = [{'key': f'M/{c}.mp3', 'dir': 'M/', 'file': f'{c}.mp3', 'kind': 'music', 'artist': c.upper()} for c in 'cdefghijkl']
+    names = ['c'] + [f's{i:02d}' for i in range(40)]
+    songs = [{'key': f'M/{c}.mp3', 'dir': 'M/', 'file': f'{c}.mp3', 'kind': 'music', 'artist': c.upper()} for c in names]
     library_post(app, 'FF', songs + [{'key': 'Ads/h.wav', 'dir': 'Ads/', 'file': 'h.wav', 'kind': 'ad'}], ads_dir='Ads/')
-    for i, c in enumerate('cdefghijkl'):
-        sql("UPDATE qsr_test.library SET duration_s = %s WHERE station = 'FF' AND key = %s", (64 if c == 'c' else 200 + 31 * i, f'M/{c}.mp3'))
-    op = signed_in(app, 'operator')
+    for i, c in enumerate(names):                   # lengths 2:30 .. 9:00, shuffled over the keys
+        sql("UPDATE qsr_test.library SET duration_s = %s WHERE station = 'FF' AND key = %s",
+            (64 if c == 'c' else 150 + (i * 97) % 390, f'M/{c}.mp3'))
+    op, admin = signed_in(app, 'operator'), signed_in(app, 'admin')
     op.post('/api/v1/ads', json={'station': 'FF', 'key': 'Ads/h.wav', 'mode': 'hourly', 'per_hour': 4}, headers=WEB)
+    tolerance = lambda v: admin.post('/api/v1/settings', json={'settings': {'ad_fit_tolerance_s': v}}, headers=WEB)
+    assert tolerance(0).status_code == 200                         # always pick by length
     state = dict(STATE, queue=[{'key': 'M/c.mp3', 'file': 'c.mp3'}],
                  decks={'A': {'state': 'playing', 'live': True, 'kind': 'music', 'key': 'M/x.mp3', 'file': 'x.mp3',
                               'remaining': 60, 'duration': 300}},
@@ -418,6 +431,12 @@ def test_forecast_fits_later_songs_to_ad_slots(app):
     whys = [(x['kind'], x['why']) for x in op.get('/api/v1/now?station=FF&ahead=10').json['station']['ahead']]
     assert whys[0] in (('music', 'queue'), ('ad', 'hourly'))
     assert ('music', 'for_ad') in whys, whys            # a later song picked by length for the next slot
+    tolerance(600)                                      # fair rotation unless an ad would be 10 min late: no fitting
+    whys = [(x['kind'], x['why']) for x in op.get('/api/v1/now?station=FF&ahead=10').json['station']['ahead']]
+    tolerance(None)
+    assert ('music', 'for_ad') not in whys, whys
+    # the server-only setting is not sent to the Core
+    assert 'ad_fit_tolerance_s' not in (sync(app, station='FF', settings_rev='').json.get('settings') or {})
 
 
 def test_ads_plan_rules_and_play_log(app):
@@ -681,8 +700,10 @@ def test_settings_spec_matches_radio_lua():
     src = open(os.path.join(os.path.dirname(__file__), '..', 'qsys', 'radio', 'radio.lua')).read()
     block = re.search(r'^SETTINGS = \{(.*?)^\}', src, re.S | re.M).group(1)
     lua = {k: v.strip().strip('"') for k, v in re.findall(r'(\w+) = ("[^"]*"|-?[\d.]+)', block)}
-    assert set(lua) == set(core_settings.BY_NAME)
+    assert set(lua) == set(core_settings.BY_NAME) - core_settings.SERVER_ONLY
     for name, spec in core_settings.BY_NAME.items():
+        if name in core_settings.SERVER_ONLY:
+            continue
         default = spec[7]
         assert (lua[name] == default) if isinstance(default, str) else float(lua[name]) == float(default), name
 

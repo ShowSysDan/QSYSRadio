@@ -62,11 +62,15 @@ SPEC = [
 
     ('artist_separation', 'Artist separation', 'Rotation', 'int', 0, 20, 1, 2,
      'Avoid repeating an artist within the last N songs.'),
+    ('ad_fit_tolerance_s', 'Ad timing tolerance', 'Rotation', 'int', 0, 600, 15, 180,
+     'The next song is the fair rotation pick unless it would start a per-hour ad more than this late; only then '
+     'is a song picked for its length. Higher = fairer rotation, ads a little later. 0 = always pick by length.'),
     ('dead_air_s', 'Dead-air guard', 'Safety', 'float', 0.5, 30, 0.5, 1.5,
      'If nothing is playing for this long, start something (seconds).'),
 ]
 BY_NAME = {s[0]: s for s in SPEC}
 REQUIRED = {'music_dir'}
+SERVER_ONLY = {'ad_fit_tolerance_s'}     # used by the server's song picks; not sent to the Core
 PREFIX = 'core.'
 
 
@@ -124,6 +128,10 @@ def load(cur, prefix=PREFIX, by_name=None):
             except ValueError:
                 pass
     return out
+
+
+def for_core(overrides):
+    return {k: v for k, v in overrides.items() if k not in SERVER_ONLY}
 
 
 def rev(overrides):

@@ -16,7 +16,6 @@ one whose length makes the song change fall just after the slot opens.
 """
 import hashlib
 import json
-import math
 from datetime import timedelta
 
 from . import core_settings
@@ -25,7 +24,6 @@ from .events import BadRequest
 
 MODES = ('mix', 'hourly', 'off')
 POOL = 40                  # at most this many least recently played songs to pick the next one from
-FIT_MAX_LATE_S = 120       # no fill when even the best choice lands later than this
 PER_HOUR_MAX = 30
 
 
@@ -109,17 +107,17 @@ def _setting(cur, name):
     return core_settings.load(cur).get(name, core_settings.BY_NAME[name][7])
 
 
-def next_song(cur, station, slot_at=None):
+def next_song(cur, station, slot=None):
     """The song the Core should play after the one on air: (key, why) or (None, None).
 
     Rotation: a random one of the least recently played quarter of the
     eligible songs (never played first; at most POOL), keeping artist
     separation, so every song airs within about 1¼ passes of the library,
-    rescans and Core restarts notwithstanding. 'ad': when the next per-hour
-    slot (slot_at) is within two songs, the one of the oldest half whose end
-    (or the best follow-up's end) falls soonest after the slot opens. Stable while one
-    song plays (seeded by its play). None when the operator queue has songs,
-    automation is off or nothing qualifies."""
+    rescans and Core restarts notwithstanding. 'ad': picked by length when
+    the rotation pick would start the next per-hour ad too late (choose()).
+    Stable while one song plays (seeded by its play). None when the operator queue has songs,
+    automation is off or nothing qualifies. slot: (datetime the next per-hour
+    slot opens, its window in seconds) or None. See choose()."""
     cur.execute("""SELECT s.state, p.id, p.started_at, p.duration_s, l.trail_s, l.lead_in_s, l.key
                    FROM stations s
                    LEFT JOIN LATERAL (SELECT * FROM play_log WHERE station = s.station AND kind = 'music' AND ended_at IS NULL
@@ -145,8 +143,13 @@ def next_song(cur, station, slot_at=None):
     def shuffled(share):               # the least recently played `share` of the eligible songs, in a stable random order
         return sorted(oldest[:max(1, min(POOL, int(n * share)))],
                       key=lambda r: hashlib.md5((r['key'] + seed).encode()).hexdigest())
-    fit = _fit(cur, on_air, shuffled(0.5), slot_at) if slot_at and on_air['duration_s'] else None
-    return (fit, 'ad') if fit else (shuffled(0.25)[0]['key'], 'rotation')
+    quarter, half = shuffled(0.25), shuffled(0.5)
+    if not (slot and on_air['duration_s']):
+        return quarter[0]['key'], 'rotation'
+    air = airtime({n: float(_setting(cur, n)) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})
+    gap = (slot[0] - on_air['started_at']).total_seconds() - air(on_air)     # from the next song's start to the slot
+    timed = lambda pool: [(r['key'], air(r)) for r in pool if r['duration_s']]
+    return choose(quarter[0]['key'], timed(quarter), timed(half), gap, float(_setting(cur, 'ad_fit_tolerance_s')), slot[1])
 
 
 def airtime(settings):
@@ -158,27 +161,37 @@ def airtime(settings):
     return air
 
 
-def _fit(cur, on_air, pool, slot_at):
-    """The pool song that lands the break soonest after slot_at, or None."""
-    air = airtime({n: float(_setting(cur, n)) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})
-    gap = (slot_at - on_air['started_at']).total_seconds() - air(on_air)
-    return best_fit([(r['key'], air(r)) for r in pool if r['duration_s']], gap)
+def lateness(cands, i, gap):
+    """Seconds after the slot opens (gap s from now) that the break starts if
+    cands[i] plays next, followed if needed by the best other candidate (0 when
+    two songs cannot reach the slot: nothing to decide yet)."""
+    length = cands[i][1]
+    if length >= gap:
+        return length - gap
+    rest = gap - length
+    # no follow-up reaches the slot: a third song will, and is picked (and timed) when its turn comes
+    return min((other - rest for j, (_, other) in enumerate(cands) if j != i and other >= rest), default=0)
 
 
-def best_fit(cands, gap):
-    """[(key, airtime)], seconds until the slot opens -> the key whose end (or the
-    best follow-up's end) falls soonest after it, or None when none lands in time."""
-    if gap <= 0 or not cands or gap > 2 * max(length for _, length in cands):
-        return None                    # the break comes anyway, or too far off to plan
+def choose(rotation, quarter, half, gap, tolerance, window):
+    """The next song with an ad slot gap s away: (key, 'rotation' | 'ad').
 
-    def late(i):
-        length = cands[i][1]
-        if length >= gap:
-            return length - gap
-        rest = gap - length
-        return min((other - rest for j, (_, other) in enumerate(cands) if j != i and other >= rest), default=math.inf)
-    best = min(range(len(cands)), key=late)
-    return cands[best][0] if late(best) <= FIT_MAX_LATE_S else None
+    Fair rotation first: `rotation` (from the least recently played quarter)
+    unless it would start the break more than `tolerance` s late. Then the
+    quarter's best-timed song, if the slot still plays (within its `window`);
+    the oldest half only when that alone saves the slot. quarter / half:
+    [(key, airtime s)], songs of unknown length left out."""
+    rot = next((i for i, (k, _) in enumerate(quarter) if k == rotation), None)
+    longest = max((length for _, length in half or quarter), default=0)
+    if gap is None or gap <= 0 or rot is None or gap > 2 * longest:
+        return rotation, 'rotation'    # the break comes anyway, too far off to plan, or the pick's length unknown
+    if lateness(quarter, rot, gap) <= tolerance:
+        return rotation, 'rotation'
+    for pool in (quarter, half):
+        best = min(range(len(pool)), key=lambda i: lateness(pool, i, gap))
+        if lateness(pool, best, gap) <= window:
+            return pool[best][0], ('rotation' if pool[best][0] == rotation else 'ad')
+    return rotation, 'rotation'
 
 
 def plan(cur, station):
@@ -188,10 +201,11 @@ def plan(cur, station):
     rows = rows.values()
     mix = [r['key'] for r in rows if r['mode'] == 'mix']
     due = sorted((r['slots'][r['states'].index('due')], r['key']) for r in rows if 'due' in r.get('states', ()))
-    upcoming = [m for r in rows for m, st in zip(r.get('slots', ()), r.get('states', ())) if st == 'next']
-    upcoming += [r['slots'][0] + 60 for r in rows if r.get('slots')]           # the next hour's first ones
+    upcoming = [(m, r['per_hour']) for r in rows for m, st in zip(r.get('slots', ()), r.get('states', ())) if st == 'next']
+    upcoming += [(r['slots'][0] + 60, r['per_hour']) for r in rows if r.get('slots')]   # the next hour's first ones
     out = {'due': [k for _, k in due], 'mix': mix}
-    song, why = next_song(cur, station, hour_start + timedelta(minutes=min(upcoming)) if upcoming else None)
+    m, per_hour = min(upcoming) if upcoming else (None, None)
+    song, why = next_song(cur, station, (hour_start + timedelta(minutes=m), window_minutes(per_hour) * 60) if m is not None else None)
     if song:
         out['next'], out['next_why'] = song, why
     return out, hashlib.sha1(json.dumps(out).encode()).hexdigest()[:12]
