@@ -11,7 +11,7 @@ local function when(cond, fn) local function chk() if cond() then fn() else Mock
 
 local function boot(music, imaging, before)
   for _, f in ipairs({ "outbox", "settings" }) do os.remove("media/_radio/" .. f .. ".json") end
-  MockCore.setup{ seed = 2, dirs = { ["Test/Tuning/"] = music, ["Test/Imaging/"] = imaging or {} }, controls = { inputs = 3, outputs = 6 } }
+  MockCore.setup{ seed = 2, dirs = { ["Test/Tuning/"] = music, ["Test/Imaging/"] = imaging or {} } }
   if before then before() end
   dofile("qsys/radio/radio.lua")
 end
@@ -62,22 +62,15 @@ check(bumpRes == false and not Station.bumperRequested, "bumper_now during a bum
 boot(songs(4, 40), BUMPERS)
 SETTINGS.bumper_every_n_tracks = 0
 MockCore.at(10, function() Station.setAutomation(false, "test") end)
-MockCore.at(20, function() MockCore.press(1) end)                 -- panel Skip while off
+MockCore.at(20, function() Control.run({ cmd = "skip" }) end)    -- Skip while off
 MockCore.at(30, function() Station.setAutomation(true, "test") end)
 MockCore.run(45)
 local restart
 for _, s in ipairs(evs("track_start")) do if s.at >= 30 then restart = restart or s end end
 local cut = false
 for _, tr in ipairs(evs("transition")) do if restart and tr.at > restart.at and tr.at < restart.at + 10 then cut = true end end
-check(restart and not cut, "panel skip while stopped does not cut the first track after start")
+check(restart and not cut, "skip while stopped does not cut the first track after start")
 check(count("dead_air_guard") == 0, "start plays immediately (no dead-air guard event)")
-
-print("-- panel Automation toggle is in sync from boot")
-boot(songs(4, 40), BUMPERS)
-check(Controls.Inputs[3].Boolean == true, "Automation control shows ON at boot")
-MockCore.run(5)
-local c = Controls.Inputs[3]; c.Boolean = false; c.EventHandler(c)
-check(Station.automation == false, "first toggle stops the station")
 
 print("-- empty music folder: no event flood")
 boot(songs(4, 40), BUMPERS)
@@ -175,16 +168,12 @@ MockCore.run(60)
 local after = outboxFile()
 check(after and #after == 0 and #Server.outbox == 0, "emptied once delivered")
 
-print("-- lightweight: fast timer only while fading/loading, panel writes only on change")
+print("-- lightweight: fast timer only while fading/loading")
 boot(songs(6, 60), BUMPERS)
 SETTINGS.bumper_every_n_tracks = 0
-local fastTicks, writes = 0, 0
+local fastTicks = 0
 local realFast = Engine.fast
 Engine.fast = function() fastTicks = fastTicks + 1; return realFast() end
-for _, o in ipairs(Controls.Outputs) do
-  local mt = { __newindex = function(t, k, v) if k == "String" then writes = writes + 1 end rawset(t, k, v) end }
-  setmetatable(o, mt)
-end
 MockCore.run(300)
 check(fastTicks < 300 * 20 * 0.15, string.format("50 ms timer ran %d times in 300 s (always-on would be 6000)", fastTicks))
 check(count("track_start") >= 5, "still crossfading normally")

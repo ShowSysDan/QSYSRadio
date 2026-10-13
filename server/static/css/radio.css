@@ -236,6 +236,11 @@ table.plays { width: 100%; border-collapse: collapse; font-size: 13px; }
 .rule { display: inline-flex; gap: 6px; align-items: center; }
 .rule select, .rule input { padding: 4px 8px; font-size: 12px; }
 .rule input { width: 64px; }
+.slots { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; font: 11px var(--mono); }
+.slots span { padding: 0 5px; border-radius: 3px; border: 1px solid var(--border); color: var(--text-dim); }
+.slots .done { color: var(--text-muted); text-decoration: line-through; border-color: transparent; }
+.slots .due { color: #000; background: var(--warning); border-color: var(--warning); }
+.slots .missed { color: var(--danger); text-decoration: line-through; border-color: rgba(239,68,68,.3); opacity: .7; }
 .tag.silence { color: var(--cyan); border-color: rgba(34,211,238,.35); }
 .tag.cut { color: var(--warning); border-color: rgba(245,158,11,.35); }
 .tag.eof, .tag.core_restart { color: var(--danger); border-color: rgba(239,68,68,.35); }
@@ -268,8 +273,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .set-row .state { font: 11px var(--mono); color: var(--text-dim); margin-top: 3px; }
 .set-row .state .ovr { color: var(--accent); }
 .set-row .state .diff { color: var(--warning); }
-.set-row input { width: 100%; }
-.set-row input.changed { border-color: var(--warning); }
+.set-row input, .set-row select { width: 100%; }
+.set-row .changed { border-color: var(--warning); }
 .linkbtn { font-size: 11px; color: var(--text-dim); background: none; border: 0; padding: 0; box-shadow: none; text-decoration: underline; cursor: pointer; }
 .linkbtn:hover { color: var(--accent); transform: none; background: none; box-shadow: none; }
 .banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: var(--radius); font-size: 13px; margin-bottom: 14px; border: 1px solid var(--border); }

@@ -9,8 +9,10 @@ which the settings page shows next to each field.
 import hashlib
 import json
 import math
+import re
 
 # name, label, group, type, min, max, step, radio.lua default, help
+# (types: int, float, dir; logs.spec() adds host, name and choice, whose min holds the choices)
 SPEC = [
     ('music_dir', 'Music folder', 'Library', 'dir', None, None, None, 'Test/Tuning/',
      "Relative to the players' root (Audio/). Changing it rescans the library."),
@@ -63,9 +65,22 @@ REQUIRED = {'music_dir'}
 PREFIX = 'core.'
 
 
-def coerce(name, raw):
+_HOST = re.compile(r'^[A-Za-z0-9._:\-]{0,253}$')
+_NAME = re.compile(r'^[!-~]{1,48}$')
+
+
+def coerce(name, raw, by_name=None):
     """Validate one value from the form. Returns the typed value or raises ValueError."""
-    _, label, _, typ, lo, hi, _, _, _ = BY_NAME[name]
+    _, label, _, typ, lo, hi, _, _, _ = (by_name or BY_NAME)[name]
+    if typ in ('host', 'name', 'choice'):
+        v = raw.strip() if isinstance(raw, str) else None
+        if typ == 'host' and (v is None or not _HOST.match(v)):
+            raise ValueError(f'{label}: must be an IP address or host name (empty = off)')
+        if typ == 'name' and (v is None or not _NAME.match(v)):
+            raise ValueError(f'{label}: 1 to 48 characters, no spaces')
+        if typ == 'choice' and v not in lo:
+            raise ValueError(f'{label}: must be one of {", ".join(lo)}')
+        return v
     if typ == 'dir':
         if not isinstance(raw, str):
             raise ValueError(f'{label}: must be a folder name')
@@ -92,13 +107,13 @@ def coerce(name, raw):
     return f
 
 
-def load(cur):
+def load(cur, prefix=PREFIX, by_name=None):
     """{name: value} overrides stored on the server."""
-    cur.execute('SELECT key, value FROM app_settings WHERE key LIKE %s', (PREFIX + '%',))
+    cur.execute('SELECT key, value FROM app_settings WHERE key LIKE %s', (prefix + '%',))
     out = {}
     for r in cur.fetchall():
-        name = r['key'][len(PREFIX):]
-        if name in BY_NAME:
+        name = r['key'][len(prefix):]
+        if name in (by_name or BY_NAME):
             try:
                 out[name] = json.loads(r['value'])
             except ValueError:
@@ -110,12 +125,12 @@ def rev(overrides):
     return hashlib.sha1(json.dumps(overrides, sort_keys=True).encode()).hexdigest()[:12]
 
 
-def save(cur, changes):
-    """changes: {name: value or None (= back to the radio.lua default)}."""
+def save(cur, changes, prefix=PREFIX):
+    """changes: {name: value or None (= back to the default)}."""
     for name, value in changes.items():
         if value is None:
-            cur.execute('DELETE FROM app_settings WHERE key = %s', (PREFIX + name,))
+            cur.execute('DELETE FROM app_settings WHERE key = %s', (prefix + name,))
         else:
             cur.execute("""INSERT INTO app_settings (key, value, updated_at) VALUES (%s, %s, NOW())
                            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
-                        (PREFIX + name, json.dumps(value)))
+                        (prefix + name, json.dumps(value)))

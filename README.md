@@ -135,10 +135,9 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   overwritten.
 - **Never dead.** If neither deck is busy for `dead_air_s`, something starts;
   with an empty music folder it backs off and logs once.
-- **Panel controls (optional).** Text Controller: named controls `Skip`,
-  `BumperNow`, `Automation` (inputs) and `Status`, `NowPlaying`, `NextUp`,
-  `DeckA`, `DeckB`, `LastEvent` (outputs). Control Script: Input Count = 3,
-  Output Count = 6, same order. Outputs update once a second, only on change.
+- **No Q-SYS panel controls.** Everything is operated from the web panel;
+  the script's Debug Output shows one short line per event (the server keeps
+  every field) and a heartbeat every 30 s.
 
 ### Testing without a Core
 
@@ -301,7 +300,7 @@ nano .env
 | `SECRET_KEY`, `RADIO_API_TOKEN` | leave empty: install.sh generates them |
 | `WEB_WORKERS`, `WEB_THREADS`, `PG_POOL_MAX_IDLE` | leave commented (4 × 8, 4). A server can open up to WEB_WORKERS × (WEB_THREADS + 2) = 40 PostgreSQL connections; check `SHOW max_connections;` (default 100) covers the sister apps too |
 | `SESSION_COOKIE_SECURE`, `SESSION_COOKIE_DOMAIN` | leave unset unless step 9 says otherwise |
-| `SYSLOG_*` | optional, see [Syslog](#syslog) |
+| `SYSLOG_*` | optional; easier on the Settings page, see [Syslog](#syslog) |
 | `RADIO_ALLOW_NO_TOKEN` | never on a real station |
 | `ACCESS_LOG` | leave commented. `1` logs every HTTP request to the journal (the Core alone makes one a second) |
 
@@ -434,7 +433,7 @@ still need the same rule. Check from a staff PC:
 `http://<server-ip>:5410/api/v1/health` shows the JSON from step 5.
 
 The server itself connects out to PostgreSQL (`<db-port>`) and, if
-`SYSLOG_HOST` is set, to syslog (514).
+a syslog server is set, to syslog (514).
 
 ### 7. Give people access (in 321Theater)
 
@@ -555,14 +554,13 @@ In Q-SYS Designer, with the station's design open:
      AUTOSTART = true,
    }
    ```
-   For the optional panel controls, see [Deck controller](#deck-controller).
 6. **Run.** Use File → Save to Core & Run. The script scans the folders and
    starts the first track on Player 1. With `AUTOSTART = false` it waits for
-   the Automation control or Start on the dashboard.
+   Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
    16:00:01 radio 0.3.0-dev starting on Core 8 Flex (<design name>)
-   16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/
+   16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
@@ -995,17 +993,25 @@ with no row is mixed in.
 | Schedule | Plays |
 |---|---|
 | Mix in | in ad breaks (every `ad_every_n_tracks` songs), shuffled with the other mix-ins |
-| Per hour, N | N times each clock hour (server time), spread out: the k-th play is owed at (k − ½)/N of the hour, e.g. N = 4 at :07, :22, :37, :52, and goes in the first break after that; an owed ad starts a break at the next song change. Plays are counted from the play log |
+| Per hour, N | N slots each clock hour (server time), evenly spaced. Ads on a per-hour schedule are staggered so they fall due in turn (four ads at 4 an hour: one every 3¾ min, :02, :06, :09, :13 …), not together. A slot is owed from its time for its window (10 min, or half the gap to that ad's next slot if shorter) and starts a break at the next song change. A slot that cannot play in its window (station stopped, a long song) is **missed**: skipped, never made up later in the hour. The Library shows each ad's slots this hour: played, owed now, missed, to come |
 | Off | never |
 
 ## Syslog
 
-Set `SYSLOG_HOST` in `.env` and restart to send the server's log to your
-syslog server as well as journald: every play and end, commands and who sent
-them, settings changes, sign-ins, unsupported files, dead-air guard, Core
-restarts and errors. Options (all in `.env.example`): `SYSLOG_PORT` (514),
-`SYSLOG_PROTOCOL` (`udp` / `tcp`), `SYSLOG_FORMAT` (`rfc3164` / `rfc5424`),
-`SYSLOG_FACILITY` (`local0`), `SYSLOG_LEVEL` (`INFO`), `SYSLOG_APP_NAME`.
+To send the server's log to your syslog server as well as journald (every
+play and end, commands and who sent them, settings changes, sign-ins,
+unsupported files, dead-air guard, Core restarts and errors), open
+**Settings → Server settings** (admins) and fill in the **Syslog server** (IP
+or host name) and **Port**, plus protocol (`udp` / `tcp`), format
+(`rfc3164` / `rfc5424`), facility (`local0`), lowest level (`INFO`) and app
+name if needed. Save, then **Send test message** to check it arrives. Every
+server worker picks the change up within 10 s; no restart. Clear the host to
+turn it off.
+
+The same options can be set in `.env` (`SYSLOG_HOST`, `SYSLOG_PORT`,
+`SYSLOG_PROTOCOL`, `SYSLOG_FORMAT`, `SYSLOG_FACILITY`, `SYSLOG_LEVEL`,
+`SYSLOG_APP_NAME`; see `.env.example`); they are the defaults, and a value
+saved on the Settings page wins.
 
 ```
 <134>Oct 12 19:40:21 radio-srv QSYSRadio[3066]: PLAY music "Bravo - Two" station=Main artist=Bravo deck=A dir=Music/ duration=28 file=Bravo - Two.mp3 title=Two at=2026-10-12T23:40:21Z

@@ -259,9 +259,38 @@ def test_queue_lengths_come_from_the_library(app):
     assert st['next_up']['duration'] == 123.0 and st['queue'][0]['duration'] == 123.0
 
 
-def test_owed_spreads_plays_over_the_hour():
-    assert [ads.owed(4, m / 60) for m in (0, 7, 8, 22, 23, 52, 53, 59)] == [0, 0, 1, 1, 2, 3, 4, 4]
-    assert ads.owed(1, 0.49) == 0 and ads.owed(1, 0.5) == 1
+def test_slots_have_windows_and_missed_ones_are_skipped():
+    slots = ads.slot_minutes(4, 0.5)
+    assert slots == [7.5, 22.5, 37.5, 52.5] and ads.window_minutes(4) == 7.5 and ads.window_minutes(1) == 10
+    w = ads.window_minutes(4)
+    assert ads.slot_states(slots, w, [], 5) == ['next'] * 4
+    assert ads.slot_states(slots, w, [], 10) == ['due', 'next', 'next', 'next']
+    # stopped from :05 to :40: the :07 and :22 slots are skipped, not played back to back
+    assert ads.slot_states(slots, w, [], 40) == ['missed', 'missed', 'due', 'next']
+    assert ads.slot_states(slots, w, [9.0, 41.0], 41) == ['done', 'missed', 'done', 'next']
+    assert ads.slot_states(slots, w, [], 59.9) == ['missed'] * 3 + ['due']      # :52.5 is open until :60
+
+
+def test_hourly_ads_are_staggered(app):
+    keys = [f'Ads/s{i}.wav' for i in range(4)]
+    library_post(app, 'A2', [{'key': k, 'dir': 'Ads/', 'file': k[4:], 'kind': 'ad'} for k in keys], ads_dir='Ads/')
+    op = signed_in(app, 'operator')
+    for k in keys:
+        assert op.post('/api/v1/ads', json={'station': 'A2', 'key': k, 'mode': 'hourly', 'per_hour': 4},
+                       headers=WEB).status_code == 200
+    items = op.get('/api/v1/library?station=A2&kind=ad').json['items']
+    minutes = sorted(datetime.fromisoformat(t).minute * 60 + datetime.fromisoformat(t).second
+                     for i in items for t in (x['at'] for x in i['slots']))
+    assert len(minutes) == 16 and all(len(i['slots']) == 4 for i in items)
+    gaps = {b - a for a, b in zip(minutes, minutes[1:])}
+    assert gaps <= {224, 225, 226}                  # one ad every 3.75 min, not four at once
+    sync(app, station='A2', state=STATE)
+    nxt = op.get('/api/v1/now?station=A2').json['station']['next_ad']
+    assert nxt['at'] and nxt['key'] in keys and nxt['owed'] >= 0
+    # nothing played: the plan owes exactly the ads with an open slot (at most 2 of 4 windows overlap)
+    due = sync(app, station='A2', ads_rev='').json['ads']['due']
+    states = {i['key']: [x['state'] for x in i['slots']] for i in op.get('/api/v1/library?station=A2&kind=ad').json['items']}
+    assert len(due) <= 2 and all('due' in states[k] for k in due) and 'done' not in sum(states.values(), [])
 
 
 def test_ads_plan_rules_and_play_log(app):
@@ -277,20 +306,20 @@ def test_ads_plan_rules_and_play_log(app):
     assert rule(op, key='Ads/h.wav', mode='hourly', per_hour=30).status_code == 200
     assert rule(op, key='Ads/off.wav', mode='off').status_code == 200
 
-    frac = float(sql("SELECT EXTRACT(EPOCH FROM NOW() - date_trunc('hour', NOW())) / 3600", fetch=True)[0][0])
+    now_m = float(sql("SELECT EXTRACT(EPOCH FROM NOW() - date_trunc('hour', NOW())) / 60", fetch=True)[0][0])
     first = sync(app, station='A1', ads_rev='').json
     assert first['ads']['mix'] == ['Ads/m1.wav', 'Ads/m2.wav']
-    assert first['ads']['due'] == (['Ads/h.wav'] if ads.owed(30, frac) > 0 else [])
+    open_now = 'due' in ads.slot_states(ads.slot_minutes(30, 0.5), ads.window_minutes(30), [], now_m)
+    assert first['ads']['due'] in ([], ['Ads/h.wav']) and (first['ads']['due'] == ['Ads/h.wav']) == open_now
     assert 'ads' not in sync(app, station='A1', ads_rev=first['ads_rev']).json             # unchanged: not resent
 
-    # 30 plays this hour: nothing owed any more; the ad is logged as kind 'ad'
+    # a play in every slot's window this hour: nothing owed; the ad is logged as kind 'ad'
     now = datetime.now(timezone.utc)
     hour_start = now.replace(minute=0, second=0, microsecond=0)
-    evs = [ev(10 + i, 'ad_start', t=(hour_start + timedelta(seconds=i)).strftime('%Y-%m-%dT%H:%M:%SZ'), deck='A',
-              file='h.wav', dir='Ads/', duration=30.0) for i in range(30)]
+    evs = [ev(10 + i, 'ad_start', t=(hour_start + timedelta(minutes=m, seconds=5)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+              deck='A', file='h.wav', dir='Ads/', duration=30.0) for i, m in enumerate(ads.slot_minutes(30, 0.5))]
     reply = sync(app, station='A1', events=evs, ads_rev=first['ads_rev']).json
-    if first['ads']['due']:
-        assert reply['ads']['due'] == []
+    assert reply.get('ads', first['ads'])['due'] == []
     lib = op.get('/api/v1/library?station=A1&kind=ad').json['items']
     h = next(i for i in lib if i['key'] == 'Ads/h.wav')
     assert (h['mode'], h['per_hour'], h['plays_hour']) == ('hourly', 30, 30) and h['plays_today'] >= 30
@@ -445,6 +474,37 @@ def test_settings_validation_and_push(app):
     assert 'settings' not in sync(app, station='S7', settings_rev=first['settings_rev']).json
     assert save(music_dir=None).json['changed'] == ['music_dir']                          # back to the default
     assert 'music_dir' not in sync(app, station='S7', settings_rev=first['settings_rev']).json['settings']
+
+
+def test_syslog_set_on_the_settings_page(app):
+    import socket
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx.bind(('127.0.0.1', 0))
+    rx.settimeout(5)
+    port = rx.getsockname()[1]
+    admin, op = signed_in(app, 'admin'), signed_in(app, 'operator')
+    save = lambda c, **s: c.post('/api/v1/server-settings', json={'settings': s}, headers=WEB)
+    assert op.get('/api/v1/server-settings').status_code == 403
+    assert save(op, host='127.0.0.1').status_code == 403
+    for bad in ({'host': 'a b'}, {'host': 'x;rm'}, {'port': 0}, {'port': 70000}, {'protocol': 'http'},
+                {'level': 'LOUD'}, {'app': 'two words'}, {'facility': 'nope'}, {'nope': 1}):
+        assert save(admin, **bad).status_code == 400, bad
+    assert admin.post('/api/v1/server-settings/test', json={}, headers=WEB).status_code == 400     # no host yet
+    try:
+        assert save(admin, host='127.0.0.1', port=port, format='rfc5424', app='RadioTest').json['changed'] == \
+            ['app', 'format', 'host', 'port']
+        view = {x['name']: x for x in admin.get('/api/v1/server-settings').json['settings']}
+        assert view['host']['running'] == '127.0.0.1' and view['protocol']['choices'] == ['udp', 'tcp']
+        assert admin.post('/api/v1/server-settings/test', json={}, headers=WEB).json['sent_to'] == f'127.0.0.1:{port}/udp'
+        for _ in range(20):                      # the settings save itself is logged first
+            line = rx.recv(4096).decode()
+            if 'SYSLOG test message' in line:
+                break
+        assert line.startswith('<') and ' RadioTest ' in line and 'user=admin' in line
+    finally:
+        save(admin, host=None, port=None, format=None, app=None)
+        rx.close()
+    assert admin.get('/api/v1/server-settings').json['settings'][0]['running'] == ''
 
 
 def test_settings_spec_matches_radio_lua():

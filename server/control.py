@@ -6,10 +6,11 @@ commands, so command ids are committed in order and none can be skipped by
 the Core's "everything after my last ack" request.
 """
 import json
+from datetime import timedelta
 
 from psycopg2.extras import execute_values
 
-from . import ads, core_settings, events
+from . import ads, core_settings, events, logs
 from .db import clean_json, iso, like, number, text
 from .events import BadRequest
 
@@ -229,11 +230,12 @@ def status(conn, station):
                  'note': c['note']} for c in cur.fetchall()]
         state = _clean_state(r['state']) or {}
         _fill_durations(cur, station, state)
+        next_ad = ads.next_ad(cur, station)
     age = float(r['age'])
     return {'station': r['station'], 'online': age < ONLINE_S, 'age_s': round(age, 1),
             'state_age_s': round(float(r['state_age']), 2) if r['state_age'] is not None else None,
             'version': r['radio_version'], 'boot': r['boot'], 'last_seen': iso(r['last_seen']),
-            'library_at': iso(r['library_at']), 'state': state, 'commands': cmds}
+            'library_at': iso(r['library_at']), 'state': state, 'commands': cmds, 'next_ad': next_ad}
 
 
 def _fill_durations(cur, station, state):
@@ -340,7 +342,21 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
         cur.execute(sql + f' ORDER BY {_SORTS.get(sort, _SORTS["artist"])}, l.key LIMIT %s OFFSET %s',
                     args + [limit, offset])
         items = [dict(r, last_played=iso(r['last_played'])) for r in cur.fetchall()]
+        if any(i['kind'] == 'ad' for i in items):
+            sched, hour_start = ads.schedule(cur, station)
+            for i in items:
+                r = sched.get(i['key'])
+                if r and 'slots' in r:      # this hour's times for an hourly ad: done / due / missed / next
+                    i['slots'] = [{'at': iso(hour_start + timedelta(minutes=m)), 'state': st}
+                                  for m, st in zip(r['slots'], r['states'])]
     return total, items
+
+
+def _setting_rows(spec, overrides, running):
+    return [{'name': n, 'label': lb, 'group': g, 'type': t, 'min': None if t == 'choice' else lo,
+             'max': hi, 'step': st, 'choices': list(lo) if t == 'choice' else None, 'default': d, 'help': h,
+             'override': overrides.get(n), 'running': running.get(n)}
+            for n, lb, g, t, lo, hi, st, d, h in spec]
 
 
 def settings_view(conn, station):
@@ -354,34 +370,55 @@ def settings_view(conn, station):
                 running = (_clean_state(r['state']) or {}).get('settings') or {}
                 rev_core = r['settings_rev']
     rev = core_settings.rev(overrides)
-    return {
-        'rev': rev, 'core_rev': rev_core, 'in_sync': rev_core == rev,
-        'settings': [{'name': n, 'label': lb, 'group': g, 'type': t, 'min': lo, 'max': hi, 'step': st,
-                      'default': d, 'help': h, 'override': overrides.get(n), 'running': running.get(n)}
-                     for n, lb, g, t, lo, hi, st, d, h in core_settings.SPEC],
-    }
+    return {'rev': rev, 'core_rev': rev_core, 'in_sync': rev_core == rev,
+            'settings': _setting_rows(core_settings.SPEC, overrides, running)}
 
 
-def save_settings(conn, form, user):
-    """form: {name: value, or None to go back to the radio.lua default}.
+def _save(conn, form, user, spec, prefix, what):
+    """form: {name: value, or None to go back to the default}.
     Returns (changed names, log_line or None)."""
     if not isinstance(form, dict):
         raise BadRequest('expected an object of settings')
+    by_name = {x[0]: x for x in spec}
     changes = {}
     for name, raw in form.items():
-        if name not in core_settings.BY_NAME:
+        if name not in by_name:
             raise BadRequest(f'unknown setting {name!r}')
         try:
-            changes[name] = None if raw is None else core_settings.coerce(name, raw)
+            changes[name] = None if raw is None else core_settings.coerce(name, raw, by_name)
         except ValueError as exc:
             raise BadRequest(str(exc))
     with conn.cursor() as cur:
-        before = core_settings.load(cur)
+        before = core_settings.load(cur, prefix, by_name)
         changed = {k: v for k, v in changes.items() if before.get(k) != v}
-        core_settings.save(cur, changed)
+        core_settings.save(cur, changed, prefix)
     conn.commit()
     line = None
     if changed:
-        line = (20, f'SETTINGS changed by={user.get("username")} ' +
+        line = (20, f'{what} changed by={user.get("username")} ' +
                 ' '.join(f'{k}={"default" if v is None else v}' for k, v in sorted(changed.items())))
     return sorted(changed), line
+
+
+def save_settings(conn, form, user):
+    return _save(conn, form, user, core_settings.SPEC, core_settings.PREFIX, 'SETTINGS')
+
+
+# ── Server settings (syslog) ─────────────────────────────────────────────────
+
+def syslog_overrides(conn):
+    spec = logs.spec()
+    with conn.cursor() as cur:
+        return core_settings.load(cur, logs.PREFIX, {x[0]: x for x in spec})
+
+
+def syslog_view(conn):
+    """The syslog settings; 'running' = what this worker is using."""
+    overrides = syslog_overrides(conn)
+    return {'settings': _setting_rows(logs.spec(), overrides, logs.configure(overrides))}
+
+
+def save_syslog(conn, form, user):
+    changed, line = _save(conn, form, user, logs.spec(), logs.PREFIX, 'SYSLOG settings')
+    logs.configure(syslog_overrides(conn))
+    return changed, line

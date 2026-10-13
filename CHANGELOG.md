@@ -7,6 +7,21 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Ad slots you can see, and no bunching.** Per-hour ads are staggered:
+  ads with the same count fall due one after another (four at 4 an hour:
+  every 3¾ min) instead of all at :07 / :22 / :37 / :52. Each slot has a
+  window (10 min, or half the gap to the ad's next slot); a slot that cannot
+  play in it (station stopped, long song) is skipped, not made up at the end
+  of the hour. Library → Ads lists each ad's times this hour (played, owed,
+  missed, to come); the dashboard's "Next ad break" card shows the next
+  hourly ad and how long until it, instead of OFF.
+- **Syslog on the Settings page**: a "Server settings" section (admins) for
+  the syslog server's IP / host name and port, protocol, format, facility,
+  lowest level and app name, with **Send test message**. Saved in
+  `app_settings` (`syslog.*`); `.env`'s `SYSLOG_*` are now only the
+  defaults. Each server worker re-reads them every 10 s and rebuilds the
+  sender only when they changed, so no restart is needed.
+  `GET/POST /api/v1/server-settings`, `POST /api/v1/server-settings/test`.
 - **App server** set up like the other apps on the shared PostgreSQL server:
   own `qsysradio` schema (`PG_APP_SCHEMA`) with the cross-app `shared` schema
   second on the search path; config in `.env`; `install.sh` (venv,
@@ -65,6 +80,16 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- radio.lua is ~1100 lines (was ~1220): the optional Q-SYS panel controls
+  are gone (inputs `Skip`, `BumperNow`, `Automation`; outputs `Status`,
+  `NowPlaying`, `NextUp`, `DeckA`, `DeckB`, `LastEvent`): the station is
+  operated from the web panel only. Debug Output lines are short (event kind
+  and file); the server keeps every field. Remove the Text Controller's
+  extra controls from the design if you added them.
+- radio.lua trimmed without changing behaviour: one `readJson`/`writeJson`
+  pair, no `Store` class (the 30 s Chores timer already paced the outbox
+  file), no unused `LOG` ring, one `Station.nextSong(take)` for peek and
+  pick, one `timer()` helper for all four timers.
 - **The Core keeps almost nothing on its media drive.** `learned.json` is
   gone: the server's `library` table keeps duration, lead-in, shortest
   trailing silence and peak per file (from each play's `track_end`) and

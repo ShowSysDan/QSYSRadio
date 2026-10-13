@@ -6,6 +6,7 @@ The Core's endpoints (/api/v1/core/*) need X-Radio-Token = RADIO_API_TOKEN.
 database connection (dbconn()), returned when the request ends.
 """
 import hmac
+import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from urllib.parse import urlparse
@@ -81,6 +82,21 @@ def _session_unavailable():
         raise db.DatabaseUnavailable('could not load the session')
     if getattr(session, 'broken', None):
         raise auth.SignInUnavailable(session.broken)
+
+
+_syslog_checked = {'at': -1e9}
+
+
+@app.before_request
+def _reload_syslog():
+    """Pick up syslog settings saved by any worker (every logs.RELOAD_S)."""
+    if request.path.startswith('/static/') or time.monotonic() - _syslog_checked['at'] < logs.RELOAD_S:
+        return
+    _syslog_checked['at'] = time.monotonic()
+    try:
+        logs.configure(control.syslog_overrides(dbconn()))
+    except db.DatabaseUnavailable:
+        pass                         # keep what is running; the request reports the outage itself
 
 
 @app.context_processor
@@ -193,7 +209,7 @@ def log_page():
 @app.get('/settings')
 @auth.admin_required
 def settings_page():
-    return _page('settings.html', 'settings')
+    return render_template('settings.html', page='settings', reload_s=logs.RELOAD_S)
 
 
 # ── Core API (token) ─────────────────────────────────────────────────────────
@@ -299,6 +315,30 @@ def post_settings():
     changed, line = control.save_settings(dbconn(), _json_body().get('settings'), auth.current_user())
     write_logs([line])
     return jsonify(ok=True, changed=changed)
+
+
+@app.get('/api/v1/server-settings')
+@auth.admin_required
+def get_server_settings():
+    return jsonify(ok=True, **control.syslog_view(dbconn()))
+
+
+@app.post('/api/v1/server-settings')
+@auth.admin_required
+def post_server_settings():
+    changed, line = control.save_syslog(dbconn(), _json_body().get('settings'), auth.current_user())
+    write_logs([line])
+    return jsonify(ok=True, changed=changed)
+
+
+@app.post('/api/v1/server-settings/test')
+@auth.admin_required
+def post_syslog_test():
+    s = logs.configure(control.syslog_overrides(dbconn()))
+    if not s['host']:
+        raise BadRequest('no syslog server is set')
+    log.warning('SYSLOG test message from user=%s (if you can read this, syslog works)', auth.current_user().get('username'))
+    return jsonify(ok=True, sent_to=f"{s['host']}:{s['port']}/{s['protocol']}")
 
 
 def _play_query(fn, *args):

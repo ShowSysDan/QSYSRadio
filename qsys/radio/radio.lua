@@ -25,8 +25,8 @@ for k, v in pairs(SETTINGS) do DEFAULTS[k] = v end
 
 -- internals (not settings)
 local K = {
-  floor_db = -100, tick_s = 0.25, fast_s = 0.05, load_timeout_s = 1.5, chores_s = 30, log_ring = 200,
-  sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000, outbox_save_s = 30,
+  floor_db = -100, tick_s = 0.25, fast_s = 0.05, load_timeout_s = 1.5, chores_s = 30,
+  sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000,
 }
 -- only what must survive a reboot while the server is unreachable; everything else lives on the server
 FILES = { outbox = "media/_radio/outbox.json", settings = "media/_radio/settings.json" }
@@ -54,24 +54,18 @@ local function utc() return os.date("!%Y-%m-%dT%H:%M:%SZ") end
 local function startsWith(s, p) return type(s) == "string" and s:sub(1, #p) == p end
 local function round(v, places) local m = 10 ^ (places or 2); return math.floor(v * m + 0.5) / m end
 local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
-local function fmtClock(sec)
-  if type(sec) ~= "number" then return "-:--" end
-  sec = math.max(0, math.floor(sec + 0.5))
-  return string.format("%d:%02d", sec // 60, sec % 60)
-end
 local function normDir(d)
   d = tostring(d or ""):gsub("^/+", "")
   if d ~= "" and d:sub(-1) ~= "/" then d = d .. "/" end
   return d
 end
-local function label(tr) return tr and ((tr.artist and (tr.artist .. " - ") or "") .. (tr.title or tr.name)) or "-" end
 -- append to a bounded list (oldest dropped); returns true when something was dropped
 local function push(list, item, max)
   list[#list + 1] = item
   if #list > max then table.remove(list, 1) return true end
   return false
 end
-local function shuffled(list)
+local function shuffled(list)               -- a shuffled copy
   local out = {}
   for i, v in ipairs(list) do
     local j = math.random(i)
@@ -81,12 +75,7 @@ local function shuffled(list)
   return out
 end
 
-LOG = {}
-local function log(fmt, ...)
-  local line = os.date("!%H:%M:%S") .. " " .. string.format(fmt, ...)
-  print(line)
-  push(LOG, line, K.log_ring)
-end
+local function log(fmt, ...) print(os.date("!%H:%M:%S") .. " " .. string.format(fmt, ...)) end
 
 -- control writes without a closure per call
 local function assign(obj, field, value) obj[field] = value end
@@ -100,58 +89,34 @@ local function trigger(ctl)
 end
 
 -- ── FILES (JSON on the Core's media drive) ────────────────────────────────────
-local function readFile(path)
-  local f = io.open(path, "r")
-  if not f then return nil end
-  local s = f:read("*a")
-  f:close()
-  return s
-end
-
-local function writeFile(path, s)
-  pcall(dir.create, "media/_radio")
+local function writeJson(path, data, raw)
   local ok, err = pcall(function()
+    raw = raw or json.encode(data)
+    pcall(dir.create, "media/_radio")
     local f = assert(io.open(path, "w"))
-    f:write(s)
+    f:write(raw)
     f:close()
   end)
   if not ok then log("! save %s failed: %s", path, tostring(err)) end
 end
 
--- A file that exists but does not decode is kept as <path>.bad, never overwritten.
+-- a file that exists but does not decode is kept as <path>.bad, never overwritten
 local function readJson(path)
-  if not json then return nil end
-  local ok, raw = pcall(readFile, path)
-  if not ok or not raw or raw == "" then return nil end
-  local okDecode, data = pcall(json.decode, raw)
-  if okDecode and type(data) == "table" then return data end
-  log("! %s is unreadable; kept as %s.bad", path, path)
-  writeFile(path .. ".bad", raw)
-  return nil
-end
-
-local function writeJson(path, data)
-  if not json then return end
-  local ok, s = pcall(json.encode, data)
-  if ok then writeFile(path, s) else log("! encode %s failed: %s", path, tostring(s)) end
-end
-
--- A file written at most every `every` seconds (or on flush(true)).
-Store = {}
-Store.__index = Store
-function Store.new(path, every, get) return setmetatable({ path = path, every = every, get = get, dirty = false, at = -1e9 }, Store) end
-function Store:touch() self.dirty = true end
-function Store:flush(force)
-  if self.dirty and (force or now() - self.at >= self.every) then
-    self.dirty, self.at = false, now()
-    writeJson(self.path, self.get())
+  local f = json and io.open(path, "r")
+  if not f then return nil end
+  local raw = f:read("*a")
+  f:close()
+  local ok, data = pcall(json.decode, raw)
+  if ok and type(data) == "table" then return data end
+  if raw ~= "" then
+    log("! %s is unreadable; kept as %s.bad", path, path)
+    writeJson(path .. ".bad", nil, raw)
   end
 end
 
 -- ── EVENTS ────────────────────────────────────────────────────────────────────
 EVENTS = {}          -- last 500 events: { boot, seq, t = utc, at, kind = ..., ... }
 BOOT_ID, EVENT_SEQ, STATE_REV = "-", 0, 0
-local META = { kind = true, t = true, at = true, boot = true, seq = true }
 local function emit(kind, data)
   data = data or {}
   data.kind, data.t, data.at = kind, utc(), round(now(), 2)
@@ -160,13 +125,7 @@ local function emit(kind, data)
   STATE_REV = STATE_REV + 1                  -- anything worth an event changes the reported state
   push(EVENTS, data, 500)
   if Server then Server.queue(data) end
-  local parts = {}
-  for k, v in pairs(data) do
-    if not META[k] then parts[#parts + 1] = k .. "=" .. tostring(v) end
-  end
-  table.sort(parts)
-  log("%-14s %s", kind, table.concat(parts, "  "))
-  if UI then UI.lastEvent = kind end
+  log("%-14s %s", kind, data.file or data.cmd or data.reason or "")   -- the server keeps every field
 end
 
 -- ── LIBRARY ───────────────────────────────────────────────────────────────────
@@ -257,7 +216,7 @@ local DECK_CONTROLS = { "gain", "play", "stop", "playing", "filename", "filename
                         "status", "remaining", "loop", "mute" }
 
 function Deck.new(id, compName, meterIdx)
-  local self = setmetatable({ id = id, state = "idle", gain = K.floor_db, meter = -120 }, Deck)
+  local self = setmetatable({ id = id, state = "idle", gain = K.floor_db }, Deck)
   local ok, comp = pcall(Component.New, compName)
   if not ok or not comp then error("Deck " .. id .. ": component '" .. compName .. "' not found") end
   self.c = {}
@@ -386,7 +345,6 @@ function Deck:sample(t)
   if self.state ~= "playing" or self.fade then return end
   local m = self.peak.Value
   if type(m) ~= "number" then return end
-  self.meter = m
   local unity = (m > -118) and (m - self.gain) or -200
   if unity > SETTINGS.silence_threshold_dbfs then
     self.lastAudioAt, self.firstAudioAt, self.silentSince = t, self.firstAudioAt or t, nil
@@ -394,15 +352,6 @@ function Deck:sample(t)
   else
     self.silentSince = self.silentSince or t
   end
-end
-
-function Deck:describe(t)
-  local tr = self.track or self.pending
-  if self.state == "playing" or self.state == "fading" then
-    return string.format("%s %s %s/%s", self.state, tr and (tr.title or tr.name) or "-",
-      fmtClock(t - (self.playStart or t)), fmtClock(self.duration))
-  end
-  return self.state .. " " .. (tr and (tr.title or tr.name) or "-")
 end
 
 -- ── ENGINE: the 250 ms station timer + a 50 ms timer that runs only while needed ───
@@ -431,7 +380,7 @@ Station = {
   tracksSinceBumper = 0, tracksSinceAd = 0,   -- songs started since the last bumper / ad
   history = {}, bag = {}, lastBumper = nil, lastAds = {},
   skipRequested = false, bumperRequested = false, adRequested = false, automation = true,
-  nowPlaying = nil, idleSince = nil, ticks = 0,
+  idleSince = nil,
   queue = {},              -- operator "play next" list (music), consulted before the bag
   stopAfter = false,       -- stop when the current track ends (no next track)
   nextBumper = nil,        -- operator-chosen bumper for the next bumper slot
@@ -460,19 +409,14 @@ local function bagChoice()
   return #Station.bag                  -- nothing satisfies separation; take one anyway
 end
 
-function Station.peekNext()
-  for _, q in ipairs(Station.queue) do if Library.byKey[q.key] then return q, true end end
+-- the next song (operator queue first, then the rotation), and whether it was queued; take = remove it
+function Station.nextSong(take)
+  local q = Station.queue
+  while q[1] and not Library.byKey[q[1].key] do table.remove(q, 1) end
+  if q[1] then return take and table.remove(q, 1) or q[1], true end
   if #Library.music == 0 then return nil end
-  return Station.bag[bagChoice()], false
-end
-
-function Station.pickNext()
-  while #Station.queue > 0 do
-    local q = table.remove(Station.queue, 1)
-    if Library.byKey[q.key] then return q end
-  end
-  if #Library.music == 0 then return nil end
-  return table.remove(Station.bag, bagChoice())
+  local i = bagChoice()
+  return take and table.remove(Station.bag, i) or Station.bag[i], false
 end
 
 function Station.pickBumper()
@@ -584,7 +528,7 @@ function Station.startTrack(deck, track, opts, attempt)
       if attempt < 5 then
         local nxt = (track.kind == "imaging" and Station.pickBumper()) or
                     (track.kind == "ad" and table.remove(Station.breakList, 1)) or nil
-        Station.startTrack(deck, nxt or Station.pickNext(), opts, attempt + 1)
+        Station.startTrack(deck, nxt or Station.nextSong(true), opts, attempt + 1)
       else
         Station.state = "idle"
       end
@@ -592,7 +536,7 @@ function Station.startTrack(deck, track, opts, attempt)
     end
     d:play(SETTINGS[KINDS[track.kind].gain], opts.fadeIn or 0)
     if track.kind == "music" then
-      Station.nowPlaying, Station.live, Station.other, Station.state = track, d, otherDeck(d), "playing"
+      Station.live, Station.other, Station.state = d, otherDeck(d), "playing"
       Station.tracksSinceBumper, Station.tracksSinceAd = Station.tracksSinceBumper + 1, Station.tracksSinceAd + 1
       push(Station.history, track, 50)
       emit("track_start", { deck = d.id, file = track.name, dir = track.dir, artist = track.artist,
@@ -608,7 +552,7 @@ end
 
 -- start the next track on a free deck (boot, start, dead-air guard)
 function Station.kick(why)
-  local nxt = Station.pickNext()
+  local nxt = Station.nextSong(true)
   if not nxt then
     if not Station.emptyNoted then emit("library_empty", { music_dir = SETTINGS.music_dir }) end
     Station.emptyNoted, Station.state = true, "idle"
@@ -645,7 +589,7 @@ function Station.transition(reason)
     Station.startTrack(other, table.remove(spots, 1), {})
     if reason == "end" then fadeS = SETTINGS.bumper_fade_s end   -- the song dips under the break
   else
-    Station.startTrack(other, Station.pickNext(), { fadeIn = SETTINGS.fade_in_s })
+    Station.startTrack(other, Station.nextSong(true), { fadeIn = SETTINGS.fade_in_s })
   end
   fadeAndFinish(live, fadeS, outReason)
 end
@@ -666,7 +610,7 @@ local function afterSpot(ended)
     Station.freeDeck = ended
     return Station.startTrack(free, nxt, {})
   end
-  Station.startTrack(free, Station.pickNext(), { fadeIn = ended and 0 or SETTINGS.fade_in_s })
+  Station.startTrack(free, Station.nextSong(true), { fadeIn = ended and 0 or SETTINGS.fade_in_s })
 end
 
 function Station.onDeckEnded(d)
@@ -675,7 +619,7 @@ function Station.onDeckEnded(d)
     Station.finishTrack(d, "eof")
     if Station.stopAfter then Station.goOff("stop_after_current") return end
     Station.state = "crossfading"
-    Station.startTrack(Station.other, Station.pickNext(), {})
+    Station.startTrack(Station.other, Station.nextSong(true), {})
   elseif isSpot(Station.state) and d == Station.spotDeck then
     Station.finishTrack(d, "end")      -- a break item plays to its end by design
     afterSpot(d)
@@ -689,7 +633,6 @@ end
 function Station.goOff(why)
   clearRequests()
   Station.automation, Station.state, Station.armed = false, "off", nil
-  UI.syncAutomation()
   emit("automation", { on = false, why = why })
 end
 
@@ -704,7 +647,6 @@ function Station.setAutomation(on, why)
     return Station.goOff(why or "control")
   end
   Station.automation, Station.state = true, "idle"
-  UI.syncAutomation()
   emit("automation", { on = true, why = why or "control" })
   if not (DeckA:isBusy() or DeckB:isBusy()) then Station.kick() end
 end
@@ -729,8 +671,6 @@ end
 function Station.tick(t)
   DeckA:sample(t)
   DeckB:sample(t)
-  Station.ticks = Station.ticks + 1
-  if Station.ticks % math.max(1, math.floor(1 / K.tick_s + 0.5)) == 0 then UI.refresh(t) end
   if not Station.automation then return end
 
   local live, spot = Station.live, Station.spotDeck
@@ -764,17 +704,12 @@ function Station.tick(t)
   end
 end
 
-function Station.statusLine(t)
-  local live = Station.live
-  if Station.state == "off" then return "automation off" end
-  if live and live.track and (live.state == "playing" or live.state == "fading") then
-    return string.format("%s | %s | since bumper: %d/%d | bag: %d",
-      Station.state, live:describe(t), Station.tracksSinceBumper, SETTINGS.bumper_every_n_tracks, #Station.bag)
-  end
-  return Station.state
+function Station.statusLine()
+  local tr = Station.live and Station.live.track
+  return Station.state .. (tr and (" | " .. tr.name) or "") .. " | bag " .. #Station.bag
 end
 
--- ── COMMANDS (web panel via the server, and the optional panel controls) ──────
+-- ── COMMANDS (from the web panel, via the server) ─────────────────────────────
 Control = {}
 
 local function trackInfo(tr)
@@ -830,7 +765,8 @@ end
 
 Control.handlers = {
   skip = function()
-    if not Station.automation then return false, "automation is off" end
+    local ok, err = running()
+    if not ok then return false, err end
     if Station.state ~= "playing" then return false, "nothing to skip right now (" .. Station.state .. ")" end
     Station.skipRequested = true
     return true
@@ -927,12 +863,11 @@ function Station.snapshot(t)
     info.duration = d.duration and round(d.duration, 1) or info.duration
     return info
   end
-  local nxt, queued = Station.peekNext()
+  local nxt, queued = Station.nextSong()
   local nextUp = trackInfo(nxt)
   if nextUp then nextUp.queued = queued end
-  local queue, settings = {}, {}
+  local queue = {}
   for i, q in ipairs(Station.queue) do queue[i] = trackInfo(q) end
-  for k in pairs(DEFAULTS) do settings[k] = SETTINGS[k] end
   return {
     automation = Station.automation, state = Station.state, stop_after = Station.stopAfter,
     decks = { A = deck(DeckA), B = deck(DeckB) }, next_up = nextUp, queue = queue,
@@ -941,75 +876,27 @@ function Station.snapshot(t)
     next_ad = trackInfo(Station.nextAd), ad_requested = Station.adRequested, tracks_since_ad = Station.tracksSinceAd,
     ad_every = SETTINGS.ad_every_n_tracks, ads_due = Station.adPlan and #Station.adPlan.due or 0,
     library = { music = #Library.music, imaging = #Library.imaging, ad = #Library.ad },
-    settings = settings, uptime = round(t - BOOT_T, 0), outbox = #Server.outbox,
+    settings = SETTINGS, uptime = round(t - BOOT_T, 0), outbox = #Server.outbox,
   }
-end
-
--- ── OPERATOR PANEL (optional controls) ────────────────────────────────────────
-UI = { outputs = {}, shown = {}, lastEvent = "-" }
-
-local function panelControl(name, index, list)
-  local c = Controls and Controls[name]
-  if not c and Controls and type(Controls[list]) == "table" then c = Controls[list][index] end
-  return c
-end
-
-function UI.init()
-  for i, name in ipairs({ "Status", "NowPlaying", "NextUp", "DeckA", "DeckB", "LastEvent" }) do
-    UI.outputs[name] = panelControl(name, i, "Outputs")
-  end
-  local inputs = {
-    Skip = function(ctl) if ctl.Boolean then Control.run({ cmd = "skip", by = "panel" }) end end,
-    BumperNow = function(ctl) if ctl.Boolean then Control.run({ cmd = "bumper_now", by = "panel" }) end end,
-    Automation = function(ctl) Control.run({ cmd = ctl.Boolean and "start" or "stop_now", by = "panel" }) end,
-  }
-  for i, name in ipairs({ "Skip", "BumperNow", "Automation" }) do
-    local c = panelControl(name, i, "Inputs")
-    if c then pcall(assign, c, "EventHandler", inputs[name]) end
-    if name == "Automation" then UI.automationCtl = c end
-  end
-  UI.syncAutomation()
-end
-
-function UI.syncAutomation()
-  if UI.automationCtl then pcall(assign, UI.automationCtl, "Boolean", Station.automation) end
-end
-
-local function show(name, s)
-  local c = UI.outputs[name]
-  if c and UI.shown[name] ~= s then
-    UI.shown[name] = s
-    pcall(assign, c, "String", s)
-  end
-end
-
-function UI.refresh(t)
-  if next(UI.outputs) == nil then return end
-  local np, live = Station.nowPlaying, Station.live
-  show("Status", Station.statusLine(t))
-  show("NowPlaying", (np and live and live.playStart) and string.format("%s  %s / %s", label(np),
-    fmtClock(t - live.playStart), fmtClock(live.duration)) or "-")
-  show("NextUp", label((Station.peekNext())))
-  show("DeckA", DeckA:describe(t))
-  show("DeckB", DeckB:describe(t))
-  show("LastEvent", UI.lastEvent)
 end
 
 -- ── SERVER: one sync request a second, plus the library after each scan ───────
 Server = { outbox = {}, dropped = 0, lastCmd = 0, settingsRev = "", adsRev = "", fails = 0, nextTry = 0,
-           busy = {}, libraryDirty = false, sentRev = -1, stateAt = -1e9, onDisk = false }
--- the outbox is written only while the server is unreachable (and once more to clear it)
-Outbox = Store.new(FILES.outbox, K.outbox_save_s, function()
-  Server.onDisk = #Server.outbox > 0
-  return Server.outbox
-end)
+           busy = {}, libraryDirty = false, sentRev = -1, stateAt = -1e9, onDisk = false, outboxDirty = false }
+
+-- the outbox is written (by Chores, every 30 s) only while the server is unreachable, and once more to clear it
+function Server.saveOutbox()
+  if not Server.outboxDirty then return end
+  Server.outboxDirty, Server.onDisk = false, #Server.outbox > 0
+  writeJson(FILES.outbox, Server.outbox)
+end
 
 function Server.enabled() return type(CFG.SERVER_URL) == "string" and CFG.SERVER_URL ~= "" end
 
 function Server.queue(ev)
   if not Server.enabled() then return end
   if push(Server.outbox, ev, K.outbox_max) then Server.dropped = Server.dropped + 1 end
-  if Server.fails > 0 or Server.onDisk then Outbox:touch() end
+  Server.outboxDirty = Server.outboxDirty or Server.fails > 0 or Server.onDisk
 end
 
 local function stationName() return CFG.STATION_ID ~= "" and CFG.STATION_ID or STATION_NAME end
@@ -1035,7 +922,7 @@ end
 
 function Server.applySettings(s, rev, fromFile)
   local new = {}
-  for k, v in pairs(SETTINGS) do new[k] = DEFAULTS[k] ~= nil and DEFAULTS[k] or v end
+  for k, v in pairs(DEFAULTS) do new[k] = v end
   local n = 0
   for k, v in pairs(s) do
     if DEFAULTS[k] ~= nil and type(v) == type(DEFAULTS[k]) then new[k], n = v, n + 1 end
@@ -1116,7 +1003,7 @@ function Server.sync()
   post("sync", "/api/v1/core/sync", body, function(code, data, httpErr)
     local resp = decoded(code, data)
     if not resp then
-      if Server.fails == 0 then Outbox:touch() end
+      Server.outboxDirty = true
       Server.fails = Server.fails + 1
       Server.nextTry = now() + math.min(30, K.sync_s * 2 ^ math.min(Server.fails, 5))
       if Server.fails == 1 or Server.fails % 20 == 0 then
@@ -1136,7 +1023,7 @@ function Server.sync()
       for _, e in ipairs(batch) do sent[e] = true end
       for _, e in ipairs(Server.outbox) do if not sent[e] then keep[#keep + 1] = e end end
       Server.outbox, Server.dropped = keep, 0
-      if Server.onDisk then Outbox:touch() end
+      Server.outboxDirty = Server.onDisk
     end
     handleReply(resp)
   end)
@@ -1155,13 +1042,13 @@ function Server.loadLocal()
 end
 
 -- ── STARTUP ───────────────────────────────────────────────────────────────────
-local function every(seconds, fn, name)
+local function timer(name, fn, seconds)    -- seconds = nil: started later
   local tm = Timer.New()
   tm.EventHandler = function()
     local ok, err = pcall(fn)
     if not ok then log("! %s error: %s", name, tostring(err)) end
   end
-  tm:Start(seconds)
+  if seconds then tm:Start(seconds) end
   return tm
 end
 
@@ -1189,19 +1076,14 @@ local function boot()
   Server.loadLocal()
   for _, kind in ipairs(KIND_ORDER) do SETTINGS[KINDS[kind].dir] = normDir(SETTINGS[KINDS[kind].dir]) end
   Library.scan()
-  UI.init()
 
-  Fast = Timer.New()                   -- started by Engine.wake() only while fading/loading
-  Fast.EventHandler = function()
-    local okFast, err = pcall(Engine.fast)
-    if not okFast then log("! fast tick error: %s", tostring(err)) end
-  end
-  Tick = every(K.tick_s, function() Station.tick(now()) end, "tick")
-  Sync = every(K.sync_s, Server.sync, "sync")
-  Chores = every(K.chores_s, function()
-    log("heartbeat: %s", Station.statusLine(now()))
-    Outbox:flush()
-  end, "chores")
+  Fast = timer("fast tick", function() Engine.fast() end)   -- started by Engine.wake() only while fading/loading
+  Tick = timer("tick", function() Station.tick(now()) end, K.tick_s)
+  Sync = timer("sync", Server.sync, K.sync_s)
+  Chores = timer("chores", function()
+    log("heartbeat: %s", Station.statusLine())
+    Server.saveOutbox()
+  end, K.chores_s)
   emit("boot", { version = RADIO_VERSION, platform = tostring(st.Platform), design = STATION_NAME,
     server = Server.enabled() and CFG.SERVER_URL or "-" })
 
@@ -1209,8 +1091,7 @@ local function boot()
     Station.kick()
   else
     Station.automation, Station.state = false, "off"
-    UI.syncAutomation()
-    log("AUTOSTART = false; waiting for the Automation control")
+    log("AUTOSTART = false; waiting for Start on the web panel")
   end
 end
 

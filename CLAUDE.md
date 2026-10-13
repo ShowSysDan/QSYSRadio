@@ -10,8 +10,8 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   `RADIO_VERSION` in radio.lua (semver).
 - Tell the user what to redeploy: the Core (paste radio.lua), the server
   (`git pull && sudo systemctl restart qsysradio`), both, or neither.
-- No duplicated code: reuse the helpers (Lua: `push`, `set`/`trigger`,
-  `readJson`/`writeJson`, `Store`, `post`, `emit`; Python: `db.text`,
+- No duplicated code: reuse the helpers (Lua: `push`, `shuffled`, `set`/`trigger`,
+  `readJson`/`writeJson`, `timer`, `post`, `emit`; Python: `db.text`,
   `db.number`, `db.clean_json`, `db.like`, `db.iso`, `dbconn()`,
   `write_logs`; JS: `Radio.api/post/command/setHTML/esc/num/status`).
 
@@ -25,8 +25,8 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 - No header essays; one-line comments only where the line needs one.
 - Overhead budget: one 250 ms timer; the 50 ms `Fast` timer only while a deck
   fades or loads (`Engine.wake()`); one HTTP request per second; control
-  objects cached in `Deck.new`; panel writes only on change; files written via
-  `Store` (debounced). Never add per-tick allocation, polling of the server,
+  objects cached in `Deck.new`; panel writes only on change; files written
+  only from `Chores` (every 30 s) or when settings change. Never add per-tick allocation, polling of the server,
   or whole-file writes on every event.
 - Use the documented Q-SYS APIs (HttpClient.Upload, Timer, Component, dir,
   io on media/, rapidjson). Keep `Tick`, `Fast`, `Sync`, `Chores` timers
