@@ -88,6 +88,8 @@ versions follow [Semantic Versioning](https://semver.org/).
   (`RADIO_ALLOW_NO_TOKEN=1` for a lab).
 
 ### Fixed
+- Core: a refused token logs `sync failed (403 CFG.SERVER_TOKEN does not match
+  the server's RADIO_API_TOKEN)` instead of `(403.0 )`.
 - A role without `CONNECT` on the database now gets the `GRANT CONNECT …` line
   to run, not just "PostgreSQL unreachable".
 - migrate: a missing or unwritable `qsysradio` schema stops with the one SQL

@@ -739,7 +739,7 @@ sudo journalctl -u qsysradio --since "1 hour ago" --no-pager | tail -n 50
 | `Deck A: 'Audio_Player_01' has no control 'gain' (Script Access on?)` | Script Access is `None`, or the Code Name differs from `CFG` (step 10) |
 | `meter 'PlayerOutput01' has no control peak.1` (or `peak.2`) | The meter's Script Access is `None`, or it has fewer than 2 channels (step 10) |
 | `library: cannot list media/Audio/Test/Tuning/` | That folder is not on the Core: upload it, or change Music folder on the Settings page |
-| `! server: sync failed (403 ); N events queued`; journal: `/api/v1/core/sync: rejected request from <core-ip> (bad or missing X-Radio-Token)` | `CFG.SERVER_TOKEN` differs from `RADIO_API_TOKEN` (`grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`): paste it and run again |
+| `! server: sync failed (403 CFG.SERVER_TOKEN does not match the server's RADIO_API_TOKEN); N events queued` (older builds: `(403.0 )`); journal: `/api/v1/core/sync: rejected request from <core-ip> (bad or missing X-Radio-Token)` | `CFG.SERVER_TOKEN` differs from `RADIO_API_TOKEN` (`grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`): paste it and run again |
 | Journal: `/api/v1/core/sync: refused, RADIO_API_TOKEN is not set in .env` | Re-run `sudo ./install.sh` (it generates one), then put it in `CFG.SERVER_TOKEN` |
 | `! server: sync failed (…)` with no 403 and nothing in the journal | The Core cannot reach the server: check `SERVER_URL`, the Core's routing and the firewall (steps 6, 10). It keeps playing and queues up to 5000 events until it can |
 | Journal: `station=Main runs radio.lua X, server is Y` | Paste radio.lua from this checkout onto the Core |

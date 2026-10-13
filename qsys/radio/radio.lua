@@ -1014,7 +1014,8 @@ function Server.sync()
       Server.fails = Server.fails + 1
       Server.nextTry = now() + math.min(30, K.sync_s * 2 ^ math.min(Server.fails, 5))
       if Server.fails == 1 or Server.fails % 20 == 0 then
-        log("! server: sync failed (%s %s); %d events queued", tostring(code), tostring(httpErr or ""), #Server.outbox)
+        local why = (code == 401 or code == 403) and "CFG.SERVER_TOKEN does not match the server's RADIO_API_TOKEN" or tostring(httpErr or "")
+        log("! server: sync failed (%s %s); %d events queued", tostring(math.tointeger(code) or code), why, #Server.outbox)
       end
       return
     end

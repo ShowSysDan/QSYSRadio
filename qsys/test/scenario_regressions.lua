@@ -137,5 +137,15 @@ MockCore.run(300)
 check(fastTicks < 300 * 20 * 0.15, string.format("50 ms timer ran %d times in 300 s (always-on would be 6000)", fastTicks))
 check(count("track_start") >= 5, "still crossfading normally")
 
+print("-- a refused token says so (and the code prints as 403, not 403.0)")
+boot(songs(4, 60), BUMPERS, function() MockCore.httpHandler = function() return 403.0, "", nil end end)
+CFG.SERVER_URL = "http://radio-server:5410"
+MockCore.run(5)
+local said = false
+for _, line in ipairs(LOG) do if line:find("sync failed (403 CFG.SERVER_TOKEN", 1, true) then said = true end end
+check(said, "403 log names CFG.SERVER_TOKEN")
+CFG.SERVER_URL = ""
+MockCore.httpHandler = function() return 200, '{"ok":true}' end
+
 print("")
 print(fails == 0 and "ALL CHECKS PASSED" or (fails .. " CHECK(S) FAILED"))
