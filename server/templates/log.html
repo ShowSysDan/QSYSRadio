@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+{% block title %}Play log · QSYSRadio{% endblock %}
+{% block main %}
+<div class="section-header">
+  <div class="section-title">Play log</div>
+  <button type="button" id="btn-csv">Download CSV</button>
+</div>
+<section class="tile blue">
+  <form id="log-form" class="toolbar">
+    <label>Day <input type="date" id="log-day" required></label>
+    <label class="grow">Search <input type="search" id="log-q" placeholder="artist, title or file"></label>
+    <label>Type
+      <select id="log-kind"><option value="">All</option><option value="music">Music</option><option value="imaging">Imaging</option></select>
+    </label>
+    <button type="submit" class="primary">Show</button>
+  </form>
+  <form id="at-form" class="toolbar">
+    <label class="grow">What was on air at <input type="datetime-local" id="at-time" step="1" required></label>
+    <button type="submit">Look up</button>
+  </form>
+  <div id="log-summary" class="dim small"></div>
+  <div class="table-wrap">
+    <table class="plays">
+      <thead><tr><th>Started</th><th>Type</th><th>Artist – Title</th><th>Deck</th><th>Played</th><th>Ended</th></tr></thead>
+      <tbody id="log"></tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/log.js') }}?v={{ version }}"></script>{% endblock %}

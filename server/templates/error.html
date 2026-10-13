@@ -1,0 +1,5 @@
+{% extends 'base.html' %}
+{% block title %}{{ title }} · QSYSRadio{% endblock %}
+{% block main %}
+<section class="tile red"><div class="t-label">{{ title }}</div><p style="margin:8px 0 12px">{{ message }}</p><a class="t-link" href="{{ url_for('dashboard') }}">← Back to the dashboard</a></section>
+{% endblock %}

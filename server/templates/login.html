@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · QSYSRadio</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/radio.css') }}?v={{ version }}">
+</head>
+<body>
+  <div class="login-wrap">
+    <form class="tile login" method="post" action="{{ url_for('login') }}">
+      <div class="logo">QSYS<span>Radio</span></div>
+      <div class="sub">Station control</div>
+      {% if error %}<div class="error-msg">{{ error }}</div>{% endif %}
+      <input type="hidden" name="next" value="{{ next }}">
+      <label>Username <input name="username" value="{{ username }}" autocomplete="username" autofocus required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit" class="primary">Sign in</button>
+      <div class="hint">Same account as 321Theater and the other apps.</div>
+    </form>
+  </div>
+</body>
+</html>
