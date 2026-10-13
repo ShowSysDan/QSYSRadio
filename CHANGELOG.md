@@ -88,6 +88,8 @@ versions follow [Semantic Versioning](https://semver.org/).
   (`RADIO_ALLOW_NO_TOKEN=1` for a lab).
 
 ### Fixed
+- A role without `CONNECT` on the database now gets the `GRANT CONNECT …` line
+  to run, not just "PostgreSQL unreachable".
 - migrate: a missing or unwritable `qsysradio` schema stops with the one SQL
   line to run (`CREATE SCHEMA … AUTHORIZATION …` / `ALTER SCHEMA … OWNER TO …`)
   instead of a psycopg2 traceback.

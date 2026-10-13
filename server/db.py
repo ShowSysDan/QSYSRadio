@@ -83,12 +83,22 @@ def _connect_kwargs(search_path=True, connect_timeout=10):
     return kwargs
 
 
+def _unavailable(exc):
+    """DatabaseUnavailable for a failed connect, naming the fix when it is a missing grant."""
+    msg = f'PostgreSQL unreachable: {exc}'.strip()
+    if 'does not have CONNECT privilege' in str(exc):
+        s = settings()
+        msg += (f'\nAs the PostgreSQL superuser (on the primary): '
+                f'GRANT CONNECT ON DATABASE "{s["dbname"]}" TO "{s["user"]}";')
+    return DatabaseUnavailable(msg)
+
+
 def connect(search_path=True, connect_timeout=10):
     """A new, unpooled connection (migrations, CLI tools)."""
     try:
         return psycopg2.connect(**_connect_kwargs(search_path, connect_timeout))
     except psycopg2.OperationalError as exc:
-        raise DatabaseUnavailable(f'PostgreSQL unreachable: {exc}'.strip()) from exc
+        raise _unavailable(exc) from exc
 
 
 # ── Pool (one per worker process, created lazily after gunicorn forks) ───────
@@ -123,7 +133,7 @@ class _Pool:
                     return psycopg2.connect(**self.kwargs)
                 except psycopg2.OperationalError as exc:
                     self.put(None)
-                    raise DatabaseUnavailable(f'PostgreSQL unreachable: {exc}'.strip()) from exc
+                    raise _unavailable(exc) from exc
             if not conn.closed and (time.monotonic() - at < PING_AFTER_S or _alive(conn)):
                 return conn
             self.put(conn, close=True)    # dead (e.g. PostgreSQL restarted): try another
