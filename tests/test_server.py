@@ -578,6 +578,47 @@ def test_syslog_set_on_the_settings_page(app):
     assert admin.get('/api/v1/server-settings').json['settings'][0]['running'] == ''
 
 
+def test_header_clock_is_server_time_with_ntp_check(app):
+    import socket
+    import struct
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)          # a fake NTP server 5 s ahead
+    srv.bind(('127.0.0.1', 0))
+    srv.settimeout(10)
+
+    def answer():
+        try:
+            for _ in range(5):
+                req, addr = srv.recvfrom(48)
+                t = time.time() + 5 + 2208988800
+                ts = struct.pack('!II', int(t), int((t % 1) * 2 ** 32))
+                srv.sendto(b'\x1c' + 31 * b'\0' + ts + ts, addr)
+        except OSError:
+            pass
+    threading.Thread(target=answer, daemon=True).start()
+    from server import clock
+    port = srv.getsockname()[1]
+    real = clock.sntp_offset
+    clock.sntp_offset = lambda host, port_=port, timeout=2.0: real(host, port_, timeout)
+    admin = signed_in(app, 'admin')
+    try:
+        c = admin.get('/api/v1/now').json['clock']
+        assert abs(c['server_ms'] / 1000 - time.time()) < 5 and c['ntp']['server'] is None
+        assert admin.post('/api/v1/server-settings', json={'settings': {'ntp_server': 'bad host'}}, headers=WEB).status_code == 400
+        assert admin.post('/api/v1/server-settings', json={'settings': {'ntp_server': '127.0.0.1'}},
+                          headers=WEB).json['changed'] == ['ntp_server']
+        for _ in range(50):
+            ntp = admin.get('/api/v1/now').json['clock']['ntp']
+            if ntp['offset_s'] is not None:
+                break
+            time.sleep(0.1)
+        assert ntp['server'] == '127.0.0.1' and abs(ntp['offset_s'] - 5) < 0.5 and ntp['ok'] is False
+    finally:
+        admin.post('/api/v1/server-settings', json={'settings': {'ntp_server': None}}, headers=WEB)
+        clock.sntp_offset = real
+        srv.close()
+    assert admin.get('/api/v1/now').json['clock']['ntp']['server'] is None
+
+
 def test_settings_spec_matches_radio_lua():
     """Every station setting is defined once on each side, with the same defaults."""
     import re

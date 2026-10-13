@@ -17,7 +17,7 @@
       <select id="station-select" class="station-select" hidden title="Station"></select>
     </div>
     <div class="header-actions">
-      <span id="server-clock" class="server-clock" title="This browser's local time">--:--:--</span>
+      <span id="server-clock" class="server-clock" title="Server time">--:--:--</span>
       {% if user %}
       <span class="userbox">{{ user.display_name }}{% if not user.can_operate %} <span class="tag ro">read-only</span>{% endif %}
         <a href="{{ url_for('logout') }}" title="Sign out of QSYSRadio and the other apps">Sign out</a></span>

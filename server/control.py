@@ -10,7 +10,7 @@ from datetime import timedelta
 
 from psycopg2.extras import execute_values
 
-from . import ads, core_settings, events, logs
+from . import ads, clock, core_settings, events, logs
 from .db import clean_json, iso, like, number, text
 from .events import BadRequest
 
@@ -415,21 +415,44 @@ def save_settings(conn, form, user):
     return _save(conn, form, user, core_settings.SPEC, core_settings.PREFIX, 'SETTINGS')
 
 
-# ── Server settings (syslog) ─────────────────────────────────────────────────
+# ── Server settings (syslog, clock) ──────────────────────────────────────────
+# module: its spec(), PREFIX and configure(overrides) -> the settings in use
+SERVER_GROUPS = ((logs, 'SYSLOG settings'), (clock, 'CLOCK settings'))
 
-def syslog_overrides(conn):
-    spec = logs.spec()
+
+def _overrides(cur, module):
+    return core_settings.load(cur, module.PREFIX, {x[0]: x for x in module.spec()})
+
+
+def apply_server_settings(conn):
+    """Load the saved server settings and apply them in this worker. Returns {module: settings in use}."""
     with conn.cursor() as cur:
-        return core_settings.load(cur, logs.PREFIX, {x[0]: x for x in spec})
+        return {m: m.configure(_overrides(cur, m)) for m, _ in SERVER_GROUPS}
 
 
-def syslog_view(conn):
-    """The syslog settings; 'running' = what this worker is using."""
-    overrides = syslog_overrides(conn)
-    return {'settings': _setting_rows(logs.spec(), overrides, logs.configure(overrides))}
+def server_settings_view(conn):
+    """Syslog and clock settings; 'running' = what this worker is using."""
+    rows = []
+    with conn.cursor() as cur:
+        for m, _ in SERVER_GROUPS:
+            overrides = _overrides(cur, m)
+            rows += _setting_rows(m.spec(), overrides, m.configure(overrides))
+    return {'settings': rows}
 
 
-def save_syslog(conn, form, user):
-    changed, line = _save(conn, form, user, logs.spec(), logs.PREFIX, 'SYSLOG settings')
-    logs.configure(syslog_overrides(conn))
-    return changed, line
+def save_server_settings(conn, form, user):
+    if not isinstance(form, dict):
+        raise BadRequest('expected an object of settings')
+    names = {x[0] for m, _ in SERVER_GROUPS for x in m.spec()}
+    unknown = set(form) - names
+    if unknown:
+        raise BadRequest(f'unknown setting {sorted(unknown)[0]!r}')
+    changed, lines = [], []
+    for m, what in SERVER_GROUPS:
+        part = {k: v for k, v in form.items() if k in {x[0] for x in m.spec()}}
+        if part:
+            c, line = _save(conn, part, user, m.spec(), m.PREFIX, what)
+            changed += c
+            lines.append(line)
+    apply_server_settings(conn)
+    return sorted(changed), lines

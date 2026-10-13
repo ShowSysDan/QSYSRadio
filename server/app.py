@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, g, jsonify, redirect, render_template, request, session, url_for
 
-from . import ads, auth, config, control, db, logs, plays
+from . import ads, auth, clock, config, control, db, logs, plays
 from .events import BadRequest
 from .migrate import discover
 
@@ -84,17 +84,17 @@ def _session_unavailable():
         raise auth.SignInUnavailable(session.broken)
 
 
-_syslog_checked = {'at': -1e9}
+_server_settings_checked = {'at': -1e9}
 
 
 @app.before_request
-def _reload_syslog():
-    """Pick up syslog settings saved by any worker (every logs.RELOAD_S)."""
-    if request.path.startswith('/static/') or time.monotonic() - _syslog_checked['at'] < logs.RELOAD_S:
+def _reload_server_settings():
+    """Pick up syslog / clock settings saved by any worker (every logs.RELOAD_S)."""
+    if request.path.startswith('/static/') or time.monotonic() - _server_settings_checked['at'] < logs.RELOAD_S:
         return
-    _syslog_checked['at'] = time.monotonic()
+    _server_settings_checked['at'] = time.monotonic()
     try:
-        logs.configure(control.syslog_overrides(dbconn()))
+        control.apply_server_settings(dbconn())
     except db.DatabaseUnavailable:
         pass                         # keep what is running; the request reports the outage itself
 
@@ -258,7 +258,8 @@ def get_now():
     """Status poll for every page: the station's live state + recent commands,
     the station list, and (plays=N) on-air / recent plays."""
     conn, station = dbconn(), _station()
-    out = {'ok': True, 'stations': control.stations(conn), 'station': None, 'on_air': [], 'recent': []}
+    out = {'ok': True, 'stations': control.stations(conn), 'station': None, 'on_air': [], 'recent': [],
+           'clock': clock.status()}
     if station:
         out['station'] = control.status(conn, station)
         n = _int_arg('plays', 0, 0, 200)
@@ -320,21 +321,21 @@ def post_settings():
 @app.get('/api/v1/server-settings')
 @auth.admin_required
 def get_server_settings():
-    return jsonify(ok=True, **control.syslog_view(dbconn()))
+    return jsonify(ok=True, **control.server_settings_view(dbconn()))
 
 
 @app.post('/api/v1/server-settings')
 @auth.admin_required
 def post_server_settings():
-    changed, line = control.save_syslog(dbconn(), _json_body().get('settings'), auth.current_user())
-    write_logs([line])
+    changed, lines = control.save_server_settings(dbconn(), _json_body().get('settings'), auth.current_user())
+    write_logs(lines)
     return jsonify(ok=True, changed=changed)
 
 
 @app.post('/api/v1/server-settings/test')
 @auth.admin_required
 def post_syslog_test():
-    s = logs.configure(control.syslog_overrides(dbconn()))
+    s = control.apply_server_settings(dbconn())[logs]
     if not s['host']:
         raise BadRequest('no syslog server is set')
     log.warning('SYSLOG test message from user=%s (if you can read this, syslog works)', auth.current_user().get('username'))

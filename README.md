@@ -180,6 +180,7 @@ server/
   plays.py            play log queries
   db.py               pooled PostgreSQL access + small helpers
   logs.py             journald + remote syslog (background thread)
+  clock.py            header clock (server time) and the optional NTP check
   migrate.py          applies server/migrations/NNNN_*.sql on every start
   templates/, static/ web control panel (bundled fonts, no CDN)
 tests/                pytest suite (real PostgreSQL)
@@ -1021,6 +1022,19 @@ when the server is unreachable.
   that makes the song change (and with it the break) fall just after the
   slot opens: that song alone, or with the best follow-up. Up next shows it
   as **FOR AD**.
+
+## Clock
+
+The clock in the header is the **server's** time in its time zone
+(`TIMEZONE` in `.env`, else the system zone), 24-hour. Every status poll
+carries it and the browser only counts the seconds in between, so a PC with
+a wrong clock still shows the station's time. To check the server itself,
+set an **NTP server** under Settings → Server settings (or `NTP_SERVER` in
+`.env`): each server worker asks it every 10 min, the clock turns green when
+the server is within the allowed error (1 s) and red, with the measured
+offset in its tooltip, when it is not; the journal and syslog get one warning
+when it goes wrong. Fix the time itself on the server (`timedatectl`,
+chrony / systemd-timesyncd); QSYSRadio only checks it.
 
 ## Syslog
 

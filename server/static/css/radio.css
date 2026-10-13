@@ -57,8 +57,10 @@ a:hover { color: #4ade80; }
 .status-pill i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .status-pill.stopped { color: var(--danger); border-color: rgba(239,68,68,.45); background: rgba(239,68,68,.1); box-shadow: none; text-shadow: none; }
 .status-pill.wait { color: var(--text-dim); border-color: var(--border); background: var(--surface2); box-shadow: none; text-shadow: none; }
-.server-clock { font-family: var(--mono); font-size: 12px; white-space: nowrap; padding: 4px 10px; border-radius: var(--radius);
+.server-clock { font-family: var(--mono); font-size: 20px; font-weight: 700; letter-spacing: .5px; font-variant-numeric: tabular-nums; white-space: nowrap; padding: 4px 10px; border-radius: var(--radius);
   background: rgba(0,0,0,.45); border: 1px solid var(--border); color: #b7bccd; box-shadow: inset 0 1px 3px rgba(0,0,0,.6); }
+.server-clock.ok { color: #86efac; }
+.server-clock.bad { color: #fca5a5; border-color: rgba(239,68,68,.6); box-shadow: 0 0 12px rgba(239,68,68,.35); }
 .userbox { font-size: 13px; color: var(--text-dim); display: flex; gap: 8px; align-items: center; }
 .userbox a { color: var(--text-dim); }
 .userbox a:hover { color: var(--accent); }
