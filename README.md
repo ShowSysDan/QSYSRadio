@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **0.3.0** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.0.1** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **0.3.0** — standalone or server-linked; all features pass the MockCore suites; awaiting first run on the Core |
-| `qsys/test` — MockCore simulator | **0.3.0** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **0.3.0** — own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.0.1** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.0.1** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.0.1** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -278,7 +278,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `0.3.0`.
+Expect the version, e.g. `1.0.1`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -411,12 +411,12 @@ Expect:
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
 - In the journal: `migrate: schema "qsysradio" at version 0009 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 0.3.0 starting on port
+  (install.sh already applied them), `[qsysradio] 1.0.1 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":9,"schema_version":9,"version":"0.3.0"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":9,"schema_version":9,"version":"1.0.1"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -580,14 +580,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 0.3.0 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.0.1 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 0.3.0`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.0.1`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -618,7 +618,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (8 in 0.3.0).
+The last line prints the number of tables (8 in 1.0.1).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -660,7 +660,7 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 0.3.0, server is 0.3.1`.
+  `station=Main runs radio.lua 1.0.1, server is 1.0.2`.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -1128,10 +1128,10 @@ complete record.
 | 0.1 | Probe |
 | 0.2 | Standalone deck controller |
 | 0.3 | Server: play log, control panel, settings, sign-in, syslog, NTP check; advertisements, fair rotation and ad-break fitting on the server; pause ads / bumpers; station IDs; quiet start / end and fade-out handling for every kind, adjustable per file |
-| 0.4 | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
-| 0.5 | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
-| 0.6 | Loudness normalisation from the learned peak |
-| 1.0 | Stable: first season on a real Core, docs |
+| 1.0.1 | Stable: everything in 0.3 |
+| 1.1 | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
+| 1.2 | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
+| 1.3 | Loudness normalisation from the learned peak |
 
 ## Network requirement
 

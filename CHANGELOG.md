@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.0.1] - 2026-10-13
+
+First stable version: the same code as 0.3.0, declared solid. From here on
+every change ships as its own version (patch = fix, minor = feature).
+Redeploy: the Core (paste radio.lua, so it reports 1.0.1) and the server
+(`git pull && sudo systemctl restart qsysradio`).
+
 ## [0.3.0] - 2026-10-13
 
 ### Added
