@@ -247,6 +247,10 @@ def test_learned_figures_live_on_the_server(app):
     assert op.post('/api/v1/control', json={'station': 'L1', 'cmd': 'queue_add', 'args': {'key': 'M/bad.wma'}},
                    headers=WEB).status_code == 400
     assert op.get('/api/v1/library?station=L1&q=bad').json['items'][0]['unsupported'] is True
+    lib = op.get('/api/v1/library?station=L1&kind=music').json
+    a_row = next(i for i in lib['items'] if i['key'] == 'M/a.mp3')
+    assert a_row['audible_s'] == pytest.approx(200 - 0.6 - 3.0)                  # without the quiet start and end
+    assert lib['totals'] == {'n': 2, 'duration_s': 200.0, 'audible_s': pytest.approx(196.4), 'unknown': 1}
     items[1]['size'] = 21                                       # replaced with a new file: try it again
     assert 'M/bad.wma' not in library_post(app, 'L1', items).json['learned']
 
@@ -291,6 +295,72 @@ def test_hourly_ads_are_staggered(app):
     due = sync(app, station='A2', ads_rev='').json['ads']['due']
     states = {i['key']: [x['state'] for x in i['slots']] for i in op.get('/api/v1/library?station=A2&kind=ad').json['items']}
     assert len(due) <= 2 and all('due' in states[k] for k in due) and 'done' not in sum(states.values(), [])
+
+
+def test_next_song_least_recently_played_and_ad_fit(app):
+    """The server names the next song (the Core only plays it): an old one, or one that lands the break on the slot."""
+    lengths = {'a': 100, 'b': 150, 'c': 200, 'd': 255, 'e': 300, 'f': 120, 'g': 180, 'h': 210}
+    items = [{'key': f'M/{k}.mp3', 'dir': 'M/', 'file': f'{k}.mp3', 'kind': 'music', 'artist': k.upper()} for k in lengths]
+    library_post(app, 'F1', items + [{'key': 'M/on.mp3', 'dir': 'M/', 'file': 'on.mp3', 'kind': 'music', 'artist': 'X'}])
+    t0 = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    sync(app, station='F1', boot='old', events=[dict(ev(i + 1, 'track_start', t=t0, deck='B', file=f'{k}.mp3', dir='M/',
+                                                        artist=k.upper(), duration=float(d)), boot='old')
+                                               for i, (k, d) in enumerate(lengths.items())])
+    # played hours ago, 'a' most recently, 'd' never (its length known from the library scan)
+    for i, k in enumerate(lengths):
+        sql("UPDATE qsr_test.play_log SET started_at = NOW() - make_interval(hours => 2 + %s), ended_at = NOW() - INTERVAL '1 hour' "
+            "WHERE station = 'F1' AND file = %s", (i, f'{k}.mp3'))
+        sql("UPDATE qsr_test.library SET last_played = " + ("NULL" if k == 'd' else "NOW() - make_interval(hours => 2 + %s)") +
+            " WHERE station = 'F1' AND key = %s", ((f'M/{k}.mp3',) if k == 'd' else (i, f'M/{k}.mp3')))
+    sync(app, station='F1', state=STATE, events=[ev(1, 'track_start', t=t0, deck='A', file='on.mp3', dir='M/',
+                                                      artist='X', duration=200.0)])
+    conn = db.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT started_at FROM play_log WHERE station = 'F1' AND ended_at IS NULL")
+            next_start = cur.fetchone()[0] + timedelta(seconds=200 - 4)          # crossfade 4 s, no learned tail
+            assert ads.next_song(cur, 'F1') == ('M/d.mp3', 'rotation')            # never played: first
+            # 'd' (255 s, 251 s airtime) lands 1 s after the slot
+            assert ads.next_song(cur, 'F1', next_start + timedelta(seconds=250)) == ('M/d.mp3', 'ad')
+            cur.execute("UPDATE library SET last_played = NOW() WHERE station = 'F1' AND key = 'M/d.mp3'")
+            key, why = ads.next_song(cur, 'F1', next_start + timedelta(seconds=600))     # too far off: rotation
+            assert why == 'rotation' and key in ('M/h.mp3', 'M/g.mp3')                   # the oldest quarter
+            conn.rollback()
+        sync(app, station='F1', state=dict(STATE, queue=[{'key': 'M/a.mp3'}]))
+        with conn.cursor() as cur:
+            assert ads.next_song(cur, 'F1') == (None, None)                                 # operator queue wins
+    finally:
+        conn.close()
+
+
+def test_every_song_gets_played_end_to_end(app, tmp_path, monkeypatch):
+    """radio.lua (MockCore) against this server, with a rescan every few songs
+    (each one used to reset the Core's shuffle bag): every song airs."""
+    lupa = pytest.importorskip('lupa.lua53')
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    os.symlink(os.path.join(repo, 'qsys'), tmp_path / 'qsys')
+    monkeypatch.chdir(tmp_path)
+    client = app.test_client()
+    L = lupa.LuaRuntime(unpack_returned_tuples=True)
+    L.execute('dofile("qsys/test/mock_core.lua")')
+    L.execute("""local songs = {}
+                 for i = 1, 24 do songs[i] = { name = string.format("Artist%d - Song%02d.mp3", i % 8, i),
+                                              duration = 20 + (i * 7) % 15, level = -10 } end
+                 MockCore.setup{ seed = 11, dirs = { ["Test/Tuning/"] = songs, ["Test/Imaging/"] = {} } }""")
+
+    def handler(req):
+        r = client.post(req.Url.split('radio-server', 1)[1], data=req.Data,
+                        headers=dict(req.Headers.items()), content_type='application/json')
+        return r.status_code, r.get_data(as_text=True)
+    L.globals().MockCore.httpHandler = handler
+    L.execute('dofile("qsys/radio/radio.lua")')
+    L.execute("""CFG.SERVER_URL, CFG.SERVER_TOKEN, CFG.STATION_ID = "http://radio-server", "tok", "E2E"
+                 Server.queue(EVENTS[#EVENTS]); Server.libraryDirty = true
+                 for t = 60, 1200, 75 do MockCore.at(t, function() Library.scan() end) end""")
+    L.eval('MockCore.run')(1260)
+    played = {r[0] for r in sql("SELECT DISTINCT file FROM qsr_test.play_log WHERE station = 'E2E'", fetch=True)}
+    starts = sql("SELECT count(*) FROM qsr_test.play_log WHERE station = 'E2E'", fetch=True)[0][0]
+    assert len(played) == 24, f'{24 - len(played)} of 24 songs never played in {starts} plays'
 
 
 def test_ads_plan_rules_and_play_log(app):

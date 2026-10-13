@@ -286,9 +286,9 @@ def get_library():
     station = _station()
     if not station:
         return jsonify(ok=True, total=0, items=[])
-    total, items = control.library(dbconn(), station, q=_arg('q'), kind=_arg('kind'), sort=_arg('sort', 'artist'),
+    total, items, totals = control.library(dbconn(), station, q=_arg('q'), kind=_arg('kind'), sort=_arg('sort', 'artist'),
                                    limit=_int_arg('limit', 200, 1, 1000), offset=_int_arg('offset', 0, 0, 10 ** 7))
-    return jsonify(ok=True, station=station, total=total, items=items)
+    return jsonify(ok=True, station=station, total=total, items=items, totals=totals)
 
 
 @app.post('/api/v1/ads')

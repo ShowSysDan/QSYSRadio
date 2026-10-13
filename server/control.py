@@ -315,9 +315,13 @@ _SORTS = {
 
 
 def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0):
-    """Files (newest scan) with play counts; for ads also the schedule and this
-    hour's / today's plays (the server's clock and TIMEZONE)."""
+    """Files (newest scan) with play counts and their length without the
+    measured quiet start and end (audible_s); for ads also the schedule and
+    this hour's / today's plays (the server's clock and TIMEZONE). Returns
+    (total, a page of items, totals over every matching file)."""
     sql = """SELECT l.key, l.kind, l.directory, l.file, l.artist, l.title, l.duration_s, l.unsupported,
+                    l.lead_in_s, l.trail_s,
+                    GREATEST(0, l.duration_s - COALESCE(l.lead_in_s, 0) - COALESCE(l.trail_s, 0)) AS audible_s,
                     COALESCE(p.plays, 0) AS plays, p.last_played, COALESCE(p.plays_hour, 0) AS plays_hour,
                     COALESCE(p.plays_today, 0) AS plays_today, COALESCE(r.mode, 'mix') AS mode, r.per_hour
              FROM library l
@@ -337,8 +341,11 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
         sql += ' AND (l.file ILIKE %s OR l.artist ILIKE %s OR l.title ILIKE %s)'
         args += [like(q)] * 3
     with conn.cursor() as cur:
-        cur.execute(f'SELECT count(*) FROM ({sql}) x', args)
-        total = cur.fetchone()[0]
+        cur.execute(f"""SELECT count(*) AS n, COALESCE(sum(duration_s), 0) AS duration_s,
+                               COALESCE(sum(audible_s), 0) AS audible_s, count(*) FILTER (WHERE duration_s IS NULL) AS unknown
+                        FROM ({sql}) x""", args)
+        totals = dict(cur.fetchone())
+        total = totals['n']
         cur.execute(sql + f' ORDER BY {_SORTS.get(sort, _SORTS["artist"])}, l.key LIMIT %s OFFSET %s',
                     args + [limit, offset])
         items = [dict(r, last_played=iso(r['last_played'])) for r in cur.fetchall()]
@@ -349,7 +356,7 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
                 if r and 'slots' in r:      # this hour's times for an hourly ad: done / due / missed / next
                     i['slots'] = [{'at': iso(hour_start + timedelta(minutes=m)), 'state': st}
                                   for m, st in zip(r['slots'], r['states'])]
-    return total, items
+    return total, items, totals
 
 
 def _setting_rows(spec, overrides, running):

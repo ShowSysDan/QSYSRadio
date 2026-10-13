@@ -7,6 +7,19 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Every song gets played; breaks land on time.** The server names the
+  next song (`next` in the ad plan): a random one of the least recently
+  played quarter of the music (never-played first, artist separation kept),
+  or, when a per-hour ad slot is within two songs, the one whose length makes
+  the song change fall just after the slot opens (Up next: FOR AD). The Core
+  plays it after the operator queue and uses its own shuffle only without
+  one. `library.last_played` (`0006_library_last_played`). An end-to-end test
+  runs radio.lua against the server with a rescan every 75 s: all 24 songs
+  play (before: one never did in 64 plays).
+- **Library: length without silence and totals.** Music shows each song's
+  length without the quiet start and end measured on earlier plays, and the
+  list ends with the total length (and without silence) of everything that
+  matches, plus how many have no known length yet.
 - **Ad slots you can see, and no bunching.** Per-hour ads are staggered:
   ads with the same count fall due one after another (four at 4 an hour:
   every 3¾ min) instead of all at :07 / :22 / :37 / :52. Each slot has a
@@ -144,6 +157,9 @@ versions follow [Semantic Versioning](https://semver.org/).
   (`RADIO_ALLOW_NO_TOKEN=1` for a lab).
 
 ### Fixed
+- radio.lua: a rescan restarted the shuffle bag, so with regular rescans
+  some songs could go unplayed for a long time (the server now picks songs,
+  and the bag keeps its cycle across rescans).
 - migrate: a missing or unwritable `qsysradio` schema stops with the one SQL
   line to run (`CREATE SCHEMA … AUTHORIZATION …` / `ALTER SCHEMA … OWNER TO …`)
   instead of a psycopg2 traceback.

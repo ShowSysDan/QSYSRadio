@@ -84,6 +84,10 @@
              sub: (left ? '' : 'after this song · ') + 'every ' + plural(every, 'song'), pct: Math.min(100, since / every * 100) + '%' };
   }
 
+  const srcTag = (n) => n && n.queued ? '<span class="src queue">QUEUE</span>'
+    : (n && n.pick === 'ad' ? '<span class="src fill" title="Picked by length so the next ad break lands on time">FOR AD</span>'
+      : '<span class="src rotation" title="' + (n && n.pick ? 'One of the least recently played songs' : 'The Core\'s own shuffle') + '">ROTATION</span>');
+
   function renderKpis() {
     const s = last && last.station, st = core(), lv = liveDeck(st);
     const lamp = $('air-lamp');
@@ -101,7 +105,7 @@
     const n = st && st.next_up, stopping = st && st.stop_after;
     $('next-title').textContent = stopping ? 'Nothing (stopping)' : (n ? R.who(n).title : '–');
     $('next-sub').textContent = stopping ? 'Stop after current is armed' : (n ? (n.artist || '') + (num(n.duration) ? '  ·  ' + R.clock(n.duration) : '') : ' ');
-    R.setHTML($('next-src'), !st ? '' : (stopping ? '<span class="src stop">STOP</span>' : (n && n.queued ? '<span class="src queue">QUEUE</span>' : '<span class="src rotation">ROTATION</span>')));
+    R.setHTML($('next-src'), !st ? '' : (stopping ? '<span class="src stop">STOP</span>' : srcTag(n)));
     $('next-meter').style.width = st ? Math.min(100, st.queue.length * 10) + '%' : '0';
     if (st) {
       const lib = st.library, imaging = num(lib.imaging) || 0, adCount = num(lib.ad) || 0;
@@ -155,7 +159,7 @@
     const st = core(), n = st && st.next_up;
     R.setHTML($('next'), !st ? '<div class="a">Core offline</div>' :
       '<div class="lbl">' + (st.stop_after ? '<span class="src stop">STOP</span> after the current track' :
-        (n && n.queued ? '<span class="src queue">QUEUE</span>' : '<span class="src rotation">ROTATION</span>')) + '</div>' +
+        srcTag(n)) + '</div>' +
       (n && !st.stop_after ? '<div class="t">' + esc(R.who(n).title) + '</div>' + (n.artist ? '<div class="a">' + esc(n.artist) + '</div>' : '') : ''));
     const q = st ? st.queue : [], op = R.canOperate;
     $('qcount').textContent = q.length ? '(' + q.length + ')' : '';
