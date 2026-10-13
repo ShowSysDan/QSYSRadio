@@ -29,6 +29,14 @@
       : button('bumper', 'play', 'Bumper now', 'Play this at the next transition, now', true);
   }
 
+  // this hour's times for an hourly ad
+  const SLOT_TIP = { done: 'played', due: 'owed: plays at the next song change', missed: 'missed its window: skipped', next: 'scheduled' };
+  function slots(it) {
+    if (!Array.isArray(it.slots)) return '';
+    return '<span class="slots">' + it.slots.map((x) => '<span class="' + esc(x.state) + '" title="' + (SLOT_TIP[x.state] || '') + '">:' +
+      String(new Date(x.at).getMinutes()).padStart(2, '0') + '</span>').join('') + '</span>';
+  }
+
   function schedule(it) {
     const hourly = it.mode === 'hourly';
     if (!R.canOperate) return esc(hourly ? it.per_hour + ' per hour' : it.mode === 'off' ? 'Off' : 'Mix in');
@@ -44,7 +52,7 @@
     const last = '<td class="num" title="' + esc(it.last_played ? new Date(it.last_played).toLocaleString() : '') + '">' + esc(R.ago(it.last_played)) + '</td>';
     const len = '<td class="num">' + (R.num(it.duration_s) ? R.clock(it.duration_s) : '–') + '</td>';
     const cells = it.kind === 'ad'
-      ? len + '<td>' + schedule(it) + '</td><td class="num">' + (R.num(it.plays_hour) || 0) + (it.mode === 'hourly' ? ' / ' + esc(it.per_hour) : '') +
+      ? len + '<td>' + schedule(it) + slots(it) + '</td><td class="num">' + (R.num(it.plays_hour) || 0) + (it.mode === 'hourly' ? ' / ' + esc(it.per_hour) : '') +
         '</td><td class="num">' + (R.num(it.plays_today) || 0) + '</td>' + last
       : len + '<td class="num">' + (R.num(it.plays) || 0) + '</td>' + last;
     return '<tr data-key="' + esc(it.key) + '" data-label="' + esc(R.whoLine(it)) + '"><td>' + name + '</td>' + cells + '<td class="acts">' + actions(it) + '</td></tr>';

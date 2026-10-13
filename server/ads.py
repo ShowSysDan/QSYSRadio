@@ -2,13 +2,18 @@
 number of times per clock hour, or off. The server works out which ads are
 owed and sends the Core a plan on its sync; the Core only plays it.
 
-An hourly ad with N plays an hour is owed its k-th play at (k - 0.5) / N of
-the hour (N = 4: at :07, :22, :37, :52), and goes into the first break after
-that; the Core starts a break at the next song change when an ad is owed.
+An hourly ad with N plays an hour has N slots, at (k + phase) / N of the
+hour; the phases stagger the hourly ads evenly, so four ads at 4 an hour
+fall due every 3.75 min in turn (:02, :06, :09, :13, :17 ...), not all at
+once. A slot is owed from its time for its window (10 min, or half the gap
+to the ad's next slot if shorter); the Core starts a break at the next song
+change while one is owed. A slot that cannot play in its window (station
+stopped, a long song) is skipped, not made up later in the hour.
 """
 import hashlib
 import json
 import math
+from datetime import timedelta
 
 from .db import text
 from .events import BadRequest
@@ -17,32 +22,84 @@ MODES = ('mix', 'hourly', 'off')
 PER_HOUR_MAX = 30
 
 
-def owed(per_hour, frac):
-    """Plays an hourly ad should have had by this fraction of the hour."""
-    return math.floor(per_hour * frac + 0.5)
+WINDOW_MAX_MIN = 10
+
+
+def window_minutes(per_hour):
+    """How long after its time a slot may still play: at most 10 min, and
+    never more than half the gap to the ad's next slot."""
+    return min(WINDOW_MAX_MIN, 30 / per_hour)
+
+
+def slot_minutes(per_hour, phase):
+    return [(k + phase) / per_hour * 60 for k in range(per_hour)]
+
+
+def slot_states(slots, window, plays, now_m):
+    """Each slot this hour: done (played in its window), due (open and not
+    played yet), missed (window passed without a play: skipped, never made
+    up) or next (still to come). plays / now_m: minutes past the hour."""
+    out = []
+    for m in slots:
+        if any(m <= p <= m + window for p in plays):
+            out.append('done')
+        elif now_m < m:
+            out.append('next')
+        else:
+            out.append('due' if now_m <= m + window else 'missed')
+    return out
+
+
+def schedule(cur, station):
+    """This hour for the station's ads: ({key: row}, hour_start). Hourly rows
+    also get slots (minutes past the hour; hourly ads are staggered evenly in
+    key order so ads with the same count fall due one at a time) and states."""
+    cur.execute("""SELECT l.key, l.artist, l.title, l.file, COALESCE(r.mode, 'mix') AS mode, r.per_hour,
+                          COALESCE(p.plays, '{}') AS plays, h.hour_start,
+                          EXTRACT(EPOCH FROM NOW() - h.hour_start) / 60 AS now_m
+                   FROM (SELECT date_trunc('hour', NOW()) AS hour_start) h
+                   JOIN library l ON l.station = %s AND l.present AND l.kind = 'ad' AND NOT l.unsupported
+                   LEFT JOIN ad_rules r ON r.station = l.station AND r.key = l.key
+                   LEFT JOIN (SELECT COALESCE(directory, '') AS directory, file,
+                                     array_agg(EXTRACT(EPOCH FROM started_at - date_trunc('hour', NOW())) / 60) AS plays
+                              FROM play_log WHERE station = %s AND kind = 'ad' AND started_at >= date_trunc('hour', NOW())
+                              GROUP BY 1, 2) p ON p.directory = COALESCE(l.directory, '') AND p.file = l.file
+                   ORDER BY l.key""", (station, station))
+    rows = [dict(r) for r in cur.fetchall()]
+    if not rows:
+        cur.execute("SELECT date_trunc('hour', NOW())")
+        return {}, cur.fetchone()[0]
+    hourly = [r for r in rows if r['mode'] == 'hourly' and r['per_hour']]
+    for i, r in enumerate(hourly):
+        r['slots'] = slot_minutes(r['per_hour'], (i + 0.5) / len(hourly))
+        r['states'] = slot_states(r['slots'], window_minutes(r['per_hour']), [float(p) for p in r['plays']],
+                                  float(r['now_m']))
+    return {r['key']: r for r in rows}, rows[0]['hour_start']
 
 
 def plan(cur, station):
-    """({'due': [keys, most behind first], 'mix': [keys]}, rev) for the Core."""
-    cur.execute("""SELECT l.key, COALESCE(r.mode, 'mix') AS mode, r.per_hour, COALESCE(p.plays, 0) AS plays,
-                          EXTRACT(EPOCH FROM NOW() - date_trunc('hour', NOW())) / 3600 AS frac
-                   FROM library l
-                   LEFT JOIN ad_rules r ON r.station = l.station AND r.key = l.key
-                   LEFT JOIN (SELECT COALESCE(directory, '') AS directory, file, count(*) AS plays
-                              FROM play_log WHERE station = %s AND kind = 'ad' AND started_at >= date_trunc('hour', NOW())
-                              GROUP BY 1, 2) p ON p.directory = COALESCE(l.directory, '') AND p.file = l.file
-                   WHERE l.station = %s AND l.present AND l.kind = 'ad' AND NOT l.unsupported
-                   ORDER BY l.key""", (station, station))
-    due, mix = [], []
-    for r in cur.fetchall():
-        if r['mode'] == 'mix':
-            mix.append(r['key'])
-        elif r['mode'] == 'hourly' and r['per_hour']:
-            behind = owed(r['per_hour'], float(r['frac'])) - r['plays']
-            if behind > 0:
-                due.append((behind, r['per_hour'], r['key']))
-    out = {'due': [k for _, _, k in sorted(due, key=lambda d: (-d[0], -d[1], d[2]))], 'mix': mix}
+    """({'due': [keys, longest waiting first], 'mix': [keys]}, rev) for the Core."""
+    rows = schedule(cur, station)[0].values()
+    mix = [r['key'] for r in rows if r['mode'] == 'mix']
+    due = sorted((r['slots'][r['states'].index('due')], r['key']) for r in rows if 'due' in r.get('states', ()))
+    out = {'due': [k for _, k in due], 'mix': mix}
     return out, hashlib.sha1(json.dumps(out).encode()).hexdigest()[:12]
+
+
+def next_ad(cur, station):
+    """The dashboard's next scheduled ad: {'owed': n, 'key', 'title', 'at' (ISO) | None}."""
+    rows, hour_start = schedule(cur, station)
+    owed_now = sum(1 for r in rows.values() if 'due' in r.get('states', ()))
+    best = None
+    for r in rows.values():
+        for m, st in zip(r.get('slots', ()), r.get('states', ())):
+            if st in ('due', 'next') and (best is None or m < best[0]):
+                best = (m, r)
+    if not best:
+        return {'owed': owed_now, 'at': None}
+    m, r = best
+    return {'owed': owed_now, 'key': r['key'], 'title': ' - '.join(x for x in (r['artist'], r['title']) if x) or r['file'],
+            'at': (hour_start + timedelta(minutes=m)).isoformat()}
 
 
 def save_rule(conn, station, payload, user):

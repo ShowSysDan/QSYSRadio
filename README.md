@@ -993,7 +993,7 @@ with no row is mixed in.
 | Schedule | Plays |
 |---|---|
 | Mix in | in ad breaks (every `ad_every_n_tracks` songs), shuffled with the other mix-ins |
-| Per hour, N | N times each clock hour (server time), spread out: the k-th play is owed at (k − ½)/N of the hour, e.g. N = 4 at :07, :22, :37, :52, and goes in the first break after that; an owed ad starts a break at the next song change. Plays are counted from the play log |
+| Per hour, N | N slots each clock hour (server time), evenly spaced. Ads on a per-hour schedule are staggered so they fall due in turn (four ads at 4 an hour: one every 3¾ min, :02, :06, :09, :13 …), not together. A slot is owed from its time for its window (10 min, or half the gap to that ad's next slot if shorter) and starts a break at the next song change. A slot that cannot play in its window (station stopped, a long song) is **missed**: skipped, never made up later in the hour. The Library shows each ad's slots this hour: played, owed now, missed, to come |
 | Off | never |
 
 ## Syslog

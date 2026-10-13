@@ -6,6 +6,7 @@ commands, so command ids are committed in order and none can be skipped by
 the Core's "everything after my last ack" request.
 """
 import json
+from datetime import timedelta
 
 from psycopg2.extras import execute_values
 
@@ -229,11 +230,12 @@ def status(conn, station):
                  'note': c['note']} for c in cur.fetchall()]
         state = _clean_state(r['state']) or {}
         _fill_durations(cur, station, state)
+        next_ad = ads.next_ad(cur, station)
     age = float(r['age'])
     return {'station': r['station'], 'online': age < ONLINE_S, 'age_s': round(age, 1),
             'state_age_s': round(float(r['state_age']), 2) if r['state_age'] is not None else None,
             'version': r['radio_version'], 'boot': r['boot'], 'last_seen': iso(r['last_seen']),
-            'library_at': iso(r['library_at']), 'state': state, 'commands': cmds}
+            'library_at': iso(r['library_at']), 'state': state, 'commands': cmds, 'next_ad': next_ad}
 
 
 def _fill_durations(cur, station, state):
@@ -340,6 +342,13 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
         cur.execute(sql + f' ORDER BY {_SORTS.get(sort, _SORTS["artist"])}, l.key LIMIT %s OFFSET %s',
                     args + [limit, offset])
         items = [dict(r, last_played=iso(r['last_played'])) for r in cur.fetchall()]
+        if any(i['kind'] == 'ad' for i in items):
+            sched, hour_start = ads.schedule(cur, station)
+            for i in items:
+                r = sched.get(i['key'])
+                if r and 'slots' in r:      # this hour's times for an hourly ad: done / due / missed / next
+                    i['slots'] = [{'at': iso(hour_start + timedelta(minutes=m)), 'state': st}
+                                  for m, st in zip(r['slots'], r['states'])]
     return total, items
 
 

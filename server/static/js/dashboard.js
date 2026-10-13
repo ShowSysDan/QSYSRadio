@@ -109,12 +109,21 @@
       R.setHTML($('bump-big'), bumper.big);
       $('bump-sub').textContent = (st.next_bumper ? R.who(st.next_bumper).title + ' · ' : '') + bumper.sub + ' · ' + plural(imaging, 'bumper') + ' in the pool';
       $('bump-meter').style.width = bumper.pct;
-      const due = num(st.ads_due) || 0;
+      const na = s.next_ad || {}, due = Math.max(num(st.ads_due) || 0, num(na.owed) || 0);
       const ad = countdown(st.ad_every, st.tracks_since_ad, st.ad_requested || st.next_ad || due > 0, adCount);
-      R.setHTML($('ad-big'), ad.big);
-      $('ad-sub').textContent = !adCount ? 'No ads (set the Ads folder in Settings)' : (st.next_ad ? R.who(st.next_ad).title + ' · ' : '') +
-        (due ? plural(due, 'hourly ad') + ' owed · ' : '') + ad.sub + ' · ' + plural(adCount, 'ad');
-      $('ad-meter').style.width = ad.pct;
+      const mins = na.at ? Math.max(0, Math.round((new Date(na.at) - Date.now()) / 60000)) : null;
+      if (adCount && ad.big === 'OFF' && na.at) {            // only hourly ads: the next one by the clock
+        R.setHTML($('ad-big'), ':' + String(new Date(na.at).getMinutes()).padStart(2, '0') + ' <small>in ' + mins + ' min</small>');
+        $('ad-sub').textContent = na.title + ' · at the first song change after';
+        $('ad-meter').style.width = Math.max(0, 100 - mins / 60 * 100) + '%';
+      } else {
+        R.setHTML($('ad-big'), adCount ? ad.big : 'NONE');
+        $('ad-sub').textContent = !adCount ? 'No ads (set the Ads folder in Settings)' : [
+          st.next_ad ? R.who(st.next_ad).title : '', due ? plural(due, 'hourly ad') + ' owed' : '', ad.big === 'OFF' ? 'no ad schedule' : ad.sub,
+          !due && na.at ? 'hourly: ' + na.title + ' at :' + String(new Date(na.at).getMinutes()).padStart(2, '0') : '',
+        ].filter(Boolean).join(' · ');
+        $('ad-meter').style.width = ad.pct;
+      }
       R.setHTML($('lib-big'), (num(lib.music) || 0) + ' <small>songs</small>');
       $('lib-sub').textContent = plural(imaging, 'bumper') + ' · ' + plural(adCount, 'ad') + ' · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
       $('core-meter').style.width = '100%';

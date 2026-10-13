@@ -7,6 +7,14 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Ad slots you can see, and no bunching.** Per-hour ads are staggered:
+  ads with the same count fall due one after another (four at 4 an hour:
+  every 3¾ min) instead of all at :07 / :22 / :37 / :52. Each slot has a
+  window (10 min, or half the gap to the ad's next slot); a slot that cannot
+  play in it (station stopped, long song) is skipped, not made up at the end
+  of the hour. Library → Ads lists each ad's times this hour (played, owed,
+  missed, to come); the dashboard's "Next ad break" card shows the next
+  hourly ad and how long until it, instead of OFF.
 - **Syslog on the Settings page**: a "Server settings" section (admins) for
   the syslog server's IP / host name and port, protocol, format, facility,
   lowest level and app name, with **Send test message**. Saved in
