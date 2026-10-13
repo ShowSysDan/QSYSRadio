@@ -112,8 +112,8 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   crossfade point; inside the last tick it arms `Timer.CallAfter` so the fade
   starts on time. Fades step gain every 50 ms on a timer that runs only while
   a deck is fading or loading (~3% of the time).
-- **Transitions.** Normal end (crossfade early by the learned tail), skip,
-  silence in the last `end_guard_s`, a break on the free deck (ads, then a
+- **Transitions.** Normal end (crossfade early by the learned tail), a
+  fade-out (below), skip, silence in the last `end_guard_s`, a break on the free deck (ads, then a
   bumper) with the next song starting under its tail, stop after current,
   stop now.
 - **Breaks.** A bumper every `bumper_every_n_tracks` songs; an ad break every
@@ -126,13 +126,23 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   (see [Rotation](#rotation-every-song-gets-played)); without one (server
   unreachable) a local shuffle bag with artist separation, which a rescan
   does not restart.
-- **Quiet starts skipped.** A song starts past its measured lead-in minus
+- **Fade-outs.** The meter is read every 250 ms (the meter's own
+  `response.time` smooths over ~300 ms), plenty for endings that take
+  seconds. When a song, bumper or ad stays `fade_out_drop_db` (20 dB) under
+  its own peak for half a second within `fade_out_early_s` (2 s; 0 = off) of
+  its regular hand-over point, the next item starts right then. Measured live
+  on every play, nothing stored.
+- **Break items** hand over at their learned quiet end (or fade-out): the
+  next ad starts when the last one goes quiet, not at its end of file.
+- **Quiet starts skipped.** Songs, bumpers and ads start past its measured lead-in minus
   `lead_skip_keep_s` (0.3 s), skipping at most `lead_skip_max_s` (3 s; 0 =
   off): the Core presses play, then seeks (`locate`). The first play of a
   file is from 0:00 (nothing measured yet); lead-in is always reported from
   the file start, so skipping never shrinks it.
-- **Learning** (kept on the server, `library` table): duration, lead-in,
-  minimum trailing silence, peak at unity. A file the player cannot play
+- **Learning** (kept on the server, `library` table, every kind): duration,
+  lead-in, minimum trailing silence, peak at unity. Trailing silence counts
+  only when it was heard before any fade began (a crossfade hides the rest
+  of the file). A file the player cannot play
   ("Unsupported…") is remembered there until its size changes; any other
   load failure only skips the file until the next scan.
 - **Files on the Core** (`media/_radio/`): `settings.json` (the server's

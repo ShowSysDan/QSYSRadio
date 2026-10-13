@@ -42,6 +42,8 @@ def forecast(cur, station, state, age_s, n=10):
         return r.get('duration_s') or guess
 
     song_air = ads.airtime({n: float(s[n]) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})
+    spot_air = ads.airtime({n: float(s[n]) if n != 'crossfade_s' else 0.0
+                            for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})   # no crossfade, quiet ends skipped
 
     def air(key):                      # a song: start to the next item's start (quiet start skipped, crossfade early)
         r = lib.get(key) or {}
@@ -151,7 +153,8 @@ def forecast(cur, station, state, age_s, n=10):
                 add(key, kind, why, dur, None if key else {'ad': 'Mix-in ad', 'ident': 'Station ID'}.get(
                     kind if kind == 'ad' else why, 'Bumper'))
                 last = i == len(spots) - 1
-                t += timedelta(seconds=max(0, dur - (s['bumper_tail_s'] if last else 0)))
+                plays = spot_air(dict(lib[key], duration_s=dur)) if key in lib else dur
+                t += timedelta(seconds=max(0, plays - (s['bumper_tail_s'] if last else 0)))
                 if kind == 'ad':
                     since_ad = 0
                 else:

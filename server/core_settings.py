@@ -59,6 +59,11 @@ SPEC = [
      '(seconds). 0 = always play from the start.'),
     ('lead_skip_keep_s', 'Keep before the music', 'Silence detection', 'float', 0, 2, 0.1, 0.3,
      'Start this long before the measured first sound, so soft fade-ins are not clipped (seconds).'),
+    ('fade_out_early_s', 'Start early over a fade-out, at most', 'Silence detection', 'float', 0, 10, 0.5, 2,
+     'When the end of a song, bumper or ad fades away (a ringing note, a dying beat), start the next item up '
+     'to this much earlier than its regular crossfade point (seconds). 0 = off.'),
+    ('fade_out_drop_db', 'Fade-out level', 'Silence detection', 'float', 6, 40, 1, 20,
+     'The end counts as faded once it stays this far below the file\'s own peak for half a second (dB).'),
 
     ('artist_separation', 'Artist separation', 'Rotation', 'int', 0, 20, 1, 2,
      'Avoid repeating an artist within the last N songs.'),

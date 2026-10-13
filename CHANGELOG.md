@@ -148,6 +148,14 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- **Fade-outs start the next item early.** When the end of a song, bumper or
+  ad fades away (a ringing note, a dying beat) and stays 20 dB under the
+  file's own peak for half a second, the next item starts up to 2 s before
+  the regular crossfade point. Settings → Silence detection: "Start early
+  over a fade-out, at most" (0 = off) and "Fade-out level".
+- **Bumpers and ads get the silence handling songs have**: their quiet start
+  is skipped and the next break item starts at the quiet end, not at the end
+  of the file. The library shows "Without silence" for imaging too.
 - **"Ads" is spelled out as "Advertisements"** wherever the panel has room:
   the tab and page title, the Settings group and labels, the pause menu, the
   play log filter. Short tags ("AD", "Next ad break") stay short.
@@ -219,6 +227,12 @@ versions follow [Semantic Versioning](https://semver.org/).
   (`RADIO_ALLOW_NO_TOKEN=1` for a lab).
 
 ### Fixed
+- **Songs crossfaded about 4 s early from their second play.** The Core
+  counted the crossfade itself as the song's silent tail (it measured after
+  the fade had begun), so every learned tail was about the crossfade length.
+  Tails now count only when the silence was heard before any fade; migration
+  0008 forgets the wrong ones (real silent tails are learned again on the
+  next play).
 - radio.lua: a rescan restarted the shuffle bag, so with regular rescans
   some songs could go unplayed for a long time (the server now picks songs,
   and the bag keeps its cycle across rescans).

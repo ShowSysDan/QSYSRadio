@@ -15,7 +15,7 @@
 
   Usage (see run_mock.py / scenario_basic.lua):
     dofile("qsys/test/mock_core.lua")
-    MockCore.setup{ dirs = { ["Test/Tuning/"] = { {name="a.flac", duration=30, lead=1, trail=0.5, level=-10}, ... } },
+    MockCore.setup{ dirs = { ["Test/Tuning/"] = { {name="a.flac", duration=30, lead=1, trail=0.5, level=-10, fade=0}, ... } },
                     controls = { inputs = 3, outputs = 6 } }
     dofile("qsys/radio/radio.lua")
     MockCore.at(120, function() MockCore.press(1) end)   -- operator skip at t=120
@@ -263,8 +263,10 @@ function Player:advance(dt)
       setVal(self.ctl["progress"], math.floor(self.pos))
       setVal(self.ctl["remaining"], f.duration - math.floor(self.pos))
       local lead, trail = f.lead or 0, f.trail or 0
-      if self.pos >= lead and self.pos <= f.duration - trail then
+      local stop, fade = f.duration - trail, f.fade or 0
+      if self.pos >= lead and self.pos <= stop then
         program = (f.level or -10) + 2 * math.sin(self.pos * 3)
+        if fade > 0 and self.pos > stop - fade then program = program - 40 * (self.pos - stop + fade) / fade end
       end
     end
   end

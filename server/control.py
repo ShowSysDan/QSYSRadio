@@ -177,10 +177,10 @@ def core_library(conn, payload):
                            imaging_dir = EXCLUDED.imaging_dir, ads_dir = EXCLUDED.ads_dir""",
                     (station, text(payload.get('music_dir'), 500), text(payload.get('imaging_dir'), 500),
                      text(payload.get('ads_dir'), 500)))
-        # what the Core uses: unsupported files, and for music the quiet start / end (where to start, when to crossfade)
+        # what the Core uses: unsupported files, and the quiet start / end (where to start, when to hand over)
         cur.execute("""SELECT key, trail_s, lead_in_s, unsupported FROM library
                        WHERE station = %s AND present
-                         AND (unsupported OR (kind = 'music' AND (trail_s IS NOT NULL OR lead_in_s IS NOT NULL)))""",
+                         AND (unsupported OR trail_s IS NOT NULL OR lead_in_s IS NOT NULL)""",
                     (station,))
         learned = {r['key']: {'unsupported': True} if r['unsupported'] else
                    {k: round(r[c], 2) for k, c in (('trail', 'trail_s'), ('lead', 'lead_in_s')) if r[c] is not None}

@@ -105,8 +105,8 @@ def _apply(cur, station, ev):
                                    ORDER BY start_seq DESC LIMIT 1)""",
                     (ev['_at'], number(ev.get('played')), text(ev.get('reason'), 50), ev['seq'], station, ev['boot'],
                      text(ev.get('deck'), 10), END_KINDS[kind], ev['seq'], file, file))
-        if kind == 'track_end':
-            # this play's measurements; trailing silence keeps the shortest seen (LEAST skips NULL)
+        if kind in END_KINDS:
+            # this play's measurements (every kind); trailing silence keeps the shortest seen (LEAST skips NULL)
             cur.execute("""UPDATE library SET lead_in_s = COALESCE(%s, lead_in_s), trail_s = LEAST(trail_s, %s),
                                peak_dbfs = COALESCE(%s, peak_dbfs)
                            WHERE station = %s AND key = %s""",

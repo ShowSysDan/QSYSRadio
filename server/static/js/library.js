@@ -20,7 +20,7 @@
   };
   const HEAD = {
     music: ['Artist – Title', 'Length', 'Without silence', 'Plays', 'Last played', ''],
-    imaging: ['Artist – Title', 'Length', 'Plays', 'Last played', ''],     // the ID toggle sits with the actions
+    imaging: ['Artist – Title', 'Length', 'Without silence', 'Plays', 'Last played', ''],     // the ID toggle sits with the actions
     ad: ['Artist – Title', 'Length', 'Schedule', 'This hour', 'Today', 'Last played', ''],
   };
   const button = (action, icon, text, title, primary) =>
@@ -72,7 +72,7 @@
     const cells = it.kind === 'ad'
       ? len + '<td>' + schedule(it) + slots(it) + '</td><td class="num">' + (R.num(it.plays_hour) || 0) + (it.mode === 'hourly' ? ' / ' + esc(it.per_hour) : '') +
         '</td><td class="num">' + (R.num(it.plays_today) || 0) + '</td>' + last
-      : len + (it.kind === 'music' ? audible(it) : '') + '<td class="num">' + (R.num(it.plays) || 0) + '</td>' + last;
+      : len + audible(it) + '<td class="num">' + (R.num(it.plays) || 0) + '</td>' + last;
     return '<tr data-key="' + esc(it.key) + '" data-label="' + esc(R.whoLine(it)) + '"><td>' + name + '</td>' + cells + '<td class="acts">' + actions(it) + '</td></tr>';
   }
 
@@ -112,7 +112,7 @@
       $('lib-info').textContent = d.total + ' ' + NOUN[kind] + (d.station ? ' on ' + d.station : '');
       const t = d.totals || {};
       $('lib-totals').textContent = !t.n ? '' : (q || only ? 'Matching: ' : 'Total: ') + t.n + ' ' + NOUN[kind] + ' · ' + R.clock(t.duration_s) +
-        (kind === 'music' ? ' (' + R.clock(t.audible_s) + ' without leading / trailing silence)' : '') +
+        (kind !== 'ad' ? ' (' + R.clock(t.audible_s) + ' without leading / trailing silence)' : '') +
         (t.unknown ? ' · ' + t.unknown + ' not measured yet (length known once played)' : '') +
         (kind === 'music' && t.n ? ' · rotation: ' + (t.never_played ? t.never_played + ' never played' : 'every song played') +
           (t.oldest_played ? ', longest wait ' + R.ago(t.oldest_played).replace(' ago', '') : '') : '');
