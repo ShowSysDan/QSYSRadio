@@ -52,6 +52,9 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- Install guide assumes 321Theater is already installed: the separate
+  "new PostgreSQL / no sign-in" path is gone; `.env.example` now defaults to
+  `PG_DBNAME=321theater` and `PG_USER=qsysradio`.
 - From the fresh-install walkthroughs: HTTP requests are no longer written to
   the journal (the Core alone made one a second); `ACCESS_LOG=1` turns them
   back on. The systemd unit starts after a local `postgresql.service`.
