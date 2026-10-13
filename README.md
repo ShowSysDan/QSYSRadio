@@ -1007,7 +1007,7 @@ with no row is mixed in.
 | Schedule | Plays |
 |---|---|
 | Mix in | in ad breaks (every `ad_every_n_tracks` songs), shuffled with the other mix-ins |
-| Per hour, N | N slots each clock hour (server time), evenly spaced. Ads on a per-hour schedule are staggered so they fall due in turn (four ads at 4 an hour: one every 3¾ min, :02, :06, :09, :13 …), not together. A slot is owed from its time for its window (10 min, or half the gap to that ad's next slot if shorter) and starts a break at the next song change. A slot that cannot play in its window (station stopped, a long song) is **missed**: skipped, never made up later in the hour. The Library shows each ad's slots this hour: played, owed now, missed, to come |
+| Per hour, N | N slots each clock hour (server time), evenly spaced. All per-hour ads' slots are placed together over the hour: each ad's own slots evenly spaced, and no two ads within 4 min of each other (less only when the hour is that full), so they fall due in turn (four ads at 4 an hour: one every 3¾ min, :02, :06, :09, :13 …) and never share a break. A slot is owed from its time for its window (10 min, or half the gap to that ad's next slot if shorter) and starts a break at the next song change. A slot that cannot play in its window (station stopped, a long song) is **missed**: skipped, never made up later in the hour. The Library shows each ad's slots this hour: played, owed now, missed, to come |
 | Off | never |
 
 ### Rotation: every song gets played

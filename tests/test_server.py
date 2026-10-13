@@ -276,6 +276,20 @@ def test_slots_have_windows_and_missed_ones_are_skipped():
     assert ads.slot_states(slots, w, [], 59.9) == ['missed'] * 3 + ['due']      # :52.5 is open until :60
 
 
+def test_hourly_slots_never_share_a_break():
+    """Ads with different counts interleave: at least 4 min apart, each ad still spread over the hour."""
+    for counts in ([4, 4, 4, 4], [1, 4, 3, 1], [4, 3, 1], [30], [6, 6, 6, 6, 6]):
+        slots = ads.spread(counts)
+        every = sorted(m for x in slots for m in x)
+        assert [len(x) for x in slots] == counts and 0 < every[0] and every[-1] < 60
+        assert min((b - a for a, b in zip(every, every[1:])), default=60) >= min(4, 60 / len(every)) - 1e-9, counts
+        for n, x in zip(counts, slots):                  # an ad's own slots: no closer than half its ideal gap
+            assert all(b - a >= 30 / n for a, b in zip(x, x[1:])), (counts, x)
+    assert ads.best_fit([('a', 100), ('b', 200), ('c', 251)], 250) == 'c'
+    assert ads.best_fit([('a', 100), ('b', 155)], 250) == 'a'                      # 100 + 155: 5 s late
+    assert ads.best_fit([('a', 100)], 600) is None
+
+
 def test_hourly_ads_are_staggered(app):
     keys = [f'Ads/s{i}.wav' for i in range(4)]
     library_post(app, 'A2', [{'key': k, 'dir': 'Ads/', 'file': k[4:], 'kind': 'ad'} for k in keys], ads_dir='Ads/')
@@ -386,6 +400,24 @@ def test_coming_up_forecast(app):
     assert len(a) == 10 and [x['at'] for x in a] == sorted(x['at'] for x in a)
     assert len({x['key'] for x in a if x['kind'] == 'music'}) == sum(1 for x in a if x['kind'] == 'music')   # no repeats
     assert 'ahead' not in op.get('/api/v1/now?station=FC').json['station']             # only when asked for
+
+
+def test_forecast_fits_later_songs_to_ad_slots(app):
+    """Not only the next song: every song the forecast lists is picked as the server will, by length near a slot."""
+    songs = [{'key': f'M/{c}.mp3', 'dir': 'M/', 'file': f'{c}.mp3', 'kind': 'music', 'artist': c.upper()} for c in 'cdefghijkl']
+    library_post(app, 'FF', songs + [{'key': 'Ads/h.wav', 'dir': 'Ads/', 'file': 'h.wav', 'kind': 'ad'}], ads_dir='Ads/')
+    for i, c in enumerate('cdefghijkl'):
+        sql("UPDATE qsr_test.library SET duration_s = %s WHERE station = 'FF' AND key = %s", (64 if c == 'c' else 200 + 31 * i, f'M/{c}.mp3'))
+    op = signed_in(app, 'operator')
+    op.post('/api/v1/ads', json={'station': 'FF', 'key': 'Ads/h.wav', 'mode': 'hourly', 'per_hour': 4}, headers=WEB)
+    state = dict(STATE, queue=[{'key': 'M/c.mp3', 'file': 'c.mp3'}],
+                 decks={'A': {'state': 'playing', 'live': True, 'kind': 'music', 'key': 'M/x.mp3', 'file': 'x.mp3',
+                              'remaining': 60, 'duration': 300}},
+                 settings={'bumper_every_n_tracks': 0, 'ad_every_n_tracks': 0, 'crossfade_s': 4})
+    sync(app, station='FF', state=state)
+    whys = [(x['kind'], x['why']) for x in op.get('/api/v1/now?station=FF&ahead=10').json['station']['ahead']]
+    assert whys[0] in (('music', 'queue'), ('ad', 'hourly'))
+    assert ('music', 'for_ad') in whys, whys            # a later song picked by length for the next slot
 
 
 def test_ads_plan_rules_and_play_log(app):

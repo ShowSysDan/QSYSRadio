@@ -40,10 +40,18 @@ def forecast(cur, station, state, age_s, n=10):
         r = lib.get(key) or {}
         return r.get('duration_s') or guess
 
+    song_air = ads.airtime({n: float(s[n]) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})
+
     def air(key):                      # a song: start to the next item's start (quiet start skipped, crossfade early)
         r = lib.get(key) or {}
-        skip = min(s['lead_skip_max_s'], max(0, (r.get('lead_in_s') or 0) - s['lead_skip_keep_s']))
-        return length(key, SONG_GUESS_S) - s['crossfade_s'] - (r.get('trail_s') or 0) - skip
+        return song_air(dict(r, duration_s=length(key, SONG_GUESS_S), lead_in_s=r.get('lead_in_s'), trail_s=r.get('trail_s')))
+
+    def next_slot(at):                 # the next per-hour slot (this hour or the next) opening after `at`, as a datetime
+        minute = (at - hour_start).total_seconds() / 60
+        later = [m + hour for key, r in sched.items() for m, st in zip(r.get('slots', ()), r.get('states', ()))
+                 for hour in (0, 60) if (hour or st not in ('done', 'missed')) and m + hour > minute
+                 and (key, m + hour) not in taken_slots]
+        return hour_start + timedelta(minutes=min(later)) if later else None
 
     # when the next item starts: the live song's (or break's) time left, less the crossfade and its tail
     decks = [d for d in (state.get('decks') or {}).values() if isinstance(d, dict)]
@@ -125,11 +133,16 @@ def forecast(cur, station, state, age_s, n=10):
             key, why, server_pick = server_pick, pick_why, None
         else:
             recent = {a.lower() for a in history[-int(s['artist_separation']):] if a} if s['artist_separation'] else set()
-            pick = next((r for r in pool if r['key'] not in played and (r['artist'] or '').lower() not in recent), None) \
-                or next((r for r in pool if r['key'] not in played), None)
-            if not pick:
+            eligible = [r for r in pool if r['key'] not in played and (r['artist'] or '').lower() not in recent] \
+                or [r for r in pool if r['key'] not in played]
+            if not eligible:
                 break
-            key, why = pick['key'], 'rotation'
+            # as the server will pick when it gets there: by length for an ad slot within two songs, else the oldest
+            slot = next_slot(t)
+            half = eligible[:max(1, min(ads.POOL, len(eligible) // 2))]
+            fit = slot and ads.best_fit([(r['key'], air(r['key'])) for r in half if r['duration_s']],
+                                        (slot - t).total_seconds())
+            key, why = (fit, 'for_ad') if fit else (eligible[0]['key'], 'rotation')
         played.add(key)
         history.append((lib.get(key) or {}).get('artist'))
         add(key, 'music', why, length(key, SONG_GUESS_S))

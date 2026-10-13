@@ -7,6 +7,12 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Per-hour ads never share a break.** All hourly slots are placed
+  together: each ad's slots stay evenly spread and two ads' slots are at
+  least 4 min apart (they could coincide when counts differed, e.g. 3/hour
+  and 1/hour both at :52). Coming up now picks every song it lists the way
+  the server will (by length for an ad slot within two songs), not only the
+  first, so its ad times match what will air.
 - **Up next knows about breaks, and Coming up.** The server forecasts the
   next 10 items (songs, ads, bumpers) with estimated start times from the
   Core's state, the ad schedule and the library, by the Core's rules (queue,
