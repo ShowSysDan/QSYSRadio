@@ -43,6 +43,13 @@ versions follow [Semantic Versioning](https://semver.org/).
   (radio.lua in real time against a real server); `tests/test_server.py`
   (pytest against real PostgreSQL: Core API, commands, sign-in, permissions,
   settings, play log, failure handling).
+- README **Installation**: one numbered path from `git clone` to a linked
+  Core: packages, PostgreSQL role and least-privilege grants (joining
+  321Theater's database, or a new one), `.env`, `install.sh`, service and
+  health checks, firewall, access in 321Theater, shared sign-in notes, the
+  Q-SYS Designer side, backup, update, rollback, troubleshooting by error
+  message, uninstall. `.env.example` documents `SESSION_COOKIE_SECURE` /
+  `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
 - `radio.lua` made light: 250 ms station timer plus a 50 ms timer only while a
