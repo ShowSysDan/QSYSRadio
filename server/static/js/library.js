@@ -96,7 +96,9 @@
       const t = d.totals || {};
       $('lib-totals').textContent = !t.n ? '' : (q ? 'Matching: ' : 'Total: ') + t.n + ' ' + NOUN[kind] + ' · ' + R.clock(t.duration_s) +
         (kind === 'music' ? ' (' + R.clock(t.audible_s) + ' without leading / trailing silence)' : '') +
-        (t.unknown ? ' · ' + t.unknown + ' not measured yet (length known once played)' : '');
+        (t.unknown ? ' · ' + t.unknown + ' not measured yet (length known once played)' : '') +
+        (kind === 'music' && t.n ? ' · rotation: ' + (t.never_played ? t.never_played + ' never played' : 'every song played') +
+          (t.oldest_played ? ', longest wait ' + R.ago(t.oldest_played).replace(' ago', '') : '') : '');
     } catch (e) {
       if (my === seq) R.toast('Library: ' + e.message, 'bad');
     } finally {

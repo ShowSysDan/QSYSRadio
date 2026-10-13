@@ -29,7 +29,7 @@
           const run = s.running == null ? '–' : (String(s.running) === String(eff) ? esc(fmt(s.running))
             : '<span class="diff">' + esc(fmt(s.running)) + (d.in_sync && s.override == null ? ' (radio.lua default; set it here to change)' : ' (updating)') + '</span>');
           return '<div class="set-row"><div><div class="nm">' + esc(s.label) + '</div><div class="state">' +
-            (s.override != null ? '<span class="ovr">set here</span>' : 'default') + ' · ' + where + ': ' + run + '</div></div>' +
+            (s.override != null ? '<span class="ovr">set here</span>' : 'default') + ' · ' + (s.server_only ? 'server' : where) + ': ' + run + '</div></div>' +
             '<div>' + field(s, eff) +
             (s.override != null ? '<button type="button" class="linkbtn" data-reset="' + esc(s.name) + '">reset to default (' + esc(fmt(s.default)) + ')</button>' : '') + '</div>' +
             '<div class="help">' + esc(s.help) + (num ? ' Range ' + s.min + '–' + s.max + '.' : '') + '</div></div>';

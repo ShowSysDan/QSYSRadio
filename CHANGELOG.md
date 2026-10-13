@@ -7,6 +7,16 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Fair rotation first, ad timing second.** The server keeps the fair
+  pick (random among the least recently played quarter) unless it would
+  start a per-hour ad more than **Ad timing tolerance** late (new setting,
+  Rotation, default 3 min, server-only); only then is a song picked by
+  length, from the same quarter, and from the oldest half only when that
+  alone keeps the ad inside its window. Before, nearly every song near a
+  slot was picked by length from the oldest half, so a song whose length
+  never fitted could keep waiting. A pick that leaves the slot for a third
+  song to reach no longer counts as late. Library totals show rotation
+  health (never played, longest wait).
 - **Per-hour ads never share a break.** All hourly slots are placed
   together: each ad's slots stay evenly spread and two ads' slots are at
   least 4 min apart (they could coincide when counts differed, e.g. 3/hour

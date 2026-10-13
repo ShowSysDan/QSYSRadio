@@ -46,12 +46,15 @@ def forecast(cur, station, state, age_s, n=10):
         r = lib.get(key) or {}
         return song_air(dict(r, duration_s=length(key, SONG_GUESS_S), lead_in_s=r.get('lead_in_s'), trail_s=r.get('trail_s')))
 
-    def next_slot(at):                 # the next per-hour slot (this hour or the next) opening after `at`, as a datetime
+    def next_slot(at):                 # the next per-hour slot opening after `at`: (datetime, window s) or None
         minute = (at - hour_start).total_seconds() / 60
-        later = [m + hour for key, r in sched.items() for m, st in zip(r.get('slots', ()), r.get('states', ()))
+        later = [(m + hour, r['per_hour']) for key, r in sched.items() for m, st in zip(r.get('slots', ()), r.get('states', ()))
                  for hour in (0, 60) if (hour or st not in ('done', 'missed')) and m + hour > minute
                  and (key, m + hour) not in taken_slots]
-        return hour_start + timedelta(minutes=min(later)) if later else None
+        if not later:
+            return None
+        m, per_hour = min(later)
+        return hour_start + timedelta(minutes=m), ads.window_minutes(per_hour) * 60
 
     # when the next item starts: the live song's (or break's) time left, less the crossfade and its tail
     decks = [d for d in (state.get('decks') or {}).values() if isinstance(d, dict)]
@@ -139,10 +142,12 @@ def forecast(cur, station, state, age_s, n=10):
                 break
             # as the server will pick when it gets there: by length for an ad slot within two songs, else the oldest
             slot = next_slot(t)
-            half = eligible[:max(1, min(ads.POOL, len(eligible) // 2))]
-            fit = slot and ads.best_fit([(r['key'], air(r['key'])) for r in half if r['duration_s']],
-                                        (slot - t).total_seconds())
-            key, why = (fit, 'for_ad') if fit else (eligible[0]['key'], 'rotation')
+            share = lambda f: eligible[:max(1, min(ads.POOL, int(len(eligible) * f)))]
+            timed = lambda pool: [(r['key'], air(r['key'])) for r in pool if r['duration_s']]
+            key, why = ads.choose(eligible[0]['key'], timed(share(0.25)), timed(share(0.5)),
+                                  (slot[0] - t).total_seconds() if slot else None, float(s['ad_fit_tolerance_s']),
+                                  slot[1] if slot else 0)
+            why = 'for_ad' if why == 'ad' else why
         played.add(key)
         history.append((lib.get(key) or {}).get('artist'))
         add(key, 'music', why, length(key, SONG_GUESS_S))
