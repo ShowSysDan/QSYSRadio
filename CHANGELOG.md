@@ -7,6 +7,13 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Syslog on the Settings page**: a "Server settings" section (admins) for
+  the syslog server's IP / host name and port, protocol, format, facility,
+  lowest level and app name, with **Send test message**. Saved in
+  `app_settings` (`syslog.*`); `.env`'s `SYSLOG_*` are now only the
+  defaults. Each server worker re-reads them every 10 s and rebuilds the
+  sender only when they changed, so no restart is needed.
+  `GET/POST /api/v1/server-settings`, `POST /api/v1/server-settings/test`.
 - **App server** set up like the other apps on the shared PostgreSQL server:
   own `qsysradio` schema (`PG_APP_SCHEMA`) with the cross-app `shared` schema
   second on the search path; config in `.env`; `install.sh` (venv,

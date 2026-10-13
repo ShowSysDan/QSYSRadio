@@ -1,5 +1,6 @@
-"""Logging: stderr (journald) always, plus a remote syslog server when
-SYSLOG_HOST is set in .env.
+"""Logging: stderr (journald) always, plus a remote syslog server when a host
+is set: on the Settings page (admins; stored in app_settings as 'syslog.*'),
+else in .env, which gives the defaults:
 
     SYSLOG_HOST=10.0.0.5        # empty = no remote syslog
     SYSLOG_PORT=514
@@ -16,7 +17,9 @@ collector can split out the APP column: rfc3164
 
 Sending happens on a background thread fed by a bounded queue, so a slow or
 dead syslog server never blocks a request: when the queue is full messages
-are dropped, and a failed TCP connection is retried every 30 s.
+are dropped, and a failed TCP connection is retried every 30 s. Each worker
+re-reads the saved settings every RELOAD_S (app.py) and rebuilds the sender
+only when they changed.
 """
 import logging
 import logging.handlers
@@ -24,6 +27,7 @@ import os
 import queue
 import socket
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -37,6 +41,9 @@ _MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct',
 _SEVERITY = {logging.DEBUG: 7, logging.INFO: 6, logging.WARNING: 4, logging.ERROR: 3, logging.CRITICAL: 2}
 _FACILITIES = logging.handlers.SysLogHandler.facility_names
 _RETRY_S, _CONNECT_TIMEOUT_S, _QUEUE_MAX = 30, 2, 10000
+RELOAD_S = 10
+PREFIX = 'syslog.'
+_LEVELS = ('DEBUG', 'INFO', 'WARNING', 'ERROR')
 
 
 class _WireFormatter(logging.Formatter):
@@ -111,27 +118,86 @@ class _DroppingQueueHandler(logging.handlers.QueueHandler):
             pass
 
 
-def syslog_settings():
-    proto = (config.get('SYSLOG_PROTOCOL', 'udp') or 'udp').lower()
-    rfc = (config.get('SYSLOG_FORMAT', 'rfc3164') or 'rfc3164').lower()
-    facility = (config.get('SYSLOG_FACILITY', 'local0') or 'local0').lower()
+def _env_defaults():
+    def pick(key, default, allowed, case=str.lower):
+        v = case(config.get(key, default) or default)
+        return v if v in allowed else default
+    port = config.get_int('SYSLOG_PORT', 514)
     return {
-        'host': config.get('SYSLOG_HOST', ''),
-        'port': config.get_int('SYSLOG_PORT', 514),
-        'protocol': proto if proto in ('udp', 'tcp') else 'udp',
-        'format': rfc if rfc in ('rfc3164', 'rfc5424') else 'rfc3164',
-        'facility': facility if facility in _FACILITIES else 'local0',
-        'level': (config.get('SYSLOG_LEVEL', 'INFO') or 'INFO').upper(),
-        'app': config.get('SYSLOG_APP_NAME', 'QSYSRadio'),
+        'host': config.get('SYSLOG_HOST', '') or '',
+        'port': port if 1 <= port <= 65535 else 514,
+        'protocol': pick('SYSLOG_PROTOCOL', 'udp', ('udp', 'tcp')),
+        'format': pick('SYSLOG_FORMAT', 'rfc3164', ('rfc3164', 'rfc5424')),
+        'facility': pick('SYSLOG_FACILITY', 'local0', tuple(_FACILITIES)),
+        'level': pick('SYSLOG_LEVEL', 'INFO', _LEVELS, str.upper),
+        'app': config.get('SYSLOG_APP_NAME', 'QSYSRadio') or 'QSYSRadio',
     }
 
 
-_listener = None
+def spec():
+    """The syslog settings for the Settings page, in core_settings.SPEC's shape;
+    the defaults are .env's (or the built-in ones)."""
+    d = _env_defaults()
+    return [
+        ('host', 'Syslog server', 'Syslog', 'host', None, None, None, d['host'],
+         'IP address or host name of your syslog server. Empty = journald only.'),
+        ('port', 'Port', 'Syslog', 'int', 1, 65535, 1, d['port'], 'Usually 514.'),
+        ('protocol', 'Protocol', 'Syslog', 'choice', ('udp', 'tcp'), None, None, d['protocol'],
+         'UDP (fire and forget) or TCP (newline framed; retried every 30 s if the server is down).'),
+        ('format', 'Format', 'Syslog', 'choice', ('rfc3164', 'rfc5424'), None, None, d['format'],
+         'rfc3164: "<PRI>Mmm dd hh:mm:ss host app[pid]: msg"; rfc5424: "<PRI>1 ISO-time host app pid - - msg".'),
+        ('facility', 'Facility', 'Syslog', 'choice', tuple(sorted(_FACILITIES)), None, None, d['facility'],
+         'Syslog facility, e.g. local0.'),
+        ('level', 'Lowest level sent', 'Syslog', 'choice', _LEVELS, None, None, d['level'],
+         'INFO sends every play and command; WARNING only problems.'),
+        ('app', 'App name', 'Syslog', 'name', None, None, None, d['app'], 'The app / tag column on the collector.'),
+    ]
+
+
+def syslog_settings(overrides=None):
+    s = _env_defaults()
+    s.update({k: v for k, v in (overrides or {}).items() if k in s})
+    return s
+
+
+_lock = threading.Lock()
+_current = {'settings': None, 'handler': None, 'listener': None}
+
+
+def configure(overrides=None):
+    """(Re)build the syslog sender for these settings; nothing happens when
+    they are unchanged. Returns the settings in use."""
+    s = syslog_settings(overrides)
+    with _lock:
+        if s == _current['settings']:
+            return s
+        old_handler, old_listener = _current['handler'], _current['listener']
+        if old_handler:
+            log.removeHandler(old_handler)
+        if old_listener:
+            old_listener.stop()          # sends what is queued, then ends the thread
+        _current.update(settings=s, handler=None, listener=None)
+        if s['host']:
+            sender = _Sender(s['host'], s['port'], s['protocol'] == 'tcp')
+            sender.setFormatter(_WireFormatter(s['format'], s['app'], _FACILITIES[s['facility']]))
+            q = queue.Queue(_QUEUE_MAX)
+            handler = _DroppingQueueHandler(q)
+            handler.setLevel(getattr(logging, s['level'], logging.INFO))
+            listener = logging.handlers.QueueListener(q, sender)
+            listener.start()
+            log.addHandler(handler)
+            _current.update(handler=handler, listener=listener)
+    if s['host']:
+        log.info('syslog -> %s:%s/%s %s facility=%s level=%s', s['host'], s['port'],
+                 s['protocol'], s['format'], s['facility'], s['level'])
+    elif old_handler:
+        log.info('syslog off')
+    return s
 
 
 def setup():
-    """Configure the 'qsysradio' logger once per process."""
-    global _listener
+    """Configure the 'qsysradio' logger once per process (syslog from .env
+    until the saved settings are read)."""
     if log.handlers:
         return log
     log.setLevel(logging.DEBUG)
@@ -140,16 +206,5 @@ def setup():
     err.setLevel(logging.INFO)
     err.setFormatter(logging.Formatter('%(levelname)s %(message)s'))
     log.addHandler(err)
-    s = syslog_settings()
-    if s['host']:
-        sender = _Sender(s['host'], s['port'], s['protocol'] == 'tcp')
-        sender.setFormatter(_WireFormatter(s['format'], s['app'], _FACILITIES[s['facility']]))
-        q = queue.Queue(_QUEUE_MAX)
-        handler = _DroppingQueueHandler(q)
-        handler.setLevel(getattr(logging, s['level'], logging.INFO))
-        log.addHandler(handler)
-        _listener = logging.handlers.QueueListener(q, sender)
-        _listener.start()
-        log.info('syslog -> %s:%s/%s %s facility=%s level=%s', s['host'], s['port'],
-                 s['protocol'], s['format'], s['facility'], s['level'])
+    configure()
     return log

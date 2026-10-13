@@ -447,6 +447,37 @@ def test_settings_validation_and_push(app):
     assert 'music_dir' not in sync(app, station='S7', settings_rev=first['settings_rev']).json['settings']
 
 
+def test_syslog_set_on_the_settings_page(app):
+    import socket
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx.bind(('127.0.0.1', 0))
+    rx.settimeout(5)
+    port = rx.getsockname()[1]
+    admin, op = signed_in(app, 'admin'), signed_in(app, 'operator')
+    save = lambda c, **s: c.post('/api/v1/server-settings', json={'settings': s}, headers=WEB)
+    assert op.get('/api/v1/server-settings').status_code == 403
+    assert save(op, host='127.0.0.1').status_code == 403
+    for bad in ({'host': 'a b'}, {'host': 'x;rm'}, {'port': 0}, {'port': 70000}, {'protocol': 'http'},
+                {'level': 'LOUD'}, {'app': 'two words'}, {'facility': 'nope'}, {'nope': 1}):
+        assert save(admin, **bad).status_code == 400, bad
+    assert admin.post('/api/v1/server-settings/test', json={}, headers=WEB).status_code == 400     # no host yet
+    try:
+        assert save(admin, host='127.0.0.1', port=port, format='rfc5424', app='RadioTest').json['changed'] == \
+            ['app', 'format', 'host', 'port']
+        view = {x['name']: x for x in admin.get('/api/v1/server-settings').json['settings']}
+        assert view['host']['running'] == '127.0.0.1' and view['protocol']['choices'] == ['udp', 'tcp']
+        assert admin.post('/api/v1/server-settings/test', json={}, headers=WEB).json['sent_to'] == f'127.0.0.1:{port}/udp'
+        for _ in range(20):                      # the settings save itself is logged first
+            line = rx.recv(4096).decode()
+            if 'SYSLOG test message' in line:
+                break
+        assert line.startswith('<') and ' RadioTest ' in line and 'user=admin' in line
+    finally:
+        save(admin, host=None, port=None, format=None, app=None)
+        rx.close()
+    assert admin.get('/api/v1/server-settings').json['settings'][0]['running'] == ''
+
+
 def test_settings_spec_matches_radio_lua():
     """Every station setting is defined once on each side, with the same defaults."""
     import re

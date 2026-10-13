@@ -268,8 +268,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .set-row .state { font: 11px var(--mono); color: var(--text-dim); margin-top: 3px; }
 .set-row .state .ovr { color: var(--accent); }
 .set-row .state .diff { color: var(--warning); }
-.set-row input { width: 100%; }
-.set-row input.changed { border-color: var(--warning); }
+.set-row input, .set-row select { width: 100%; }
+.set-row .changed { border-color: var(--warning); }
 .linkbtn { font-size: 11px; color: var(--text-dim); background: none; border: 0; padding: 0; box-shadow: none; text-decoration: underline; cursor: pointer; }
 .linkbtn:hover { color: var(--accent); transform: none; background: none; box-shadow: none; }
 .banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: var(--radius); font-size: 13px; margin-bottom: 14px; border: 1px solid var(--border); }

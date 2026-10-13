@@ -9,7 +9,19 @@
   <div id="sync" class="banner"></div>
   <form id="set-form"><div id="groups"></div>
     <div class="form-actions"><button type="submit" class="primary">Save settings</button>
-      <button type="button" id="btn-revert">Discard changes</button></div>
+      <button type="button" data-revert>Discard changes</button></div>
+  </form>
+</section>
+
+<div class="section-header" style="margin-top:24px">
+  <div class="section-title">Server settings</div>
+  <span class="dim small">Used by this server within {{ reload_s }} s of saving; no restart. Defaults come from .env.</span>
+</div>
+<section class="tile blue">
+  <form id="srv-form"><div id="srv-groups"></div>
+    <div class="form-actions"><button type="submit" class="primary">Save server settings</button>
+      <button type="button" data-revert>Discard changes</button>
+      <button type="button" id="btn-syslog-test" title="Send one WARNING line to the saved syslog server">Send test message</button></div>
   </form>
 </section>
 {% endblock %}

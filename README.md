@@ -301,7 +301,7 @@ nano .env
 | `SECRET_KEY`, `RADIO_API_TOKEN` | leave empty: install.sh generates them |
 | `WEB_WORKERS`, `WEB_THREADS`, `PG_POOL_MAX_IDLE` | leave commented (4 × 8, 4). A server can open up to WEB_WORKERS × (WEB_THREADS + 2) = 40 PostgreSQL connections; check `SHOW max_connections;` (default 100) covers the sister apps too |
 | `SESSION_COOKIE_SECURE`, `SESSION_COOKIE_DOMAIN` | leave unset unless step 9 says otherwise |
-| `SYSLOG_*` | optional, see [Syslog](#syslog) |
+| `SYSLOG_*` | optional; easier on the Settings page, see [Syslog](#syslog) |
 | `RADIO_ALLOW_NO_TOKEN` | never on a real station |
 | `ACCESS_LOG` | leave commented. `1` logs every HTTP request to the journal (the Core alone makes one a second) |
 
@@ -434,7 +434,7 @@ still need the same rule. Check from a staff PC:
 `http://<server-ip>:5410/api/v1/health` shows the JSON from step 5.
 
 The server itself connects out to PostgreSQL (`<db-port>`) and, if
-`SYSLOG_HOST` is set, to syslog (514).
+a syslog server is set, to syslog (514).
 
 ### 7. Give people access (in 321Theater)
 
@@ -1000,12 +1000,20 @@ with no row is mixed in.
 
 ## Syslog
 
-Set `SYSLOG_HOST` in `.env` and restart to send the server's log to your
-syslog server as well as journald: every play and end, commands and who sent
-them, settings changes, sign-ins, unsupported files, dead-air guard, Core
-restarts and errors. Options (all in `.env.example`): `SYSLOG_PORT` (514),
-`SYSLOG_PROTOCOL` (`udp` / `tcp`), `SYSLOG_FORMAT` (`rfc3164` / `rfc5424`),
-`SYSLOG_FACILITY` (`local0`), `SYSLOG_LEVEL` (`INFO`), `SYSLOG_APP_NAME`.
+To send the server's log to your syslog server as well as journald (every
+play and end, commands and who sent them, settings changes, sign-ins,
+unsupported files, dead-air guard, Core restarts and errors), open
+**Settings → Server settings** (admins) and fill in the **Syslog server** (IP
+or host name) and **Port**, plus protocol (`udp` / `tcp`), format
+(`rfc3164` / `rfc5424`), facility (`local0`), lowest level (`INFO`) and app
+name if needed. Save, then **Send test message** to check it arrives. Every
+server worker picks the change up within 10 s; no restart. Clear the host to
+turn it off.
+
+The same options can be set in `.env` (`SYSLOG_HOST`, `SYSLOG_PORT`,
+`SYSLOG_PROTOCOL`, `SYSLOG_FORMAT`, `SYSLOG_FACILITY`, `SYSLOG_LEVEL`,
+`SYSLOG_APP_NAME`; see `.env.example`); they are the defaults, and a value
+saved on the Settings page wins.
 
 ```
 <134>Oct 12 19:40:21 radio-srv QSYSRadio[3066]: PLAY music "Bravo - Two" station=Main artist=Bravo deck=A dir=Music/ duration=28 file=Bravo - Two.mp3 title=Two at=2026-10-12T23:40:21Z
