@@ -293,6 +293,35 @@ def test_hourly_ads_are_staggered(app):
     assert len(due) <= 2 and all('due' in states[k] for k in due) and 'done' not in sum(states.values(), [])
 
 
+def test_fill_song_lands_the_break_on_the_slot(app):
+    """The server picks the song after the one on air by length (Core only plays it)."""
+    lengths = {'a': 100, 'b': 150, 'c': 200, 'd': 255, 'e': 300}
+    items = [{'key': f'M/{k}.mp3', 'dir': 'M/', 'file': f'{k}.mp3', 'kind': 'music', 'artist': k.upper()} for k in lengths]
+    library_post(app, 'F1', items + [{'key': 'M/on.mp3', 'dir': 'M/', 'file': 'on.mp3', 'kind': 'music', 'artist': 'X'}])
+    t0 = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    evs = [ev(i + 1, 'track_start', t=t0, deck='B', file=f'{k}.mp3', dir='M/', artist=k.upper(), duration=float(d))
+           for i, (k, d) in enumerate(lengths.items())]                       # lengths learned from earlier plays
+    sync(app, station='F1', boot='old', events=[dict(e, boot='old') for e in evs])
+    sql("UPDATE qsr_test.play_log SET started_at = NOW() - INTERVAL '2 hours', ended_at = NOW() - INTERVAL '2 hours' "
+        "WHERE station = 'F1'")                                              # long ago: free to play again
+    sync(app, station='F1', state=STATE, events=[ev(1, 'track_start', t=t0, deck='A', file='on.mp3', dir='M/',
+                                                      artist='X', duration=200.0)])
+    conn = db.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT started_at FROM play_log WHERE station = 'F1' AND ended_at IS NULL")
+            started = cur.fetchone()[0]
+            next_start = started + timedelta(seconds=200 - 4)                   # crossfade 4 s, no learned tail
+            assert ads.fill(cur, 'F1', next_start + timedelta(seconds=250)) == 'M/d.mp3'    # 255 - 4 s: 1 s late
+            assert ads.fill(cur, 'F1', next_start + timedelta(seconds=600)) is None         # too far: plain rotation
+            assert ads.fill(cur, 'F1', next_start - timedelta(seconds=5)) is None           # the break comes anyway
+        sync(app, station='F1', state=dict(STATE, queue=[{'key': 'M/a.mp3'}]))
+        with conn.cursor() as cur:
+            assert ads.fill(cur, 'F1', next_start + timedelta(seconds=250)) is None         # operator queue wins
+    finally:
+        conn.close()
+
+
 def test_ads_plan_rules_and_play_log(app):
     items = [{'key': f'Ads/{n}.wav', 'dir': 'Ads/', 'file': f'{n}.wav', 'kind': 'ad'} for n in ('m1', 'm2', 'h', 'off')]
     assert library_post(app, 'A1', items, ads_dir='Ads/').status_code == 200

@@ -386,7 +386,7 @@ Station = {
   nextBumper = nil,        -- operator-chosen bumper for the next bumper slot
   nextAd = nil,            -- operator-chosen ad for the next break
   breakList = {},          -- the rest of the break that is playing (ads, then a bumper)
-  adPlan = nil,            -- from the server: { due = {keys owed this hour}, mix = {keys} }; nil = mix every ad
+  adPlan = nil,            -- from the server: { due = {keys owed now}, mix = {keys}, fill = key }; nil = mix every ad
   armed = nil,             -- the crossfade timer's target (deck + play start)
 }
 
@@ -409,11 +409,17 @@ local function bagChoice()
   return #Station.bag                  -- nothing satisfies separation; take one anyway
 end
 
--- the next song (operator queue first, then the rotation), and whether it was queued; take = remove it
+-- the next song (operator queue, then the server's fill for the next ad slot, then the rotation),
+-- whether it was queued, whether it is the fill; take = remove it
 function Station.nextSong(take)
-  local q = Station.queue
+  local q, plan = Station.queue, Station.adPlan
   while q[1] and not Library.byKey[q[1].key] do table.remove(q, 1) end
   if q[1] then return take and table.remove(q, 1) or q[1], true end
+  local fill, last = plan and Library.byKey[plan.fill or ""], Station.history[#Station.history]
+  if fill and fill.kind == "music" and fill ~= last then   -- a stale plan may still name the song just played
+    if take then plan.fill, Server.adsRev = nil, ""; removeKey(Station.bag, fill.key) end
+    return fill, false, true
+  end
   if #Library.music == 0 then return nil end
   local i = bagChoice()
   return take and table.remove(Station.bag, i) or Station.bag[i], false
@@ -863,9 +869,9 @@ function Station.snapshot(t)
     info.duration = d.duration and round(d.duration, 1) or info.duration
     return info
   end
-  local nxt, queued = Station.nextSong()
+  local nxt, queued, fill = Station.nextSong()
   local nextUp = trackInfo(nxt)
-  if nextUp then nextUp.queued = queued end
+  if nextUp then nextUp.queued, nextUp.fill = queued, fill end
   local queue = {}
   for i, q in ipairs(Station.queue) do queue[i] = trackInfo(q) end
   return {
@@ -971,7 +977,7 @@ function Server.applyAdPlan(p, rev)
     for _, k in ipairs(type(list) == "table" and list or {}) do if type(k) == "string" then out[#out + 1] = k end end
     return out
   end
-  Station.adPlan = { due = keys(p.due), mix = keys(p.mix) }
+  Station.adPlan = { due = keys(p.due), mix = keys(p.mix), fill = type(p.fill) == "string" and p.fill or nil }
   Server.adsRev = tostring(rev or "")
   STATE_REV = STATE_REV + 1
 end

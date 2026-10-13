@@ -7,6 +7,11 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Breaks land on time.** When a per-hour ad slot is within two songs,
+  the server picks the next song by length (from 40 not played in the last
+  hour, keeping artist separation) so the song change falls just after the
+  slot opens, and sends it in the ad plan as `fill`; the Core plays it after
+  the operator queue (6 lines in radio.lua). Up next shows it as FOR AD.
 - **Ad slots you can see, and no bunching.** Per-hour ads are staggered:
   ads with the same count fall due one after another (four at 4 an hour:
   every 3¾ min) instead of all at :07 / :22 / :37 / :52. Each slot has a

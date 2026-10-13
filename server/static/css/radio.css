@@ -198,6 +198,7 @@ button.ghost-danger:hover:not(:disabled) { color: var(--danger); border-color: r
 .src.queue { background: var(--accent); color: #000; box-shadow: var(--glow-g); }
 .src.rotation { background: var(--surface2); color: var(--text-dim); border: 1px solid var(--border); }
 .src.stop { background: var(--warning); color: #000; }
+.src.fill { background: rgba(245,158,11,.15); color: var(--warning); border: 1px solid rgba(245,158,11,.5); }
 .subhead { display: flex; justify-content: space-between; align-items: center; margin: 16px 0 8px; font-size: 11px; font-weight: 600;
   text-transform: uppercase; letter-spacing: 1.2px; color: #a9aec2; }
 .qlist { list-style: none; display: flex; flex-direction: column; gap: 4px; }

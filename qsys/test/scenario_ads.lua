@@ -24,10 +24,17 @@ MockCore.setup{
 
 local HOURLY, DUE_FROM = "Ads/hourly.wav", 200
 local hourlyPlays, libraryPosts, revsSeen = 0, {}, {}
+-- the server's fill (song picked by length for the next slot) from t=380 to 440, still named after it
+-- started (a stale plan); a missing file is ignored
+local FILL, FILL_FROM, FILL_TO = "Test/Tuning/H - Song8.flac", 380, 440
 local function plan()
   local due = (MockCore.clock >= DUE_FROM and hourlyPlays == 0) and { HOURLY } or {}
-  return { due = due, mix = { "Ads/mix1.wav", "Ads/mix2.wav" } }, "p" .. #due
+  local fill = (MockCore.clock >= FILL_FROM and MockCore.clock < FILL_TO) and FILL
+               or (MockCore.clock >= 300 and MockCore.clock < 330 and "Test/Tuning/Gone.flac") or nil
+  return { due = due, mix = { "Ads/mix1.wav", "Ads/mix2.wav" }, fill = fill }, "p" .. #due .. tostring(fill)
 end
+local fillSeen
+MockCore.at(FILL_FROM + 5, function() fillSeen = Station.snapshot(Timer.Now()).next_up end)
 MockCore.httpHandler = function(req)
   local body = json.decode(req.Data)
   if req.Url:match("/core/library$") then
@@ -101,7 +108,7 @@ end
 check(hourly and hourly.at > DUE_FROM and hourly.at < DUE_FROM + 40 and hourlyPlays == 1 and songsBefore < 3,
   string.format("owed hourly ad played once, at the first song change after it fell due (t=%s, %d songs into the cycle)",
     hourly and hourly.at or "-", songsBefore))
-check(revsSeen.p1 and revsSeen.p0, "ads plan revision reported back to the server")
+check(revsSeen.p1nil and revsSeen.p0nil, "ads plan revision reported back to the server")
 
 local adThenBumper = s:find("AB", 1, true) ~= nil
 check(adThenBumper and not s:find("BA", 1, true), "ads and a bumper due together: ads first, bumper last")
@@ -112,6 +119,13 @@ local function firstAdAfter(t) for _, a in ipairs(ads) do if a.at >= t then retu
 local a1, a2 = firstAdAfter(330), firstAdAfter(445)
 check(cmds[1] and cmds[1].ok and a1 and a1.at < 334, "ad_now: a break starts within 3 s")
 check(cmds[2] and cmds[2].ok and a2 and a2.file == "mix2.wav" and a2.at < 449, "play_now with an ad: that ad within 3 s")
+
+local songsAfterFill = {}
+for _, x in ipairs(seq) do if x.k == "S" and x.e.at > FILL_FROM then songsAfterFill[#songsAfterFill + 1] = x.e.file end end
+local fillPlays = 0
+for _, x in ipairs(seq) do if x.k == "S" and x.e.at > FILL_FROM and x.e.file == "H - Song8.flac" then fillPlays = fillPlays + 1 end end
+check(songsAfterFill[1] == "H - Song8.flac" and fillPlays == 1 and fillSeen and fillSeen.fill and fillSeen.file == "H - Song8.flac",
+  "the server's fill song plays next (shown as such), once")
 
 local paired = #ads == #adEnds or #ads == #adEnds + 1
 check(paired, string.format("every ad start has an end (%d/%d)", #ads, #adEnds))

@@ -996,6 +996,16 @@ with no row is mixed in.
 | Per hour, N | N slots each clock hour (server time), evenly spaced. Ads on a per-hour schedule are staggered so they fall due in turn (four ads at 4 an hour: one every 3¾ min, :02, :06, :09, :13 …), not together. A slot is owed from its time for its window (10 min, or half the gap to that ad's next slot if shorter) and starts a break at the next song change. A slot that cannot play in its window (station stopped, a long song) is **missed**: skipped, never made up later in the hour. The Library shows each ad's slots this hour: played, owed now, missed, to come |
 | Off | never |
 
+**Landing breaks on time.** The server also knows every song's length and
+trailing silence (kept per file in `library`, even while a file is out of
+the folder) and when the song on air started. When the next per-hour slot is
+within two songs, it picks the song to play after the current one, from a
+sample of 40 not played in the last hour and keeping artist separation, so
+that the song change (and with it the break) falls just after the slot opens:
+that song alone, or that song plus the best follow-up. The dashboard tags it
+**FOR AD** under Up next. The operator queue always wins; the Core just plays
+the named song next (and its own shuffle when the server is unreachable).
+
 ## Syslog
 
 To send the server's log to your syslog server as well as journald (every
