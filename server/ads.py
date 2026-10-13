@@ -18,7 +18,7 @@ import hashlib
 import json
 from datetime import timedelta
 
-from . import core_settings
+from . import breaks, core_settings
 from .db import text
 from .events import BadRequest
 
@@ -195,17 +195,29 @@ def choose(rotation, quarter, half, gap, tolerance, window):
 
 
 def plan(cur, station):
-    """({'due': [keys, longest waiting first], 'mix': [keys], 'next': key of the
-    song to play next, 'next_why': 'rotation' | 'ad'}, rev) for the Core."""
+    """The Core's plan, and its rev: {'due': [ads owed, longest waiting first], 'mix': [ads],
+    'next': song to play next, 'next_why': 'rotation' | 'ad', 'ident': station ID owed,
+    'no_bumpers': True while bumpers are held}. Held ads: none owed or mixed in."""
     rows, hour_start = schedule(cur, station)
     rows = rows.values()
-    mix = [r['key'] for r in rows if r['mode'] == 'mix']
-    due = sorted((r['slots'][r['states'].index('due')], r['key']) for r in rows if 'due' in r.get('states', ()))
-    upcoming = [(m, r['per_hour']) for r in rows for m, st in zip(r.get('slots', ()), r.get('states', ())) if st == 'next']
-    upcoming += [(r['slots'][0] + 60, r['per_hour']) for r in rows if r.get('slots')]   # the next hour's first ones
-    out = {'due': [k for _, k in due], 'mix': mix}
-    m, per_hour = min(upcoming) if upcoming else (None, None)
-    song, why = next_song(cur, station, (hour_start + timedelta(minutes=m), window_minutes(per_hour) * 60) if m is not None else None)
+    hold = breaks.holds(cur, station)
+    ids = breaks.idents(cur, station)
+    out = {'due': [], 'mix': []}
+    upcoming = []                      # (datetime a slot opens, its window s): the next song is timed for the first
+    if 'ads' not in hold:
+        out['mix'] = [r['key'] for r in rows if r['mode'] == 'mix']
+        due = sorted((r['slots'][r['states'].index('due')], r['key']) for r in rows if 'due' in r.get('states', ()))
+        out['due'] = [k for _, k in due]
+        upcoming = [(hour_start + timedelta(minutes=m + hour), window_minutes(r['per_hour']) * 60)
+                    for r in rows for m, st in zip(r.get('slots', ()), r.get('states', ()))
+                    for hour in (0, 60) if (st == 'next' and not hour) or (hour and m == r['slots'][0])]
+    if ids['next_at']:
+        upcoming.append((ids['next_at'], ids['window_s']))
+    if ids['due']:
+        out['ident'] = ids['due']
+    if 'bumpers' in hold:
+        out['no_bumpers'] = True
+    song, why = next_song(cur, station, min(upcoming) if upcoming else None)
     if song:
         out['next'], out['next_why'] = song, why
     return out, hashlib.sha1(json.dumps(out).encode()).hexdigest()[:12]

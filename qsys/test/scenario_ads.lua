@@ -27,11 +27,17 @@ local hourlyPlays, libraryPosts, revsSeen = 0, {}, {}
 -- the server's fill (song picked by length for the next slot) from t=380 to 440, still named after it
 -- started (a stale plan); a missing file is ignored
 local FILL, FILL_FROM, FILL_TO = "Test/Tuning/H - Song8.flac", 380, 440
+-- a station ID owed from t=470 until it plays; bumpers held from t=230 to 320
+local IDENT_FROM, identPlays = 470, 0
+local HOLD_FROM, HOLD_TO = 230, 320
 local function plan()
   local due = (MockCore.clock >= DUE_FROM and hourlyPlays == 0) and { HOURLY } or {}
   local fill = (MockCore.clock >= FILL_FROM and MockCore.clock < FILL_TO) and FILL
                or (MockCore.clock >= 300 and MockCore.clock < 330 and "Test/Tuning/Gone.flac") or nil
-  return { due = due, mix = { "Ads/mix1.wav", "Ads/mix2.wav" }, next = fill, next_why = fill and "ad" }, "p" .. #due .. tostring(fill)
+  local ident = (MockCore.clock >= IDENT_FROM and identPlays == 0) and "Test/Imaging/id.wav" or nil
+  local hold = MockCore.clock >= HOLD_FROM and MockCore.clock < HOLD_TO
+  return { due = due, mix = { "Ads/mix1.wav", "Ads/mix2.wav" }, next = fill, next_why = fill and "ad", ident = ident,
+           no_bumpers = hold or nil }, "p" .. #due .. tostring(fill) .. tostring(ident) .. tostring(hold)
 end
 local fillSeen
 MockCore.at(FILL_FROM + 5, function() fillSeen = Station.snapshot(Timer.Now()).next_up end)
@@ -43,6 +49,7 @@ MockCore.httpHandler = function(req)
   end
   for _, e in ipairs(body.events or {}) do
     if e.kind == "ad_start" and e.dir .. e.file == HOURLY then hourlyPlays = hourlyPlays + 1 end
+    if e.kind == "bumper_start" and e.at >= IDENT_FROM then identPlays = identPlays + 1 end
   end
   revsSeen[body.ads_rev or "?"] = true
   local p, rev = plan()
@@ -58,7 +65,7 @@ end
 dofile("qsys/radio/radio.lua")
 CFG.SERVER_URL = "http://radio-server:5410"
 Server.applySettings({ ads_dir = "Ads", ad_every_n_tracks = 3, ads_per_break = 2, bumper_every_n_tracks = 6 }, "r1")
-MockCore.run(520)
+MockCore.run(620)
 
 local fails = 0
 local function check(cond, msg) print((cond and "PASS  " or "FAIL  ") .. msg); if not cond then fails = fails + 1 end end
@@ -108,7 +115,7 @@ end
 check(hourly and hourly.at > DUE_FROM and hourly.at < DUE_FROM + 40 and hourlyPlays == 1 and songsBefore < 3,
   string.format("owed hourly ad played once, at the first song change after it fell due (t=%s, %d songs into the cycle)",
     hourly and hourly.at or "-", songsBefore))
-check(revsSeen.p1nil and revsSeen.p0nil, "ads plan revision reported back to the server")
+check(next(revsSeen) ~= nil and revsSeen["?"] == nil, "ads plan revision reported back to the server")
 
 local adThenBumper = s:find("AB", 1, true) ~= nil
 check(adThenBumper and not s:find("BA", 1, true), "ads and a bumper due together: ads first, bumper last")
@@ -123,9 +130,21 @@ check(cmds[2] and cmds[2].ok and a2 and a2.file == "mix2.wav" and a2.at < 449, "
 local songsAfterFill = {}
 for _, x in ipairs(seq) do if x.k == "S" and x.e.at > FILL_FROM then songsAfterFill[#songsAfterFill + 1] = x.e.file end end
 local fillPlays = 0
-for _, x in ipairs(seq) do if x.k == "S" and x.e.at > FILL_FROM and x.e.file == "H - Song8.flac" then fillPlays = fillPlays + 1 end end
+for _, x in ipairs(seq) do   -- (the shuffle may bring it round again later)
+  if x.k == "S" and x.e.at > FILL_FROM and x.e.at < FILL_TO + 90 and x.e.file == "H - Song8.flac" then fillPlays = fillPlays + 1 end
+end
 check(songsAfterFill[1] == "H - Song8.flac" and fillPlays == 1 and fillSeen and fillSeen.pick == "ad" and fillSeen.file == "H - Song8.flac",
   "the server's fill song plays next (shown as such), once")
+
+local held, idStarts, firstAfterId = false, {}, nil
+for i, x in ipairs(seq) do
+  if x.k == "B" and x.e.at >= HOLD_FROM + 1 and x.e.at < HOLD_TO then held = true end
+  if x.k == "B" and x.e.at >= IDENT_FROM then idStarts[#idStarts + 1] = { i = i, e = x.e } end
+end
+local id = idStarts[1]
+check(not held, "bumpers held: no every-N-songs bumper while the hold is on")
+check(id and #idStarts == 1 and id.e.file == "id.wav" and seq[id.i - 1].k == "S",
+  string.format("station ID owed: played once, first in its break (%d bumper starts after t=%d)", #idStarts, IDENT_FROM))
 
 local paired = #ads == #adEnds or #ads == #adEnds + 1
 check(paired, string.format("every ad start has an end (%d/%d)", #ads, #adEnds))

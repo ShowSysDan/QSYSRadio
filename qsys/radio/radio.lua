@@ -391,7 +391,7 @@ Station = {
   nextBumper = nil,        -- operator-chosen bumper for the next bumper slot
   nextAd = nil,            -- operator-chosen ad for the next break
   breakList = {},          -- the rest of the break that is playing (ads, then a bumper)
-  adPlan = nil,            -- from the server: { due = {ads owed now}, mix = {ads}, next = song, why = "rotation"|"ad" }
+  adPlan = nil,            -- from the server: { due, mix (ads), next = song, why, ident = ID owed, no_bumpers }
   armed = nil,             -- the crossfade timer's target (deck + play start)
 }
 
@@ -479,11 +479,16 @@ local function adBreak()
   return list
 end
 
--- what plays between this song and the next: ads (if due), then a bumper (if due)
+-- what plays between this song and the next: the server's station ID (if owed), ads (if due),
+-- then a bumper (if due, no ID and bumpers not held)
 local function planBreak()
-  local spots = adBreak() or {}
-  if Station.bumperRequested or
-     (SETTINGS.bumper_every_n_tracks > 0 and Station.tracksSinceBumper >= SETTINGS.bumper_every_n_tracks) then
+  local plan = Station.adPlan or {}
+  local spots, ident = adBreak() or {}, Library.byKey[plan.ident or ""]
+  if ident and ident.kind == "imaging" then
+    table.insert(spots, 1, ident)
+    plan.ident, Server.adsRev = nil, ""
+  elseif Station.bumperRequested or (not plan.no_bumpers and
+     SETTINGS.bumper_every_n_tracks > 0 and Station.tracksSinceBumper >= SETTINGS.bumper_every_n_tracks) then
     spots[#spots + 1] = Station.pickBumper()
   end
   return #spots > 0 and spots or nil
@@ -989,7 +994,8 @@ function Server.applyAdPlan(p, rev)
     return out
   end
   Station.adPlan = { due = keys(p.due), mix = keys(p.mix), next = type(p.next) == "string" and p.next or nil,
-                     why = tostring(p.next_why or "") }
+                     why = tostring(p.next_why or ""), ident = type(p.ident) == "string" and p.ident or nil,
+                     no_bumpers = p.no_bumpers == true }
   Server.adsRev = tostring(rev or "")
   STATE_REV = STATE_REV + 1
 end

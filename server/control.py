@@ -10,7 +10,7 @@ from datetime import timedelta
 
 from psycopg2.extras import execute_values
 
-from . import ads, clock, core_settings, events, logs
+from . import ads, breaks, clock, core_settings, events, logs
 from .db import clean_json, iso, like, number, text
 from .events import BadRequest
 
@@ -235,11 +235,14 @@ def status(conn, station):
         state = _clean_state(r['state']) or {}
         _fill_durations(cur, station, state)
         next_ad = ads.next_ad(cur, station)
+        holds = breaks.holds_view(cur, station)
+        ids = breaks.idents(cur, station)
     age = float(r['age'])
     return {'station': r['station'], 'online': age < ONLINE_S, 'age_s': round(age, 1),
             'state_age_s': round(float(r['state_age']), 2) if r['state_age'] is not None else None,
             'version': r['radio_version'], 'boot': r['boot'], 'last_seen': iso(r['last_seen']),
-            'library_at': iso(r['library_at']), 'state': state, 'commands': cmds, 'next_ad': next_ad}
+            'library_at': iso(r['library_at']), 'state': state, 'commands': cmds, 'next_ad': next_ad,
+            'holds': holds, 'ident': {'due': ids['due'], 'next_at': iso(ids['next_at']), 'count': len(ids['keys'])}}
 
 
 def _fill_durations(cur, station, state):
@@ -310,20 +313,25 @@ def add_command(conn, station, cmd, args, user):
 
 
 _SORTS = {
-    'artist': 'lower(COALESCE(l.artist, l.title, l.file)), lower(COALESCE(l.title, l.file))',
-    'title': 'lower(COALESCE(l.title, l.file))',
+    'artist': 'lower(COALESCE(artist, title, file)), lower(COALESCE(title, file))',
+    'title': 'lower(COALESCE(title, file))',
     'plays': 'plays DESC',
     'last_played': 'last_played DESC NULLS LAST',
     'least_recent': 'last_played ASC NULLS FIRST',
 }
 
 
-def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0):
+# list filters: name -> SQL condition (the select below is aliased x)
+FILTERS = {'never': 'last_played IS NULL', 'unsupported': 'unsupported', 'ident': 'ident',
+           'hourly': "mode = 'hourly'", 'mix': "mode = 'mix'", 'off': "mode = 'off'"}
+
+
+def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0, only=None):
     """Files (newest scan) with play counts and their length without the
     measured quiet start and end (audible_s); for ads also the schedule and
     this hour's / today's plays (the server's clock and TIMEZONE). Returns
     (total, a page of items, totals over every matching file)."""
-    sql = """SELECT l.key, l.kind, l.directory, l.file, l.artist, l.title, l.duration_s, l.unsupported,
+    sql = """SELECT l.key, l.kind, l.directory, l.file, l.artist, l.title, l.duration_s, l.unsupported, l.ident,
                     l.lead_in_s, l.trail_s,
                     GREATEST(0, l.duration_s - COALESCE(l.lead_in_s, 0) - COALESCE(l.trail_s, 0)) AS audible_s,
                     COALESCE(p.plays, 0) AS plays, p.last_played, COALESCE(p.plays_hour, 0) AS plays_hour,
@@ -344,6 +352,10 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
     if q:
         sql += ' AND (l.file ILIKE %s OR l.artist ILIKE %s OR l.title ILIKE %s)'
         args += [like(q)] * 3
+    if only in FILTERS:
+        sql = f'SELECT * FROM ({sql}) x WHERE {FILTERS[only]}'
+    else:
+        sql = f'SELECT * FROM ({sql}) x'
     with conn.cursor() as cur:
         cur.execute(f"""SELECT count(*) AS n, COALESCE(sum(duration_s), 0) AS duration_s,
                                COALESCE(sum(audible_s), 0) AS audible_s, count(*) FILTER (WHERE duration_s IS NULL) AS unknown,
@@ -352,7 +364,7 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
         totals = dict(cur.fetchone())
         totals['oldest_played'] = iso(totals['oldest_played'])
         total = totals['n']
-        cur.execute(sql + f' ORDER BY {_SORTS.get(sort, _SORTS["artist"])}, l.key LIMIT %s OFFSET %s',
+        cur.execute(sql + f' ORDER BY {_SORTS.get(sort, _SORTS["artist"])}, key LIMIT %s OFFSET %s',
                     args + [limit, offset])
         items = [dict(r, last_played=iso(r['last_played'])) for r in cur.fetchall()]
         if any(i['kind'] == 'ad' for i in items):

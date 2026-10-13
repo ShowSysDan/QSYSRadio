@@ -12,7 +12,7 @@ import math
 import re
 
 # name, label, group, type, min, max, step, radio.lua default, help
-# (types: int, float, dir; logs.spec() adds host, name and choice, whose min holds the choices)
+# (types: int, float, dir, choice (min holds the choices); logs.spec() adds host and name)
 SPEC = [
     ('music_dir', 'Music folder', 'Library', 'dir', None, None, None, 'Test/Tuning/',
      "Relative to the players' root (Audio/). Changing it rescans the library."),
@@ -62,6 +62,12 @@ SPEC = [
 
     ('artist_separation', 'Artist separation', 'Rotation', 'int', 0, 20, 1, 2,
      'Avoid repeating an artist within the last N songs.'),
+    ('ident_schedule', 'Station ID schedule', 'Bumpers & ads', 'choice',
+     ('off', 'hourly', 'half-hourly', 'quarter-hourly'), None, None, 'off',
+     'Plays a station ID (an imaging file marked "ID" on the Imaging page; a random one if several) at the first '
+     'song change after :00 (hourly), :00 and :30, or every quarter hour, before any ads. Not stopped by a bumper pause.'),
+    ('ident_window_min', 'Station ID may be late by', 'Bumpers & ads', 'int', 1, 15, 1, 8,
+     'An ID that cannot play within this many minutes of its time (station stopped, a long song) is skipped.'),
     ('ad_fit_tolerance_s', 'Ad timing tolerance', 'Rotation', 'int', 0, 600, 15, 180,
      'The next song is the fair rotation pick unless it would start a per-hour ad more than this late; only then '
      'is a song picked for its length. Higher = fairer rotation, ads a little later. 0 = always pick by length.'),
@@ -70,7 +76,7 @@ SPEC = [
 ]
 BY_NAME = {s[0]: s for s in SPEC}
 REQUIRED = {'music_dir'}
-SERVER_ONLY = {'ad_fit_tolerance_s'}     # used by the server's song picks; not sent to the Core
+SERVER_ONLY = {'ad_fit_tolerance_s', 'ident_schedule', 'ident_window_min'}   # the server's own; not sent to the Core
 PREFIX = 'core.'
 
 

@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, g, jsonify, redirect, render_template, request, session, url_for
 
-from . import ads, auth, clock, config, control, db, forecast, logs, plays
+from . import ads, auth, breaks, clock, config, control, db, forecast, logs, plays
 from .events import BadRequest
 from .migrate import discover
 
@@ -294,8 +294,35 @@ def get_library():
     if not station:
         return jsonify(ok=True, total=0, items=[])
     total, items, totals = control.library(dbconn(), station, q=_arg('q'), kind=_arg('kind'), sort=_arg('sort', 'artist'),
-                                   limit=_int_arg('limit', 200, 1, 1000), offset=_int_arg('offset', 0, 0, 10 ** 7))
+                                   limit=_int_arg('limit', 200, 1, 1000), offset=_int_arg('offset', 0, 0, 10 ** 7),
+                                   only=_arg('only'))
     return jsonify(ok=True, station=station, total=total, items=items, totals=totals)
+
+
+@app.post('/api/v1/hold')
+@auth.operator_required
+def post_hold():
+    """{station, what: ads|bumpers, until: ISO time | null (until resumed) | 'off' (resume)}."""
+    body = _json_body()
+    station = _station(body.get('station'))
+    if not station:
+        raise BadRequest('no station has connected yet')
+    write_logs([breaks.set_hold(dbconn(), station, body.get('what'), body.get('until'), auth.current_user())])
+    return jsonify(ok=True)
+
+
+@app.post('/api/v1/library/ident')
+@auth.operator_required
+def post_ident():
+    """{station, key, ident: true|false}: mark an imaging file as a station ID."""
+    body = _json_body()
+    station = _station(body.get('station'))
+    if not station:
+        raise BadRequest('no station has connected yet')
+    breaks.set_ident(dbconn(), station, body.get('key'), body.get('ident') is True)
+    write_logs([(20, f'IDENT station={station} key="{body.get("key")}" ident={body.get("ident") is True} '
+                     f'by={auth.current_user().get("username")}')])
+    return jsonify(ok=True)
 
 
 @app.post('/api/v1/ads')

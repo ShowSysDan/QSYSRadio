@@ -439,6 +439,65 @@ def test_forecast_fits_later_songs_to_ad_slots(app):
     assert 'ad_fit_tolerance_s' not in (sync(app, station='FF', settings_rev='').json.get('settings') or {})
 
 
+def test_holds_and_station_ids(app):
+    items = [{'key': 'Ads/m.wav', 'dir': 'Ads/', 'file': 'm.wav', 'kind': 'ad'},
+             {'key': 'I/id1.wav', 'dir': 'I/', 'file': 'id1.wav', 'kind': 'imaging'},
+             {'key': 'I/id2.wav', 'dir': 'I/', 'file': 'id2.wav', 'kind': 'imaging'},
+             {'key': 'I/sweep.wav', 'dir': 'I/', 'file': 'sweep.wav', 'kind': 'imaging'},
+             {'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music'}]
+    library_post(app, 'H1', items, ads_dir='Ads/')
+    op, viewer, admin = signed_in(app, 'operator'), signed_in(app, 'viewer'), signed_in(app, 'admin')
+    hold = lambda c, **b: c.post('/api/v1/hold', json=dict(station='H1', **b), headers=WEB)
+    plan = lambda: sync(app, station='H1', ads_rev='').json['ads']
+    assert plan()['mix'] == ['Ads/m.wav'] and 'no_bumpers' not in plan()
+    assert hold(viewer, what='ads', until=None).status_code == 403
+    assert hold(op, what='music', until=None).status_code == 400
+    assert hold(op, what='ads', until='2001-01-01T00:00:00Z').status_code == 400          # in the past
+    later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    assert hold(op, what='ads', until=later).status_code == 200
+    assert hold(op, what='bumpers', until=None).status_code == 200                       # until resumed
+    p = plan()
+    assert p['mix'] == [] and p['due'] == [] and p['no_bumpers'] is True
+    holds = op.get('/api/v1/now?station=H1').json['station']['holds']
+    assert holds['ads']['until'] and holds['bumpers']['until'] is None and holds['ads']['by'] == 'operator'
+    assert hold(op, what='ads', until='off').status_code == 200 and hold(op, what='bumpers', until='off').status_code == 200
+    assert plan()['mix'] == ['Ads/m.wav'] and 'no_bumpers' not in plan()
+    sql("INSERT INTO qsr_test.station_holds (station, what, until) VALUES ('H1', 'ads', NOW() - INTERVAL '1 minute')")
+    assert plan()['mix'] == ['Ads/m.wav']                                                  # an expired hold is no hold
+
+    # station IDs: two marked, every quarter hour with a 15 min window (so one is always owed until played)
+    mark = lambda key, on=True: op.post('/api/v1/library/ident', json={'station': 'H1', 'key': key, 'ident': on}, headers=WEB)
+    assert mark('M/a.mp3').status_code == 400 and viewer.post('/api/v1/library/ident', json={'station': 'H1', 'key': 'I/id1.wav',
+                                                                                         'ident': True}, headers=WEB).status_code == 403
+    assert mark('I/id1.wav').status_code == 200 and mark('I/id2.wav').status_code == 200
+    assert 'ident' not in plan()                                                           # schedule off
+    settings = lambda **v: admin.post('/api/v1/settings', json={'settings': v}, headers=WEB)
+    assert settings(ident_schedule='often').status_code == 400
+    assert settings(ident_schedule='quarter-hourly', ident_window_min=15).status_code == 200
+    try:
+        owed = plan().get('ident')
+        assert owed in ('I/id1.wav', 'I/id2.wav')
+        assert 'ident_schedule' not in (sync(app, station='H1', settings_rev='').json.get('settings') or {})  # server-only
+        hold(op, what='ads', until=None)
+        sync(app, station='H1', state=dict(STATE, decks={'A': {'state': 'playing', 'live': True, 'kind': 'music', 'key': 'M/x.mp3',
+                                                              'file': 'x.mp3', 'remaining': 60, 'duration': 200}},
+                                           settings={'ad_every_n_tracks': 1, 'bumper_every_n_tracks': 1}))
+        ahead = op.get('/api/v1/now?station=H1&ahead=6').json['station']['ahead']
+        assert (ahead[0]['kind'], ahead[0]['why'], ahead[0]['key']) == ('imaging', 'ident', owed)   # the ID first
+        assert not any(x['kind'] == 'ad' for x in ahead)                                         # ads held
+        hold(op, what='ads', until='off')
+        sync(app, station='H1', events=[ev(1, 'bumper_start', deck='B', file=owed.split('/')[1], dir='I/', duration=5.0)])
+        assert 'ident' not in plan()                                                       # played: nothing owed
+        lib = op.get('/api/v1/library?station=H1&kind=imaging&only=ident').json['items']
+        assert sorted(i['key'] for i in lib) == ['I/id1.wav', 'I/id2.wav'] and all(i['ident'] for i in lib)
+        never = op.get('/api/v1/library?station=H1&kind=imaging&only=never').json['items']
+        assert owed not in [i['key'] for i in never] and len(never) == 2
+        nxt = op.get('/api/v1/now?station=H1').json['station']['ident']
+        assert nxt['count'] == 2 and nxt['next_at'] and nxt['due'] is None
+    finally:
+        settings(ident_schedule=None, ident_window_min=None)
+
+
 def test_ads_plan_rules_and_play_log(app):
     items = [{'key': f'Ads/{n}.wav', 'dir': 'Ads/', 'file': f'{n}.wav', 'kind': 'ad'} for n in ('m1', 'm2', 'h', 'off')]
     assert library_post(app, 'A1', items, ads_dir='Ads/').status_code == 200
