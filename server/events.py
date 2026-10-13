@@ -4,8 +4,9 @@
 so repeats count as duplicates and change nothing. Each event is stored in
 its own savepoint, so one malformed event is rejected on its own instead of
 failing the batch (which would make the Core resend it forever). Only newly
-stored events touch play_log and the log; log lines are returned to the
-caller to write after the transaction commits.
+stored events touch play_log, the library's per-file figures (lead-in,
+trailing silence, peak, unsupported) and the log; log lines are returned to
+the caller to write after the transaction commits.
 """
 import json
 import logging
@@ -15,8 +16,8 @@ import psycopg2
 
 from .db import clean_json, number, text
 
-START_KINDS = {'track_start': 'music', 'bumper_start': 'imaging'}
-END_KINDS = {'track_end': 'music', 'bumper_end': 'imaging'}
+START_KINDS = {'track_start': 'music', 'bumper_start': 'imaging', 'ad_start': 'ad'}
+END_KINDS = {'track_end': 'music', 'bumper_end': 'imaging', 'ad_end': 'ad'}
 WARN_KINDS = {'file_unsupported', 'file_failed', 'dead_air_guard', 'library_empty'}
 _META = ('kind', 't', 'at', 'boot', 'seq')
 SEQ_MAX = 2 ** 31 - 1
@@ -104,6 +105,16 @@ def _apply(cur, station, ev):
                                    ORDER BY start_seq DESC LIMIT 1)""",
                     (ev['_at'], number(ev.get('played')), text(ev.get('reason'), 50), ev['seq'], station, ev['boot'],
                      text(ev.get('deck'), 10), END_KINDS[kind], ev['seq'], file, file))
+        if kind == 'track_end':
+            # this play's measurements; trailing silence keeps the shortest seen (LEAST skips NULL)
+            cur.execute("""UPDATE library SET lead_in_s = COALESCE(%s, lead_in_s), trail_s = LEAST(trail_s, %s),
+                               peak_dbfs = COALESCE(%s, peak_dbfs)
+                           WHERE station = %s AND key = %s""",
+                        (number(ev.get('lead_in')), number(ev.get('trail')), number(ev.get('peak')), station,
+                         (text(ev.get('dir'), 500) or '') + (file or '')))
+    elif kind == 'file_unsupported':
+        cur.execute('UPDATE library SET unsupported = TRUE WHERE station = %s AND key = %s',
+                    (station, (text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')))
     return None
 
 

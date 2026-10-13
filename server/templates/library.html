@@ -10,6 +10,7 @@
     <div class="chip-group" id="kind-tabs">
       <button type="button" class="chip active" data-kind="music">Music</button>
       <button type="button" class="chip" data-kind="imaging">Imaging</button>
+      <button type="button" class="chip" data-kind="ad">Ads</button>
     </div>
     <label class="grow">Search <input type="search" id="lib-q" placeholder="artist, title or file"></label>
     <label>Sort
@@ -23,7 +24,7 @@
   </form>
   <div class="table-wrap">
     <table class="plays">
-      <thead><tr><th>Artist – Title</th><th>Length</th><th>Plays</th><th>Last played</th><th></th></tr></thead>
+      <thead id="lib-head"></thead>
       <tbody id="lib"></tbody>
     </table>
   </div>

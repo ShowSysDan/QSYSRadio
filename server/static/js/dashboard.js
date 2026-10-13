@@ -26,6 +26,7 @@
     }
     let cls = 'dk', label = d.state;
     if (d.kind === 'imaging') { cls += ' imaging'; label = 'imaging'; }
+    else if (d.kind === 'ad') { cls += ' ad'; label = 'ad'; }
     else if (d.live && d.state === 'playing') { cls += ' live'; label = 'on air'; }
     else if (d.state === 'playing') { cls += ' incoming'; label = 'incoming'; }
     if (d.state === 'fading') { cls += ' fading'; label = 'fading out'; }
@@ -70,6 +71,19 @@
       artist: p.artist, title: p.title, kind: p.kind, state: 'playing', live: true })).join('') : deckHtml('A', null) + deckHtml('B', null));
   }
 
+  const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+  // songs still to play (after the current one) before a bumper / ad break;
+  // since = songs started since the last one, the current song included
+  function countdown(every, since, now, pool) {
+    every = num(every) || 0; since = num(since) || 0;
+    if (!pool) return { big: 'NONE', sub: 'none in the folder', pct: '0' };
+    if (now) return { big: 'NEXT', sub: 'after this song', pct: '100%' };
+    if (every <= 0) return { big: 'OFF', sub: 'not scheduled', pct: '0' };
+    const left = Math.max(0, every - since);
+    return { big: left ? left + ' <small>more song' + (left === 1 ? '' : 's') + '</small>' : 'NEXT',
+             sub: (left ? '' : 'after this song · ') + 'every ' + plural(every, 'song'), pct: Math.min(100, since / every * 100) + '%' };
+  }
+
   function renderKpis() {
     const s = last && last.station, st = core(), lv = liveDeck(st);
     const lamp = $('air-lamp');
@@ -90,15 +104,22 @@
     R.setHTML($('next-src'), !st ? '' : (stopping ? '<span class="src stop">STOP</span>' : (n && n.queued ? '<span class="src queue">QUEUE</span>' : '<span class="src rotation">ROTATION</span>')));
     $('next-meter').style.width = st ? Math.min(100, st.queue.length * 10) + '%' : '0';
     if (st) {
-      const every = num(st.bumper_every) || 0, since = num(st.tracks_since_bumper) || 0, left = every > 0 ? Math.max(0, every - since) : null;
-      R.setHTML($('bump-big'), st.bumper_requested || st.next_bumper ? 'NEXT' : (left == null ? 'OFF' : left + ' <small>song' + (left === 1 ? '' : 's') + '</small>'));
-      $('bump-sub').textContent = st.next_bumper ? R.who(st.next_bumper).title : (left == null ? 'Bumpers are off' : 'every ' + every + ' songs · ' + (num(st.library.imaging) || 0) + ' in pool');
-      $('bump-meter').style.width = every > 0 ? Math.min(100, since / every * 100) + '%' : '0';
-      R.setHTML($('lib-big'), (num(st.library.music) || 0) + ' <small>songs</small>');
-      $('lib-sub').textContent = (num(st.library.imaging) || 0) + ' imaging · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
+      const lib = st.library, imaging = num(lib.imaging) || 0, adCount = num(lib.ad) || 0;
+      const bumper = countdown(st.bumper_every, st.tracks_since_bumper, st.bumper_requested || st.next_bumper, imaging);
+      R.setHTML($('bump-big'), bumper.big);
+      $('bump-sub').textContent = (st.next_bumper ? R.who(st.next_bumper).title + ' · ' : '') + bumper.sub + ' · ' + plural(imaging, 'bumper') + ' in the pool';
+      $('bump-meter').style.width = bumper.pct;
+      const due = num(st.ads_due) || 0;
+      const ad = countdown(st.ad_every, st.tracks_since_ad, st.ad_requested || st.next_ad || due > 0, adCount);
+      R.setHTML($('ad-big'), ad.big);
+      $('ad-sub').textContent = !adCount ? 'No ads (set the Ads folder in Settings)' : (st.next_ad ? R.who(st.next_ad).title + ' · ' : '') +
+        (due ? plural(due, 'hourly ad') + ' owed · ' : '') + ad.sub + ' · ' + plural(adCount, 'ad');
+      $('ad-meter').style.width = ad.pct;
+      R.setHTML($('lib-big'), (num(lib.music) || 0) + ' <small>songs</small>');
+      $('lib-sub').textContent = plural(imaging, 'bumper') + ' · ' + plural(adCount, 'ad') + ' · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
       $('core-meter').style.width = '100%';
     } else {
-      $('bump-big').textContent = '–'; $('bump-sub').textContent = ' '; $('lib-big').textContent = '–'; $('lib-sub').textContent = ' ';
+      ['bump', 'ad', 'lib'].forEach((k) => { $(k + '-big').textContent = '–'; $(k + '-sub').textContent = ' '; });
       $('core-meter').style.width = '0';
     }
     $('core-info').textContent = s ? '· ' + s.station + ' · radio.lua ' + (s.version || '?') + (s.online ? '' : ' · offline')
@@ -109,7 +130,9 @@
     const st = core(), op = R.canOperate, auto = !!(st && st.automation);
     const b = (c) => document.querySelector('#transport [data-cmd="' + c + '"]');
     b('skip').disabled = !(op && auto && st.state === 'playing');
-    b('bumper_now').disabled = !(op && auto && st.state !== 'bumper' && !st.bumper_requested && num(st.library.imaging) > 0);
+    const inBreak = st && (st.state === 'bumper' || st.state === 'ad');
+    b('bumper_now').disabled = !(op && auto && !inBreak && !st.bumper_requested && num(st.library.imaging) > 0);
+    b('ad_now').disabled = !(op && auto && !inBreak && !st.ad_requested && num(st.library.ad) > 0);
     $('btn-stop-after').disabled = !(op && auto);
     $('btn-stop-after').classList.toggle('on', !!(st && st.stop_after));
     $('btn-stop-after').querySelector('span').textContent = st && st.stop_after ? 'Cancel stop after' : 'Stop after current';

@@ -6,8 +6,8 @@ control panel without a Core.  Needs: pip install lupa
 
     python3 qsys/test/live_core.py --server http://127.0.0.1:5410 [--token T] [--station Main]
 
-Ctrl-C to stop. The simulated library is a small set of fictional songs and
-bumpers with realistic lengths; --speed 4 runs the clock four times faster.
+Ctrl-C to stop. The simulated library is a small set of fictional songs,
+bumpers and ads with realistic lengths; --speed 4 runs the clock four times faster.
 """
 import argparse
 import os
@@ -55,6 +55,11 @@ return {
     { name = "Promo - Summer Series.wav", duration = 15, lead = 0.2, trail = 0.4, level = -7 },
     { name = "Sweeper - Fast.wav", duration = 4, lead = 0.0, trail = 0.2, level = -5 },
   },
+  ["Ads/"] = {
+    { name = "Harbor Bakery - Fresh Bread.wav", duration = 30, lead = 0.1, trail = 0.3, level = -7 },
+    { name = "City Library - Summer Reading.wav", duration = 15, lead = 0.1, trail = 0.3, level = -7 },
+    { name = "Riverside Cafe - Open Late.wav", duration = 30, lead = 0.1, trail = 0.3, level = -7 },
+  },
 }
 '''
 
@@ -98,8 +103,8 @@ def main():
     L.execute('dofile("qsys/radio/radio.lua")')
     cfg = L.globals().CFG
     cfg.SERVER_URL, cfg.SERVER_TOKEN, cfg.STATION_ID = args.server, args.token, args.station
-    L.execute('SETTINGS.music_dir = "Music/"; SETTINGS.imaging_dir = "Imaging/"; '
-              'DEFAULTS.music_dir = "Music/"; DEFAULTS.imaging_dir = "Imaging/"; '
+    L.execute('SETTINGS.music_dir = "Music/"; SETTINGS.imaging_dir = "Imaging/"; SETTINGS.ads_dir = "Ads/"; '
+              'DEFAULTS.music_dir = "Music/"; DEFAULTS.imaging_dir = "Imaging/"; DEFAULTS.ads_dir = "Ads/"; '
               'Library.scan(); for _, e in ipairs(EVENTS) do Server.queue(e) end')   # events from before SERVER_URL was set (boot included)
     run = L.eval('MockCore.run')
     step = 0.05
