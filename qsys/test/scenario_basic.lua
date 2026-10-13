@@ -20,14 +20,13 @@ MockCore.setup{
       { name = "bumper_02.wav", duration = 5, lead = 0.1, trail = 0.2, level = -6 },
     },
   },
-  controls = { inputs = 3, outputs = 6 },
 }
 
 dofile("qsys/radio/radio.lua")
 SETTINGS.bumper_every_n_tracks = 3
 SETTINGS.heartbeat_s = 60
 
-MockCore.at(65, function() print("        >>> operator presses SKIP"); MockCore.press(1) end)
+MockCore.at(65, function() print("        >>> operator presses SKIP"); Control.run({ cmd = "skip", by = "test" }) end)
 MockCore.run(260)
 
 -------------------------------------------------------------------------------

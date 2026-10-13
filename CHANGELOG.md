@@ -72,6 +72,16 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- radio.lua is ~1100 lines (was ~1220): the optional Q-SYS panel controls
+  are gone (inputs `Skip`, `BumperNow`, `Automation`; outputs `Status`,
+  `NowPlaying`, `NextUp`, `DeckA`, `DeckB`, `LastEvent`): the station is
+  operated from the web panel only. Debug Output lines are short (event kind
+  and file); the server keeps every field. Remove the Text Controller's
+  extra controls from the design if you added them.
+- radio.lua trimmed without changing behaviour: one `readJson`/`writeJson`
+  pair, no `Store` class (the 30 s Chores timer already paced the outbox
+  file), no unused `LOG` ring, one `Station.nextSong(take)` for peek and
+  pick, one `timer()` helper for all four timers.
 - **The Core keeps almost nothing on its media drive.** `learned.json` is
   gone: the server's `library` table keeps duration, lead-in, shortest
   trailing silence and peak per file (from each play's `track_end`) and

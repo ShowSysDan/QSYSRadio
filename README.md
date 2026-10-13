@@ -135,10 +135,9 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   overwritten.
 - **Never dead.** If neither deck is busy for `dead_air_s`, something starts;
   with an empty music folder it backs off and logs once.
-- **Panel controls (optional).** Text Controller: named controls `Skip`,
-  `BumperNow`, `Automation` (inputs) and `Status`, `NowPlaying`, `NextUp`,
-  `DeckA`, `DeckB`, `LastEvent` (outputs). Control Script: Input Count = 3,
-  Output Count = 6, same order. Outputs update once a second, only on change.
+- **No Q-SYS panel controls.** Everything is operated from the web panel;
+  the script's Debug Output shows one short line per event (the server keeps
+  every field) and a heartbeat every 30 s.
 
 ### Testing without a Core
 
@@ -555,14 +554,13 @@ In Q-SYS Designer, with the station's design open:
      AUTOSTART = true,
    }
    ```
-   For the optional panel controls, see [Deck controller](#deck-controller).
 6. **Run.** Use File → Save to Core & Run. The script scans the folders and
    starts the first track on Player 1. With `AUTOSTART = false` it waits for
-   the Automation control or Start on the dashboard.
+   Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
    16:00:01 radio 0.3.0-dev starting on Core 8 Flex (<design name>)
-   16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/
+   16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.

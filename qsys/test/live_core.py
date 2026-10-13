@@ -80,7 +80,7 @@ def main():
     L = lupa.LuaRuntime(unpack_returned_tuples=True)
     L.execute('dofile("qsys/test/mock_core.lua")')
     L.globals().LIVE_LIBRARY = L.execute(LIBRARY)
-    L.execute('MockCore.setup{ seed = os.time(), dirs = LIVE_LIBRARY, controls = { inputs = 3, outputs = 6 } }')
+    L.execute('MockCore.setup{ seed = os.time(), dirs = LIVE_LIBRARY }')
 
     done = queue.Queue()
 

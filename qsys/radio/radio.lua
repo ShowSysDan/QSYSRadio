@@ -54,17 +54,11 @@ local function utc() return os.date("!%Y-%m-%dT%H:%M:%SZ") end
 local function startsWith(s, p) return type(s) == "string" and s:sub(1, #p) == p end
 local function round(v, places) local m = 10 ^ (places or 2); return math.floor(v * m + 0.5) / m end
 local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
-local function fmtClock(sec)
-  if type(sec) ~= "number" then return "-:--" end
-  sec = math.max(0, math.floor(sec + 0.5))
-  return string.format("%d:%02d", sec // 60, sec % 60)
-end
 local function normDir(d)
   d = tostring(d or ""):gsub("^/+", "")
   if d ~= "" and d:sub(-1) ~= "/" then d = d .. "/" end
   return d
 end
-local function label(tr) return tr and ((tr.artist and (tr.artist .. " - ") or "") .. (tr.title or tr.name)) or "-" end
 -- append to a bounded list (oldest dropped); returns true when something was dropped
 local function push(list, item, max)
   list[#list + 1] = item
@@ -123,7 +117,6 @@ end
 -- ── EVENTS ────────────────────────────────────────────────────────────────────
 EVENTS = {}          -- last 500 events: { boot, seq, t = utc, at, kind = ..., ... }
 BOOT_ID, EVENT_SEQ, STATE_REV = "-", 0, 0
-local META = { kind = true, t = true, at = true, boot = true, seq = true }
 local function emit(kind, data)
   data = data or {}
   data.kind, data.t, data.at = kind, utc(), round(now(), 2)
@@ -132,13 +125,7 @@ local function emit(kind, data)
   STATE_REV = STATE_REV + 1                  -- anything worth an event changes the reported state
   push(EVENTS, data, 500)
   if Server then Server.queue(data) end
-  local parts = {}
-  for k, v in pairs(data) do
-    if not META[k] then parts[#parts + 1] = k .. "=" .. tostring(v) end
-  end
-  table.sort(parts)
-  log("%-14s %s", kind, table.concat(parts, "  "))
-  if UI then UI.lastEvent = kind end
+  log("%-14s %s", kind, data.file or data.cmd or data.reason or "")   -- the server keeps every field
 end
 
 -- ── LIBRARY ───────────────────────────────────────────────────────────────────
@@ -229,7 +216,7 @@ local DECK_CONTROLS = { "gain", "play", "stop", "playing", "filename", "filename
                         "status", "remaining", "loop", "mute" }
 
 function Deck.new(id, compName, meterIdx)
-  local self = setmetatable({ id = id, state = "idle", gain = K.floor_db, meter = -120 }, Deck)
+  local self = setmetatable({ id = id, state = "idle", gain = K.floor_db }, Deck)
   local ok, comp = pcall(Component.New, compName)
   if not ok or not comp then error("Deck " .. id .. ": component '" .. compName .. "' not found") end
   self.c = {}
@@ -358,7 +345,6 @@ function Deck:sample(t)
   if self.state ~= "playing" or self.fade then return end
   local m = self.peak.Value
   if type(m) ~= "number" then return end
-  self.meter = m
   local unity = (m > -118) and (m - self.gain) or -200
   if unity > SETTINGS.silence_threshold_dbfs then
     self.lastAudioAt, self.firstAudioAt, self.silentSince = t, self.firstAudioAt or t, nil
@@ -366,15 +352,6 @@ function Deck:sample(t)
   else
     self.silentSince = self.silentSince or t
   end
-end
-
-function Deck:describe(t)
-  local tr = self.track or self.pending
-  if self.state == "playing" or self.state == "fading" then
-    return string.format("%s %s %s/%s", self.state, tr and (tr.title or tr.name) or "-",
-      fmtClock(t - (self.playStart or t)), fmtClock(self.duration))
-  end
-  return self.state .. " " .. (tr and (tr.title or tr.name) or "-")
 end
 
 -- ── ENGINE: the 250 ms station timer + a 50 ms timer that runs only while needed ───
@@ -403,7 +380,7 @@ Station = {
   tracksSinceBumper = 0, tracksSinceAd = 0,   -- songs started since the last bumper / ad
   history = {}, bag = {}, lastBumper = nil, lastAds = {},
   skipRequested = false, bumperRequested = false, adRequested = false, automation = true,
-  nowPlaying = nil, idleSince = nil, ticks = 0,
+  idleSince = nil,
   queue = {},              -- operator "play next" list (music), consulted before the bag
   stopAfter = false,       -- stop when the current track ends (no next track)
   nextBumper = nil,        -- operator-chosen bumper for the next bumper slot
@@ -559,7 +536,7 @@ function Station.startTrack(deck, track, opts, attempt)
     end
     d:play(SETTINGS[KINDS[track.kind].gain], opts.fadeIn or 0)
     if track.kind == "music" then
-      Station.nowPlaying, Station.live, Station.other, Station.state = track, d, otherDeck(d), "playing"
+      Station.live, Station.other, Station.state = d, otherDeck(d), "playing"
       Station.tracksSinceBumper, Station.tracksSinceAd = Station.tracksSinceBumper + 1, Station.tracksSinceAd + 1
       push(Station.history, track, 50)
       emit("track_start", { deck = d.id, file = track.name, dir = track.dir, artist = track.artist,
@@ -656,7 +633,6 @@ end
 function Station.goOff(why)
   clearRequests()
   Station.automation, Station.state, Station.armed = false, "off", nil
-  UI.syncAutomation()
   emit("automation", { on = false, why = why })
 end
 
@@ -671,7 +647,6 @@ function Station.setAutomation(on, why)
     return Station.goOff(why or "control")
   end
   Station.automation, Station.state = true, "idle"
-  UI.syncAutomation()
   emit("automation", { on = true, why = why or "control" })
   if not (DeckA:isBusy() or DeckB:isBusy()) then Station.kick() end
 end
@@ -696,8 +671,6 @@ end
 function Station.tick(t)
   DeckA:sample(t)
   DeckB:sample(t)
-  Station.ticks = Station.ticks + 1
-  if Station.ticks % math.max(1, math.floor(1 / K.tick_s + 0.5)) == 0 then UI.refresh(t) end
   if not Station.automation then return end
 
   local live, spot = Station.live, Station.spotDeck
@@ -731,17 +704,12 @@ function Station.tick(t)
   end
 end
 
-function Station.statusLine(t)
-  local live = Station.live
-  if Station.state == "off" then return "automation off" end
-  if live and live.track and (live.state == "playing" or live.state == "fading") then
-    return string.format("%s | %s | since bumper: %d/%d | bag: %d",
-      Station.state, live:describe(t), Station.tracksSinceBumper, SETTINGS.bumper_every_n_tracks, #Station.bag)
-  end
-  return Station.state
+function Station.statusLine()
+  local tr = Station.live and Station.live.track
+  return Station.state .. (tr and (" | " .. tr.name) or "") .. " | bag " .. #Station.bag
 end
 
--- ── COMMANDS (web panel via the server, and the optional panel controls) ──────
+-- ── COMMANDS (from the web panel, via the server) ─────────────────────────────
 Control = {}
 
 local function trackInfo(tr)
@@ -898,9 +866,8 @@ function Station.snapshot(t)
   local nxt, queued = Station.nextSong()
   local nextUp = trackInfo(nxt)
   if nextUp then nextUp.queued = queued end
-  local queue, settings = {}, {}
+  local queue = {}
   for i, q in ipairs(Station.queue) do queue[i] = trackInfo(q) end
-  for k in pairs(DEFAULTS) do settings[k] = SETTINGS[k] end
   return {
     automation = Station.automation, state = Station.state, stop_after = Station.stopAfter,
     decks = { A = deck(DeckA), B = deck(DeckB) }, next_up = nextUp, queue = queue,
@@ -909,58 +876,8 @@ function Station.snapshot(t)
     next_ad = trackInfo(Station.nextAd), ad_requested = Station.adRequested, tracks_since_ad = Station.tracksSinceAd,
     ad_every = SETTINGS.ad_every_n_tracks, ads_due = Station.adPlan and #Station.adPlan.due or 0,
     library = { music = #Library.music, imaging = #Library.imaging, ad = #Library.ad },
-    settings = settings, uptime = round(t - BOOT_T, 0), outbox = #Server.outbox,
+    settings = SETTINGS, uptime = round(t - BOOT_T, 0), outbox = #Server.outbox,
   }
-end
-
--- ── OPERATOR PANEL (optional controls) ────────────────────────────────────────
-UI = { outputs = {}, shown = {}, lastEvent = "-" }
-
-local function panelControl(name, index, list)
-  local c = Controls and Controls[name]
-  if not c and Controls and type(Controls[list]) == "table" then c = Controls[list][index] end
-  return c
-end
-
-function UI.init()
-  for i, name in ipairs({ "Status", "NowPlaying", "NextUp", "DeckA", "DeckB", "LastEvent" }) do
-    UI.outputs[name] = panelControl(name, i, "Outputs")
-  end
-  local inputs = {
-    Skip = function(ctl) if ctl.Boolean then Control.run({ cmd = "skip", by = "panel" }) end end,
-    BumperNow = function(ctl) if ctl.Boolean then Control.run({ cmd = "bumper_now", by = "panel" }) end end,
-    Automation = function(ctl) Control.run({ cmd = ctl.Boolean and "start" or "stop_now", by = "panel" }) end,
-  }
-  for i, name in ipairs({ "Skip", "BumperNow", "Automation" }) do
-    local c = panelControl(name, i, "Inputs")
-    if c then pcall(assign, c, "EventHandler", inputs[name]) end
-    if name == "Automation" then UI.automationCtl = c end
-  end
-  UI.syncAutomation()
-end
-
-function UI.syncAutomation()
-  if UI.automationCtl then pcall(assign, UI.automationCtl, "Boolean", Station.automation) end
-end
-
-local function show(name, s)
-  local c = UI.outputs[name]
-  if c and UI.shown[name] ~= s then
-    UI.shown[name] = s
-    pcall(assign, c, "String", s)
-  end
-end
-
-function UI.refresh(t)
-  if next(UI.outputs) == nil then return end
-  local np, live = Station.nowPlaying, Station.live
-  show("Status", Station.statusLine(t))
-  show("NowPlaying", (np and live and live.playStart) and string.format("%s  %s / %s", label(np),
-    fmtClock(t - live.playStart), fmtClock(live.duration)) or "-")
-  show("NextUp", label((Station.nextSong())))
-  show("DeckA", DeckA:describe(t))
-  show("DeckB", DeckB:describe(t))
-  show("LastEvent", UI.lastEvent)
 end
 
 -- ── SERVER: one sync request a second, plus the library after each scan ───────
@@ -1005,7 +922,7 @@ end
 
 function Server.applySettings(s, rev, fromFile)
   local new = {}
-  for k, v in pairs(SETTINGS) do new[k] = DEFAULTS[k] ~= nil and DEFAULTS[k] or v end
+  for k, v in pairs(DEFAULTS) do new[k] = v end
   local n = 0
   for k, v in pairs(s) do
     if DEFAULTS[k] ~= nil and type(v) == type(DEFAULTS[k]) then new[k], n = v, n + 1 end
@@ -1159,13 +1076,12 @@ local function boot()
   Server.loadLocal()
   for _, kind in ipairs(KIND_ORDER) do SETTINGS[KINDS[kind].dir] = normDir(SETTINGS[KINDS[kind].dir]) end
   Library.scan()
-  UI.init()
 
   Fast = timer("fast tick", function() Engine.fast() end)   -- started by Engine.wake() only while fading/loading
   Tick = timer("tick", function() Station.tick(now()) end, K.tick_s)
   Sync = timer("sync", Server.sync, K.sync_s)
   Chores = timer("chores", function()
-    log("heartbeat: %s", Station.statusLine(now()))
+    log("heartbeat: %s", Station.statusLine())
     Server.saveOutbox()
   end, K.chores_s)
   emit("boot", { version = RADIO_VERSION, platform = tostring(st.Platform), design = STATION_NAME,
@@ -1175,8 +1091,7 @@ local function boot()
     Station.kick()
   else
     Station.automation, Station.state = false, "off"
-    UI.syncAutomation()
-    log("AUTOSTART = false; waiting for the Automation control")
+    log("AUTOSTART = false; waiting for Start on the web panel")
   end
 end
 
