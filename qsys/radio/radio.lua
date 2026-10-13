@@ -130,7 +130,7 @@ local function emit(kind, data)
 end
 
 -- ── LIBRARY ───────────────────────────────────────────────────────────────────
--- per file (all kinds): { trail = s, lead = s, unsupported = true }, from the server after each upload + this boot's plays
+-- per file (all kinds): { trail = s, lead = s, fixed = operator's, unsupported = true }: the server's, + this boot's plays
 LEARNED = {}
 Library = { music = {}, imaging = {}, ad = {}, byKey = {}, root = "Audio/" }
 
@@ -198,14 +198,14 @@ function Library.remove(track)
   Library.byKey[track.key] = nil
 end
 
--- the server's per-file figures (reply to the library upload)
+-- the server's per-file figures (reply to the library upload): they replace this boot's (edits, forgotten figures)
 function Library.learn(map)
   if type(map) ~= "table" then return end
+  for _, L in pairs(LEARNED) do L.trail, L.lead, L.fixed = nil, nil, nil end
   for key, v in pairs(map) do
     if type(v) == "table" then
-      local L, trail = LEARNED[key] or {}, tonumber(v.trail)
-      if trail then L.trail = math.min(L.trail or trail, trail) end
-      L.lead = tonumber(v.lead) or L.lead
+      local L = LEARNED[key] or {}
+      L.trail, L.lead, L.fixed = tonumber(v.trail), tonumber(v.lead), v.fixed == true or nil
       if v.unsupported == true then L.unsupported = true end
       LEARNED[key] = L
       if L.unsupported and Library.byKey[key] then Library.remove(Library.byKey[key]) end
@@ -517,12 +517,12 @@ function Station.finishTrack(d, reason)
   LEARNED[tr.key] = L
   if d.firstAudioAt and d.playStart then
     ev.lead_in = round(d.firstAudioAt - d.playStart, 2)
-    L.lead = ev.lead_in
+    if not L.fixed then L.lead = ev.lead_in end
   end
   -- the silent tail counts only if the silence was heard before any fade (a fade hides the rest of the file)
   if reason ~= "cut" and d.lastAudioAt and d.playStart and d.duration and (d.fadedAt or 1e9) - d.lastAudioAt >= K.quiet_s then
     ev.trail = round(math.max(0, d.duration - (d.lastAudioAt - d.playStart)), 2)
-    L.trail = math.min(L.trail or ev.trail, ev.trail)
+    if not L.fixed then L.trail = math.min(L.trail or ev.trail, ev.trail) end
   end
   if d.peakMax then ev.peak = round(d.peakMax, 1) end
   emit(KINDS[tr.kind].event .. "_end", ev)

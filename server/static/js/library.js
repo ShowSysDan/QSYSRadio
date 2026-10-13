@@ -7,6 +7,7 @@
   const PAGE = 100;
   const kind = $('lib-tile').dataset.kind;
   let offset = 0, seq = 0, timer = null, loading = false, stale = false, seen = null, only = '';
+  const byKey = {};                    // the rows shown, for the quiet start / end editor
   const ICON = {
     next: '<svg viewBox="0 0 24 24"><path d="M4 6h10v2H4zm0 5h10v2H4zm0 5h6v2H4zm12-3v-3h2v3h3v2h-3v3h-2v-3h-3v-2z"/></svg>',
     queue: '<svg viewBox="0 0 24 24"><path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h10v2H4z"/></svg>',
@@ -14,14 +15,14 @@
   };
   const NOUN = { music: 'songs', imaging: 'imaging files', ad: 'advertisements' };
   const FILTERS = {
-    music: [['', 'All'], ['never', 'Never played'], ['unsupported', 'Unsupported']],
-    imaging: [['', 'All'], ['ident', 'Station IDs'], ['never', 'Never played'], ['unsupported', 'Unsupported']],
-    ad: [['', 'All'], ['hourly', 'Per hour'], ['mix', 'Mix in'], ['off', 'Off'], ['never', 'Never played']],
+    music: [['', 'All'], ['never', 'Never played'], ['adjusted', 'Adjusted'], ['unsupported', 'Unsupported']],
+    imaging: [['', 'All'], ['ident', 'Station IDs'], ['never', 'Never played'], ['adjusted', 'Adjusted'], ['unsupported', 'Unsupported']],
+    ad: [['', 'All'], ['hourly', 'Per hour'], ['mix', 'Mix in'], ['off', 'Off'], ['never', 'Never played'], ['adjusted', 'Adjusted']],
   };
   const HEAD = {
     music: ['Artist – Title', 'Length', 'Without silence', 'Plays', 'Last played', ''],
     imaging: ['Artist – Title', 'Length', 'Without silence', 'Plays', 'Last played', ''],     // the ID toggle sits with the actions
-    ad: ['Artist – Title', 'Length', 'Schedule', 'This hour', 'Today', 'Last played', ''],
+    ad: ['Artist – Title', 'Length', 'Without silence', 'Schedule', 'This hour', 'Today', 'Last played', ''],
   };
   const button = (action, icon, text, title, primary) =>
     '<button class="sm' + (primary ? ' primary' : '') + '" data-a="' + action + '" title="' + title + '">' + ICON[icon] + '<span>' + text + '</span></button>';
@@ -55,12 +56,60 @@
       ' title="Plays per clock hour"></span>';
   }
 
-  // length without the quiet start and end the Core measured on earlier plays
+  // length without the quiet start and end (measured on earlier plays, or set by an operator); click to view / adjust
+  const pick = (set, measured) => (R.num(set) != null ? R.num(set) : R.num(measured));
+  const adjusted = (it) => R.num(it.lead_set_s) != null || R.num(it.trail_set_s) != null;
   function audible(it) {
-    const lead = R.num(it.lead_in_s), trail = R.num(it.trail_s);
-    if (!R.num(it.duration_s) || (lead == null && trail == null)) return '<td class="num">–</td>';
-    return '<td class="num" title="quiet start ' + (lead || 0).toFixed(1) + ' s, quiet end ' + (trail || 0).toFixed(1) + ' s">' +
-      R.clock(it.audible_s) + '</td>';
+    const lead = pick(it.lead_set_s, it.lead_in_s), trail = pick(it.trail_set_s, it.trail_s);
+    const known = R.num(it.duration_s) && (lead != null || trail != null);
+    const inner = (known ? R.clock(it.audible_s) : '–') + (adjusted(it) ? ' <span class="tag" title="Set by an operator">adj</span>' : '');
+    const tip = known ? 'quiet start ' + (lead || 0).toFixed(1) + ' s, quiet end ' + (trail || 0).toFixed(1) + ' s' : 'not measured yet';
+    return '<td class="num" title="' + tip + '">' + (R.canOperate && !it.unsupported
+      ? '<button type="button" class="linkbtn" data-a="trim" title="' + tip + ': view or adjust">' + inner + '</button>' : inner) + '</td>';
+  }
+
+  // the editor under a row: measured figures, the operator's (blank = use the measured one)
+  function trimRow(tr) {
+    const open = tr.nextElementSibling && tr.nextElementSibling.classList.contains('trim-row') ? tr.nextElementSibling : null;
+    $('lib').querySelectorAll('.trim-row').forEach((x) => x.remove());
+    if (open) { refresh(); return; }
+    const it = byKey[tr.dataset.key];
+    if (!it) return;
+    const measured = (v) => (R.num(v) != null ? 'measured ' + R.num(v).toFixed(1) + ' s'
+      : it.plays ? 'none heard' : 'not measured yet');
+    const input = (name, set, m) => '<input type="number" min="0" max="600" step="0.1" data-trim="' + name + '" value="' +
+      (R.num(set) == null ? '' : R.num(set)) + '" placeholder="' + (R.num(m) == null ? 'auto' : R.num(m).toFixed(1)) + '">';
+    tr.insertAdjacentHTML('afterend', '<tr class="trim-row" data-key="' + esc(it.key) + '" data-label="' + esc(tr.dataset.label) + '"><td colspan="' +
+      HEAD[kind].length + '"><div class="trim">' +
+      '<label>Quiet start ' + input('lead', it.lead_set_s, it.lead_in_s) + ' s <span class="dim">' + measured(it.lead_in_s) + '</span></label>' +
+      '<label>Quiet end ' + input('trail', it.trail_set_s, it.trail_s) + ' s <span class="dim">' + measured(it.trail_s) + '</span></label>' +
+      '<button type="button" class="sm primary" data-t="save">Save</button>' +
+      '<button type="button" class="sm" data-t="clear" title="Remove the figures set here">Use measured</button>' +
+      '<button type="button" class="sm" data-t="forget" title="Measure again on the next play">Forget measured</button>' +
+      '<button type="button" class="linkbtn" data-t="close">close</button>' +
+      '<div class="dim small">Quiet start: where the sound begins, in seconds from the start of the file (the Core starts just before it, ' +
+      'within Settings → Silence detection). Quiet end: seconds of silence at the end (the next item starts that much early). ' +
+      'Blank = what the Core measures. A figure set here is not measured over.</div></div></td></tr>');
+    tr.nextElementSibling.querySelector('input').focus();
+  }
+
+  async function trimAction(row, t) {
+    const key = row.dataset.key, label = row.dataset.label, body = { station: R.station || undefined, key };
+    try {
+      if (t === 'save' || t === 'clear') {
+        const val = (name) => { const v = row.querySelector('[data-trim="' + name + '"]').value; return t === 'clear' || v === '' ? null : Number(v); };
+        body.lead = val('lead');
+        body.trail = val('trail');
+        await R.post('/api/v1/library/trim', body);
+        R.toast(label + (t === 'clear' ? ': using the measured figures' : ': saved; the Core picks it up after its rescan'), 'ok');
+      } else if (t === 'forget') {
+        if (!confirm('Forget the measured quiet start and end of “' + label + '”? They are measured again on its next play.')) return;
+        await R.post('/api/v1/library/forget', body);
+        R.toast(label + ': measured figures forgotten', 'ok');
+      }
+    } catch (e) { R.toast(label + ': ' + e.message, 'bad'); return; }
+    row.remove();
+    refresh();
   }
 
   function row(it) {
@@ -70,7 +119,7 @@
     const last = '<td class="num" title="' + esc(R.timeOf(it.last_played, true)) + '">' + esc(R.ago(it.last_played)) + '</td>';
     const len = '<td class="num">' + (R.num(it.duration_s) ? R.clock(it.duration_s) : '–') + '</td>';
     const cells = it.kind === 'ad'
-      ? len + '<td>' + schedule(it) + slots(it) + '</td><td class="num">' + (R.num(it.plays_hour) || 0) + (it.mode === 'hourly' ? ' / ' + esc(it.per_hour) : '') +
+      ? len + audible(it) + '<td>' + schedule(it) + slots(it) + '</td><td class="num">' + (R.num(it.plays_hour) || 0) + (it.mode === 'hourly' ? ' / ' + esc(it.per_hour) : '') +
         '</td><td class="num">' + (R.num(it.plays_today) || 0) + '</td>' + last
       : len + audible(it) + '<td class="num">' + (R.num(it.plays) || 0) + '</td>' + last;
     return '<tr data-key="' + esc(it.key) + '" data-label="' + esc(R.whoLine(it)) + '"><td>' + name + '</td>' + cells + '<td class="acts">' + actions(it) + '</td></tr>';
@@ -97,6 +146,7 @@
       const d = await R.api(R.withStation('/api/v1/library?' + qs));
       if (my !== seq) return;              // a newer search replaced this one
       R.setHTML($('lib-head'), '<tr>' + HEAD[kind].map((h) => '<th>' + h + '</th>').join('') + '</tr>');
+      d.items.forEach((it) => { byKey[it.key] = it; });
       const html = d.items.map(row).join('');
       if (append) {
         $('lib').insertAdjacentHTML('beforeend', html);
@@ -112,7 +162,7 @@
       $('lib-info').textContent = d.total + ' ' + NOUN[kind] + (d.station ? ' on ' + d.station : '');
       const t = d.totals || {};
       $('lib-totals').textContent = !t.n ? '' : (q || only ? 'Matching: ' : 'Total: ') + t.n + ' ' + NOUN[kind] + ' · ' + R.clock(t.duration_s) +
-        (kind !== 'ad' ? ' (' + R.clock(t.audible_s) + ' without leading / trailing silence)' : '') +
+        ' (' + R.clock(t.audible_s) + ' without leading / trailing silence)' +
         (t.unknown ? ' · ' + t.unknown + ' not measured yet (length known once played)' : '') +
         (kind === 'music' && t.n ? ' · rotation: ' + (t.never_played ? t.never_played + ' never played' : 'every song played') +
           (t.oldest_played ? ', longest wait ' + R.ago(t.oldest_played).replace(' ago', '') : '') : '');
@@ -127,8 +177,9 @@
     }
   }
 
-  // never redraw under an operator who is editing an ad's schedule
-  const editing = () => $('lib').contains(document.activeElement) && /^(INPUT|SELECT)$/.test(document.activeElement.tagName);
+  // never redraw under an operator who is editing an ad's schedule or a file's quiet start / end
+  const editing = () => !!$('lib').querySelector('.trim-row') ||
+    ($('lib').contains(document.activeElement) && /^(INPUT|SELECT)$/.test(document.activeElement.tagName));
   function refresh() { if (editing() || loading) stale = true; else load(false, true); }
 
   async function saveRule(tr) {
@@ -184,9 +235,27 @@
   $('lib-more').addEventListener('click', () => { if (!loading) load(true); });
   $('btn-rescan').hidden = !R.canOperate;
   $('btn-rescan').addEventListener('click', () => R.command('rescan', {}, 'Rescan library'));
+  $('btn-forget').hidden = !R.canOperate;
+  $('btn-forget').addEventListener('click', async () => {
+    if (!confirm('Forget the measured quiet start and end of every one of the ' + NOUN[kind] + '? Each is measured again on its next play. Figures set by an operator stay.')) return;
+    try {
+      const r = await R.post('/api/v1/library/forget', { station: R.station || undefined, kind });
+      R.toast('Forgotten for ' + r.files + ' ' + NOUN[kind], 'ok');
+    } catch (e) { R.toast('Forget: ' + e.message, 'bad'); }
+    refresh();
+  });
   $('lib').addEventListener('change', (e) => { if (e.target.dataset.rule) saveRule(e.target.closest('tr')); });
+  $('lib').addEventListener('keydown', (e) => {
+    if (e.target.dataset.trim && e.key === 'Enter') trimAction(e.target.closest('tr'), 'save');
+    if (e.target.dataset.trim && e.key === 'Escape') { e.target.closest('tr').remove(); refresh(); }
+  });
   $('lib').addEventListener('focusout', () => setTimeout(() => { if (stale && !editing()) load(false, true); }, 0));
   $('lib').addEventListener('click', (e) => {
+    const t = e.target.closest('button[data-t]');
+    if (t) {
+      if (t.dataset.t === 'close') { t.closest('tr').remove(); refresh(); } else trimAction(t.closest('tr'), t.dataset.t);
+      return;
+    }
     const b = e.target.closest('button[data-a]');
     if (!b) return;
     const tr = b.closest('tr'), key = tr.dataset.key, label = tr.dataset.label, a = b.dataset.a;
@@ -195,6 +264,7 @@
     else if (a === 'now' && confirm('Fade to “' + label + '” now?')) R.command('play_now', { key }, 'Play now: ' + label);
     else if (a === 'bumper') R.command('bumper_now', { key }, 'Bumper now: ' + label);
     else if (a === 'ident') setIdent(tr, !b.classList.contains('on'));
+    else if (a === 'trim') trimRow(tr);
     else if (a === 'ad' && confirm('Fade to an ad break with “' + label + '” now?')) R.command('play_now', { key }, 'Play now: ' + label);
   });
 

@@ -7,6 +7,13 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **See and adjust each file's quiet start and end.** On the Music, Imaging &
+  IDs and Advertisements pages, click the length without silence: the
+  measured figures, your own (the Core never measures over them), "Use
+  measured" and "Forget measured" (measured again on the next play). A
+  "Forget measured" button does a whole page; an "Adjusted" filter lists the
+  files you set. The server queues a rescan so the Core applies the change.
+  Migration 0009.
 - **Pause ads and bumpers**, for 30 min, 1 hour, until a time ("no more
   ads till 05:00") or until resumed: a pause button on the Next bumper /
   Next ad break cards, PAUSED and until when shown on the card. Server side

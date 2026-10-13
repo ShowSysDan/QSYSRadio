@@ -140,7 +140,9 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   file is from 0:00 (nothing measured yet); lead-in is always reported from
   the file start, so skipping never shrinks it.
 - **Learning** (kept on the server, `library` table, every kind): duration,
-  lead-in, minimum trailing silence, peak at unity. Trailing silence counts
+  lead-in, minimum trailing silence, peak at unity; an operator's figures
+  (`lead_set_s`, `trail_set_s`) win over them. After each library upload the
+  server's figures replace the Core's (so edits and forgotten figures apply). Trailing silence counts
   only when it was heard before any fade began (a crossfade hides the rest
   of the file). A file the player cannot play
   ("Unsupported…") is remembered there until its size changes; any other
@@ -933,9 +935,14 @@ MockCore scenarios and `live_core.py`.
   activity (every command, who sent it, and the Core's answer); recent plays.
 - **Music**, **Imaging & IDs** and **Advertisements** pages (one tab each): search
   (`/` jumps to it, Esc clears), sort, quick filters (never played,
-  unsupported; station IDs; per hour / mix in / off), all kept in the URL so
-  a view can be bookmarked. Length and length without the measured silence,
-  totals. Music: Play next, Queue, Play now. Imaging: Bumper now and the
+  unsupported; station IDs; per hour / mix in / off; adjusted), all kept in
+  the URL so a view can be bookmarked. Length and length without the
+  measured silence, totals. Click the length without silence (operators) to
+  see the measured quiet start and end and set your own (blank = measured;
+  the Core never measures over a figure set here), go back to the measured
+  ones, or forget them (measured again on the next play). **Forget
+  measured** in the toolbar does that for the whole page. Changes reach the
+  Core with a rescan the server queues. Music: Play next, Queue, Play now. Imaging: Bumper now and the
   **ID** toggle (marks a station ID). Advertisements: Play now, the schedule (Mix in /
   Per hour with the count / Off) with plays this hour and today, and a
   **This hour** line of every per-hour slot in time order. Rescan. Lists

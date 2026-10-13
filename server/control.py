@@ -177,13 +177,15 @@ def core_library(conn, payload):
                            imaging_dir = EXCLUDED.imaging_dir, ads_dir = EXCLUDED.ads_dir""",
                     (station, text(payload.get('music_dir'), 500), text(payload.get('imaging_dir'), 500),
                      text(payload.get('ads_dir'), 500)))
-        # what the Core uses: unsupported files, and the quiet start / end (where to start, when to hand over)
-        cur.execute("""SELECT key, trail_s, lead_in_s, unsupported FROM library
+        # what the Core uses: unsupported files, and the quiet start / end (where to start, when to hand over);
+        # fixed = the operator set a figure: the Core does not learn over it
+        cur.execute("""SELECT key, unsupported, COALESCE(trail_set_s, trail_s) AS trail, COALESCE(lead_set_s, lead_in_s) AS lead,
+                              trail_set_s IS NOT NULL OR lead_set_s IS NOT NULL AS fixed FROM library
                        WHERE station = %s AND present
-                         AND (unsupported OR trail_s IS NOT NULL OR lead_in_s IS NOT NULL)""",
-                    (station,))
+                         AND (unsupported OR trail_s IS NOT NULL OR lead_in_s IS NOT NULL OR trail_set_s IS NOT NULL
+                              OR lead_set_s IS NOT NULL)""", (station,))
         learned = {r['key']: {'unsupported': True} if r['unsupported'] else
-                   {k: round(r[c], 2) for k, c in (('trail', 'trail_s'), ('lead', 'lead_in_s')) if r[c] is not None}
+                   dict({k: round(r[k], 2) for k in ('trail', 'lead') if r[k] is not None}, **({'fixed': True} if r['fixed'] else {}))
                    for r in cur.fetchall()}
     conn.commit()
     counts = ' '.join(f'{k}={sum(1 for r in rows.values() if r[2] == k)}' for k in KINDS)
@@ -312,6 +314,40 @@ def add_command(conn, station, cmd, args, user):
     return cid, (20, f'COMMAND station={station} id={cid} {label} by={user.get("username")}')
 
 
+def set_trim(conn, station, key, lead, trail, user):
+    """The operator's quiet start / end for a file (seconds; None = use what the Core measures).
+    The caller queues a rescan so the Core picks it up. Returns a log line."""
+    vals = []
+    for name, v in (('quiet start', lead), ('quiet end', trail)):
+        n = None if v is None else number(v)
+        if v is not None and (n is None or not 0 <= n <= 600):
+            raise BadRequest(f'{name} must be 0–600 seconds, or empty to use the measured one')
+        vals.append(None if n is None else round(n, 2))
+    with conn.cursor() as cur:
+        cur.execute("""UPDATE library SET lead_set_s = %s, trail_set_s = %s
+                       WHERE station = %s AND key = %s AND present""", (*vals, station, key or ''))
+        if not cur.rowcount:
+            raise BadRequest('that file is not in the library')
+    conn.commit()
+    show = lambda v: 'measured' if v is None else f'{v}s'
+    return 20, f'TRIM station={station} key="{key}" start={show(vals[0])} end={show(vals[1])} by={user.get("username")}'
+
+
+def forget_measured(conn, station, key, kind, user):
+    """Forget the measured quiet start / end of one file (key) or every file of a kind; they are
+    measured again on the next play. Operator figures stay. Returns (files, log line)."""
+    if not key and kind not in KINDS:
+        raise BadRequest('give a file (key) or a kind')
+    with conn.cursor() as cur:
+        cur.execute("""UPDATE library SET lead_in_s = NULL, trail_s = NULL
+                       WHERE station = %s AND (lead_in_s IS NOT NULL OR trail_s IS NOT NULL)
+                         AND """ + ('key = %s' if key else 'kind = %s'), (station, key or kind))
+        n = cur.rowcount
+    conn.commit()
+    return n, (20, f'FORGET station={station} {"key=" + repr(key) if key else "kind=" + kind} files={n} '
+                   f'by={user.get("username")}')
+
+
 _SORTS = {
     'artist': 'lower(COALESCE(artist, title, file)), lower(COALESCE(title, file))',
     'title': 'lower(COALESCE(title, file))',
@@ -323,6 +359,7 @@ _SORTS = {
 
 # list filters: name -> SQL condition (the select below is aliased x)
 FILTERS = {'never': 'last_played IS NULL', 'unsupported': 'unsupported', 'ident': 'ident',
+           'adjusted': 'lead_set_s IS NOT NULL OR trail_set_s IS NOT NULL',
            'hourly': "mode = 'hourly'", 'mix': "mode = 'mix'", 'off': "mode = 'off'"}
 
 
@@ -332,8 +369,9 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
     this hour's / today's plays (the server's clock and TIMEZONE). Returns
     (total, a page of items, totals over every matching file)."""
     sql = """SELECT l.key, l.kind, l.directory, l.file, l.artist, l.title, l.duration_s, l.unsupported, l.ident,
-                    l.lead_in_s, l.trail_s,
-                    GREATEST(0, l.duration_s - COALESCE(l.lead_in_s, 0) - COALESCE(l.trail_s, 0)) AS audible_s,
+                    l.lead_in_s, l.trail_s, l.lead_set_s, l.trail_set_s,
+                    GREATEST(0, l.duration_s - COALESCE(l.lead_set_s, l.lead_in_s, 0)
+                                             - COALESCE(l.trail_set_s, l.trail_s, 0)) AS audible_s,
                     COALESCE(p.plays, 0) AS plays, p.last_played, COALESCE(p.plays_hour, 0) AS plays_hour,
                     COALESCE(p.plays_today, 0) AS plays_today, COALESCE(r.mode, 'mix') AS mode, r.per_hour
              FROM library l

@@ -439,6 +439,40 @@ def test_forecast_fits_later_songs_to_ad_slots(app):
     assert 'ad_fit_tolerance_s' not in (sync(app, station='FF', settings_rev='').json.get('settings') or {})
 
 
+def test_quiet_start_and_end_can_be_adjusted_and_forgotten(app):
+    items = [{'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music'},
+             {'key': 'I/b.wav', 'dir': 'I/', 'file': 'b.wav', 'kind': 'imaging'}]
+    library_post(app, 'T1', items)
+    sync(app, station='T1', events=[
+        ev(1, 'track_start', deck='A', file='a.mp3', dir='M/', duration=200.0),
+        ev(2, 'track_end', deck='A', file='a.mp3', dir='M/', reason='end', lead_in=0.8, trail=6.0),
+        ev(3, 'bumper_start', deck='B', file='b.wav', dir='I/', duration=8.0),
+        ev(4, 'bumper_end', deck='B', file='b.wav', dir='I/', reason='end', lead_in=0.2, trail=1.0)])
+    assert library_post(app, 'T1', items).json['learned'] == {'M/a.mp3': {'trail': 6.0, 'lead': 0.8},
+                                                           'I/b.wav': {'trail': 1.0, 'lead': 0.2}}   # every kind
+    op, viewer = signed_in(app, 'operator'), signed_in(app, 'viewer')
+    trim = lambda c, **b: c.post('/api/v1/library/trim', json=dict(station='T1', **b), headers=WEB)
+    forget = lambda c, **b: c.post('/api/v1/library/forget', json=dict(station='T1', **b), headers=WEB)
+    assert trim(viewer, key='M/a.mp3', lead=None, trail=0.5).status_code == 403
+    assert trim(op, key='M/a.mp3', lead=None, trail=-1).status_code == 400
+    assert trim(op, key='M/nope.mp3', lead=None, trail=1).status_code == 400
+    assert trim(op, key='M/a.mp3', lead=None, trail=0.5).status_code == 200
+    assert [c['cmd'] for c in sync(app, station='T1').json['commands']][-1] == 'rescan'      # the Core picks it up
+    assert library_post(app, 'T1', items).json['learned']['M/a.mp3'] == {'trail': 0.5, 'lead': 0.8, 'fixed': True}
+    row = next(i for i in op.get('/api/v1/library?station=T1&only=adjusted').json['items'])
+    assert (row['key'], row['trail_s'], row['trail_set_s'], row['audible_s']) == ('M/a.mp3', 6.0, 0.5, pytest.approx(198.7))
+    sync(app, station='T1', events=[                     # still measured underneath, never over the operator's figure
+        ev(5, 'track_start', deck='A', file='a.mp3', dir='M/', duration=200.0),
+        ev(6, 'track_end', deck='A', file='a.mp3', dir='M/', reason='end', lead_in=0.7, trail=5.0)])
+    assert library_post(app, 'T1', items).json['learned']['M/a.mp3'] == {'trail': 0.5, 'lead': 0.7, 'fixed': True}
+    assert forget(op).status_code == 400
+    assert forget(op, kind='music').json['files'] == 1
+    assert library_post(app, 'T1', items).json['learned']['M/a.mp3'] == {'trail': 0.5, 'fixed': True}   # the operator's stays
+    assert trim(op, key='M/a.mp3', lead=None, trail=None).status_code == 200                       # back to measured
+    assert forget(op, key='I/b.wav').json['files'] == 1
+    assert library_post(app, 'T1', items).json['learned'] == {}
+
+
 def test_holds_and_station_ids(app):
     items = [{'key': 'Ads/m.wav', 'dir': 'Ads/', 'file': 'm.wav', 'kind': 'ad'},
              {'key': 'I/id1.wav', 'dir': 'I/', 'file': 'id1.wav', 'kind': 'imaging'},

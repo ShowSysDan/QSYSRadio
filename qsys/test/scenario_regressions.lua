@@ -146,6 +146,18 @@ check(Library.byKey["Test/Tuning/B - Song2.flac"] == nil and #Library.music == 3
 Library.scan()
 check(Library.byKey["Test/Tuning/B - Song2.flac"] == nil, "and stays out after a rescan")
 
+print("-- the server's figures replace this boot's; the operator's (fixed) are not learned over")
+boot(songs(2, 30), {})
+SETTINGS.bumper_every_n_tracks, SETTINGS.artist_separation = 0, 0
+Library.learn({ ["Test/Tuning/A - Song1.flac"] = { trail = 2.5, lead = 0.1, fixed = true } })
+MockCore.run(130)
+local fixedA, freeB = LEARNED["Test/Tuning/A - Song1.flac"], LEARNED["Test/Tuning/B - Song2.flac"]
+check(fixedA.trail == 2.5 and fixedA.lead == 0.1, "operator's figures kept through plays")
+check(freeB and freeB.lead and freeB.lead > 0, "other files still learned this boot")
+Library.learn({})
+check(LEARNED["Test/Tuning/A - Song1.flac"].trail == nil and LEARNED["Test/Tuning/B - Song2.flac"].lead == nil
+  and not LEARNED["Test/Tuning/A - Song1.flac"].fixed, "forgotten on the server: forgotten on the Core")
+
 print("-- the outbox is written only while the server is unreachable")
 boot(songs(4, 20), BUMPERS, function()
   MockCore.httpHandler = function(req)

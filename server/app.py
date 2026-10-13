@@ -338,6 +338,34 @@ def post_ident():
     return jsonify(ok=True)
 
 
+@app.post('/api/v1/library/trim')
+@auth.operator_required
+def post_trim():
+    """{station, key, lead, trail}: the quiet start / end in seconds (null = use the measured one)."""
+    body = _json_body()
+    station = _station(body.get('station'))
+    if not station:
+        raise BadRequest('no station has connected yet')
+    conn, user = dbconn(), auth.current_user()
+    line = control.set_trim(conn, station, body.get('key'), body.get('lead'), body.get('trail'), user)
+    write_logs([line, control.add_command(conn, station, 'rescan', {}, user)[1]])   # the Core picks it up
+    return jsonify(ok=True)
+
+
+@app.post('/api/v1/library/forget')
+@auth.operator_required
+def post_forget():
+    """{station, key} or {station, kind}: forget the measured quiet start / end (measured again on the next play)."""
+    body = _json_body()
+    station = _station(body.get('station'))
+    if not station:
+        raise BadRequest('no station has connected yet')
+    conn, user = dbconn(), auth.current_user()
+    n, line = control.forget_measured(conn, station, body.get('key'), body.get('kind'), user)
+    write_logs([line, control.add_command(conn, station, 'rescan', {}, user)[1]])
+    return jsonify(ok=True, files=n)
+
+
 @app.post('/api/v1/ads')
 @auth.operator_required
 def post_ad_rule():

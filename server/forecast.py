@@ -31,7 +31,8 @@ def forecast(cur, station, state, age_s, n=10):
     if not state.get('automation'):
         return []
     s = _settings(cur, state)
-    cur.execute("""SELECT key, kind, file, artist, title, duration_s, trail_s, lead_in_s, last_played FROM library
+    cur.execute("""SELECT key, kind, file, artist, title, duration_s, COALESCE(trail_set_s, trail_s) AS trail_s,
+                          COALESCE(lead_set_s, lead_in_s) AS lead_in_s, last_played FROM library
                    WHERE station = %s AND present AND NOT unsupported""", (station,))
     lib = {r['key']: dict(r) for r in cur.fetchall()}
     sched, hour_start = ads.schedule(cur, station)

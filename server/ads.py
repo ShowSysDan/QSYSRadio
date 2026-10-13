@@ -118,7 +118,7 @@ def next_song(cur, station, slot=None):
     Stable while one song plays (seeded by its play). None when the operator queue has songs,
     automation is off or nothing qualifies. slot: (datetime the next per-hour
     slot opens, its window in seconds) or None. See choose()."""
-    cur.execute("""SELECT s.state, p.id, p.started_at, p.duration_s, l.trail_s, l.lead_in_s, l.key
+    cur.execute("""SELECT s.state, p.id, p.started_at, p.duration_s, COALESCE(l.trail_set_s, l.trail_s) AS trail_s, COALESCE(l.lead_set_s, l.lead_in_s) AS lead_in_s, l.key
                    FROM stations s
                    LEFT JOIN LATERAL (SELECT * FROM play_log WHERE station = s.station AND kind = 'music' AND ended_at IS NULL
                                       ORDER BY started_at DESC LIMIT 1) p ON TRUE
@@ -128,7 +128,8 @@ def next_song(cur, station, slot=None):
     state = (on_air and on_air['state']) or {}
     if not on_air or state.get('queue') or state.get('automation') is not True:
         return None, None
-    cur.execute("""SELECT key, duration_s, trail_s, lead_in_s, count(*) OVER () AS n FROM library
+    cur.execute("""SELECT key, duration_s, COALESCE(trail_set_s, trail_s) AS trail_s,
+                          COALESCE(lead_set_s, lead_in_s) AS lead_in_s, count(*) OVER () AS n FROM library
                    WHERE station = %s AND present AND NOT unsupported AND kind = 'music' AND key IS DISTINCT FROM %s
                      AND lower(COALESCE(artist, '')) NOT IN (
                          SELECT lower(artist) FROM (SELECT artist FROM play_log WHERE station = %s AND kind = 'music'
