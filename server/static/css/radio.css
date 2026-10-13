@@ -237,6 +237,7 @@ table.plays { width: 100%; border-collapse: collapse; font-size: 13px; }
 .rule { display: inline-flex; gap: 6px; align-items: center; }
 .rule select, .rule input { padding: 4px 8px; font-size: 12px; }
 .rule input { width: 64px; }
+.lib-totals { margin-top: 10px; font: 12px var(--mono); color: var(--text-dim); text-align: right; }
 .slots { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; font: 11px var(--mono); }
 .slots span { padding: 0 5px; border-radius: 3px; border: 1px solid var(--border); color: var(--text-dim); }
 .slots .done { color: var(--text-muted); text-decoration: line-through; border-color: transparent; }

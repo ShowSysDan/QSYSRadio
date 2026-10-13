@@ -8,9 +8,11 @@ fall due every 3.75 min in turn (:02, :06, :09, :13, :17 ...), not all at
 once. A slot is owed from its time for its window (10 min, or half the gap
 to the ad's next slot if shorter); the Core starts a break at the next song
 change while one is owed. A slot that cannot play in its window (station
-stopped, a long song) is skipped, not made up later in the hour. To land
-breaks on time the server also names a "fill" song: the next song (after the
-one on air) chosen by length so the song change falls just after the next slot.
+stopped, a long song) is skipped, not made up later in the hour.
+
+The server also names the next song (next_song): normally a random one of
+the least recently played, so every song gets airtime; near an ad slot the
+one whose length makes the song change fall just after the slot opens.
 """
 import hashlib
 import json
@@ -22,7 +24,7 @@ from .db import text
 from .events import BadRequest
 
 MODES = ('mix', 'hourly', 'off')
-FIT_SAMPLE = 40            # songs considered when fitting the rotation to an ad slot
+POOL = 40                  # at most this many least recently played songs to pick the next one from
 FIT_MAX_LATE_S = 120       # no fill when even the best choice lands later than this
 PER_HOUR_MAX = 30
 
@@ -86,42 +88,56 @@ def _setting(cur, name):
     return core_settings.load(cur).get(name, core_settings.BY_NAME[name][7])
 
 
-def fill(cur, station, slot_at):
-    """The song to play after the one on air so the break lands soon after
-    the next ad slot opens (slot_at), or None. Looks two songs ahead: the
-    candidate's own end, or the best follow-up's end. Candidates: a sample of
-    present music with a known length, not played in the last hour, keeping
-    artist separation; the sample is seeded by the play on air, so the pick
-    is stable while that song plays. Only when the operator queue is empty."""
-    cur.execute("""SELECT p.id, p.started_at, p.duration_s, l.trail_s, s.state
+def next_song(cur, station, slot_at=None):
+    """The song the Core should play after the one on air: (key, why) or (None, None).
+
+    Rotation: a random one of the least recently played quarter of the
+    eligible songs (never played first; at most POOL), keeping artist
+    separation, so every song airs within about 1¼ passes of the library,
+    rescans and Core restarts notwithstanding. 'ad': when the next per-hour
+    slot (slot_at) is within two songs, the one of the oldest half whose end
+    (or the best follow-up's end) falls soonest after the slot opens. Stable while one
+    song plays (seeded by its play). None when the operator queue has songs,
+    automation is off or nothing qualifies."""
+    cur.execute("""SELECT s.state, p.id, p.started_at, p.duration_s, l.trail_s, l.key
                    FROM stations s
-                   JOIN play_log p ON p.station = s.station AND p.kind = 'music' AND p.ended_at IS NULL
+                   LEFT JOIN LATERAL (SELECT * FROM play_log WHERE station = s.station AND kind = 'music' AND ended_at IS NULL
+                                      ORDER BY started_at DESC LIMIT 1) p ON TRUE
                    LEFT JOIN library l ON l.station = p.station AND l.key = COALESCE(p.directory, '') || p.file
-                   WHERE s.station = %s ORDER BY p.started_at DESC LIMIT 1""", (station,))
+                   WHERE s.station = %s""", (station,))
     on_air = cur.fetchone()
     state = (on_air and on_air['state']) or {}
-    if not on_air or not on_air['duration_s'] or state.get('queue') or state.get('automation') is not True:
-        return None
+    if not on_air or state.get('queue') or state.get('automation') is not True:
+        return None, None
+    cur.execute("""SELECT key, duration_s, trail_s, count(*) OVER () AS n FROM library
+                   WHERE station = %s AND present AND NOT unsupported AND kind = 'music' AND key IS DISTINCT FROM %s
+                     AND lower(COALESCE(artist, '')) NOT IN (
+                         SELECT lower(artist) FROM (SELECT artist FROM play_log WHERE station = %s AND kind = 'music'
+                                                    ORDER BY started_at DESC LIMIT %s) a WHERE artist IS NOT NULL)
+                   ORDER BY last_played NULLS FIRST, key LIMIT %s""",
+                (station, on_air['key'], station, int(_setting(cur, 'artist_separation')), POOL))
+    oldest = cur.fetchall()
+    if not oldest:
+        return None, None
+    seed, n = str(on_air['id']), oldest[0]['n']
+
+    def shuffled(share):               # the least recently played `share` of the eligible songs, in a stable random order
+        return sorted(oldest[:max(1, min(POOL, int(n * share)))],
+                      key=lambda r: hashlib.md5((r['key'] + seed).encode()).hexdigest())
+    fit = _fit(cur, on_air, shuffled(0.5), slot_at) if slot_at and on_air['duration_s'] else None
+    return (fit, 'ad') if fit else (shuffled(0.25)[0]['key'], 'rotation')
+
+
+def _fit(cur, on_air, pool, slot_at):
+    """The pool song that lands the break soonest after slot_at, or None."""
     xfade = float(_setting(cur, 'crossfade_s'))
 
     def air(duration, trail):          # start to the next item's start: crossfade early by the learned tail
         return duration - xfade - (trail or 0)
     gap = (slot_at - on_air['started_at']).total_seconds() - air(on_air['duration_s'], on_air['trail_s'])
-    if gap <= 0:
-        return None
-    cur.execute("""SELECT l.key, l.duration_s, l.trail_s FROM library l
-                   WHERE l.station = %s AND l.present AND l.kind = 'music' AND NOT l.unsupported AND l.duration_s > 0
-                     AND NOT EXISTS (SELECT 1 FROM play_log p WHERE p.station = l.station AND p.kind = 'music'
-                                       AND p.started_at > NOW() - INTERVAL '1 hour'
-                                       AND COALESCE(p.directory, '') || p.file = l.key)
-                     AND lower(COALESCE(l.artist, '')) NOT IN (
-                         SELECT lower(artist) FROM (SELECT artist FROM play_log WHERE station = %s AND kind = 'music'
-                                                    ORDER BY started_at DESC LIMIT %s) a WHERE artist IS NOT NULL)
-                   ORDER BY md5(l.key || %s) LIMIT %s""",
-                (station, station, int(_setting(cur, 'artist_separation')), str(on_air['id']), FIT_SAMPLE))
-    cands = [(r['key'], air(r['duration_s'], r['trail_s'])) for r in cur.fetchall()]
-    if not cands or gap > 2 * max(length for _, length in cands):
-        return None                    # too far off: ordinary rotation for now
+    cands = [(r['key'], air(r['duration_s'], r['trail_s'])) for r in pool if r['duration_s']]
+    if gap <= 0 or not cands or gap > 2 * max(length for _, length in cands):
+        return None                    # the break comes anyway, or too far off to plan
 
     def late(i):
         length = cands[i][1]
@@ -134,8 +150,8 @@ def fill(cur, station, slot_at):
 
 
 def plan(cur, station):
-    """({'due': [keys, longest waiting first], 'mix': [keys], 'fill': key of the
-    song to play next so the next ad slot is met, if any}, rev) for the Core."""
+    """({'due': [keys, longest waiting first], 'mix': [keys], 'next': key of the
+    song to play next, 'next_why': 'rotation' | 'ad'}, rev) for the Core."""
     rows, hour_start = schedule(cur, station)
     rows = rows.values()
     mix = [r['key'] for r in rows if r['mode'] == 'mix']
@@ -143,9 +159,9 @@ def plan(cur, station):
     upcoming = [m for r in rows for m, st in zip(r.get('slots', ()), r.get('states', ())) if st == 'next']
     upcoming += [r['slots'][0] + 60 for r in rows if r.get('slots')]           # the next hour's first ones
     out = {'due': [k for _, k in due], 'mix': mix}
-    song = upcoming and fill(cur, station, hour_start + timedelta(minutes=min(upcoming)))
+    song, why = next_song(cur, station, hour_start + timedelta(minutes=min(upcoming)) if upcoming else None)
     if song:
-        out['fill'] = song
+        out['next'], out['next_why'] = song, why
     return out, hashlib.sha1(json.dumps(out).encode()).hexdigest()[:12]
 
 

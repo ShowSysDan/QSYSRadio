@@ -122,8 +122,10 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   then ads owed this hour (the server's plan), then mix-ins (shuffled, not
   the last break's when there is a choice). Without a plan from the server
   (standalone, or before the first sync) every ad is a mix-in.
-- **Rotation.** Shuffle bag with artist separation; the operator queue comes
-  first.
+- **Rotation.** The operator queue first, then the song the server names
+  (see [Rotation](#rotation-every-song-gets-played)); without one (server
+  unreachable) a local shuffle bag with artist separation, which a rescan
+  does not restart.
 - **Learning** (kept on the server, `library` table): duration, lead-in,
   minimum trailing silence, peak at unity. A file the player cannot play
   ("Unsupported…") is remembered there until its size changes; any other
@@ -909,7 +911,8 @@ MockCore scenarios and `live_core.py`.
   Start); both decks live; the queue (reorder, remove, clear);
   activity (every command, who sent it, and the Core's answer); recent plays.
 - **Library:** music, imaging and ads; search, sort (artist, title, most /
-  least recently played), Play next, Queue, Play now; imaging files: Bumper
+  least recently played), length and length without the measured leading /
+  trailing silence, totals for the list, Play next, Queue, Play now; imaging files: Bumper
   now; ads: Play now and the schedule (Mix in / Per hour with the count /
   Off) with plays this hour and today. Rescan. The list reloads by itself
   after the Core uploads a new scan and whenever something new plays.
@@ -996,15 +999,23 @@ with no row is mixed in.
 | Per hour, N | N slots each clock hour (server time), evenly spaced. Ads on a per-hour schedule are staggered so they fall due in turn (four ads at 4 an hour: one every 3¾ min, :02, :06, :09, :13 …), not together. A slot is owed from its time for its window (10 min, or half the gap to that ad's next slot if shorter) and starts a break at the next song change. A slot that cannot play in its window (station stopped, a long song) is **missed**: skipped, never made up later in the hour. The Library shows each ad's slots this hour: played, owed now, missed, to come |
 | Off | never |
 
-**Landing breaks on time.** The server also knows every song's length and
-trailing silence (kept per file in `library`, even while a file is out of
-the folder) and when the song on air started. When the next per-hour slot is
-within two songs, it picks the song to play after the current one, from a
-sample of 40 not played in the last hour and keeping artist separation, so
-that the song change (and with it the break) falls just after the slot opens:
-that song alone, or that song plus the best follow-up. The dashboard tags it
-**FOR AD** under Up next. The operator queue always wins; the Core just plays
-the named song next (and its own shuffle when the server is unreachable).
+### Rotation: every song gets played
+
+The server names the song to play after the one on air; the Core plays it
+next (the operator queue always wins) and falls back to its own shuffle only
+when the server is unreachable.
+
+- **Normally** a random one of the least recently played quarter of the music
+  (at most 40 songs; never-played songs first), keeping artist separation. A
+  song therefore airs within about 1¼ passes through the library, whatever
+  rescans, folder changes or Core restarts happen (`library.last_played`).
+- **Near an ad slot.** The server knows every song's length and trailing
+  silence (kept per file in `library`, even while a file is out of the
+  folder) and when the song on air started. When the next per-hour slot is
+  within two songs, it picks from the least recently played half the song
+  that makes the song change (and with it the break) fall just after the
+  slot opens: that song alone, or with the best follow-up. Up next shows it
+  as **FOR AD**.
 
 ## Syslog
 

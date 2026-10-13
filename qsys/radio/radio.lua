@@ -173,7 +173,9 @@ function Library.scan()
     Library[kind] = listAudio(SETTINGS[KINDS[kind].dir], kind)
     for _, tr in ipairs(Library[kind]) do Library.byKey[tr.key] = tr end
   end
-  Station.refillBag()
+  local keep = {}                      -- keep the shuffle cycle going (new files join at the next refill)
+  for _, tr in ipairs(Station.bag) do keep[#keep + 1] = Library.byKey[tr.key] end
+  Station.bag = keep
   Server.libraryDirty = true
   STATE_REV = STATE_REV + 1
   if #Library.music > 0 and Station.emptyNoted then   -- music is back: play now, not after the back-off
@@ -386,7 +388,7 @@ Station = {
   nextBumper = nil,        -- operator-chosen bumper for the next bumper slot
   nextAd = nil,            -- operator-chosen ad for the next break
   breakList = {},          -- the rest of the break that is playing (ads, then a bumper)
-  adPlan = nil,            -- from the server: { due = {keys owed now}, mix = {keys}, fill = key }; nil = mix every ad
+  adPlan = nil,            -- from the server: { due = {ads owed now}, mix = {ads}, next = song, why = "rotation"|"ad" }
   armed = nil,             -- the crossfade timer's target (deck + play start)
 }
 
@@ -409,16 +411,16 @@ local function bagChoice()
   return #Station.bag                  -- nothing satisfies separation; take one anyway
 end
 
--- the next song (operator queue, then the server's fill for the next ad slot, then the rotation),
--- whether it was queued, whether it is the fill; take = remove it
+-- the next song (operator queue, then the server's pick, then the local shuffle bag),
+-- whether it was queued, and why the server picked it; take = remove it
 function Station.nextSong(take)
   local q, plan = Station.queue, Station.adPlan
   while q[1] and not Library.byKey[q[1].key] do table.remove(q, 1) end
   if q[1] then return take and table.remove(q, 1) or q[1], true end
-  local fill, last = plan and Library.byKey[plan.fill or ""], Station.history[#Station.history]
-  if fill and fill.kind == "music" and fill ~= last then   -- a stale plan may still name the song just played
-    if take then plan.fill, Server.adsRev = nil, ""; removeKey(Station.bag, fill.key) end
-    return fill, false, true
+  local pick, last = plan and Library.byKey[plan.next or ""], Station.history[#Station.history]
+  if pick and pick.kind == "music" and pick ~= last then   -- a stale plan may still name the song just played
+    if take then plan.next, Server.adsRev = nil, ""; removeKey(Station.bag, pick.key) end
+    return pick, false, plan.why
   end
   if #Library.music == 0 then return nil end
   local i = bagChoice()
@@ -869,9 +871,9 @@ function Station.snapshot(t)
     info.duration = d.duration and round(d.duration, 1) or info.duration
     return info
   end
-  local nxt, queued, fill = Station.nextSong()
+  local nxt, queued, why = Station.nextSong()
   local nextUp = trackInfo(nxt)
-  if nextUp then nextUp.queued, nextUp.fill = queued, fill end
+  if nextUp then nextUp.queued, nextUp.pick = queued, why end
   local queue = {}
   for i, q in ipairs(Station.queue) do queue[i] = trackInfo(q) end
   return {
@@ -977,7 +979,8 @@ function Server.applyAdPlan(p, rev)
     for _, k in ipairs(type(list) == "table" and list or {}) do if type(k) == "string" then out[#out + 1] = k end end
     return out
   end
-  Station.adPlan = { due = keys(p.due), mix = keys(p.mix), fill = type(p.fill) == "string" and p.fill or nil }
+  Station.adPlan = { due = keys(p.due), mix = keys(p.mix), next = type(p.next) == "string" and p.next or nil,
+                     why = tostring(p.next_why or "") }
   Server.adsRev = tostring(rev or "")
   STATE_REV = STATE_REV + 1
 end

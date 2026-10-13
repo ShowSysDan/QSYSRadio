@@ -168,6 +168,19 @@ MockCore.run(60)
 local after = outboxFile()
 check(after and #after == 0 and #Server.outbox == 0, "emptied once delivered")
 
+print("-- rescans do not restart the shuffle: every song plays (no server)")
+local many = {}
+for i = 1, 24 do many[i] = { name = string.format("Artist%d - Song%02d.mp3", i % 8, i), duration = 20 + (i * 7) % 15, level = -10 } end
+boot(many, {})
+SETTINGS.bumper_every_n_tracks = 0
+for t = 60, 1200, 75 do MockCore.at(t, function() Library.scan() end) end
+MockCore.run(1260)
+local heard = {}
+for _, e in ipairs(evs("track_start")) do heard[e.file] = true end
+local missing = 0
+for _, tr in ipairs(many) do if not heard[tr.name] then missing = missing + 1 end end
+check(missing == 0, string.format("all 24 songs played in %d plays with a rescan every 75 s (%d never)", count("track_start"), missing))
+
 print("-- lightweight: fast timer only while fading/loading")
 boot(songs(6, 60), BUMPERS)
 SETTINGS.bumper_every_n_tracks = 0

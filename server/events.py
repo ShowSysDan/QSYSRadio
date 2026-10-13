@@ -91,9 +91,9 @@ def _apply(cur, station, ev):
                        ON CONFLICT (station, boot, start_seq) DO NOTHING""",
                     (station, START_KINDS[kind], file, directory, text(ev.get('artist'), 500),
                      text(ev.get('title'), 500), text(ev.get('deck'), 10), ev['_at'], duration, ev['boot'], ev['seq']))
-        if duration:
-            cur.execute('UPDATE library SET duration_s = %s WHERE station = %s AND key = %s',
-                        (duration, station, directory + file))
+        cur.execute("""UPDATE library SET duration_s = COALESCE(%s, duration_s),
+                           last_played = GREATEST(last_played, %s) WHERE station = %s AND key = %s""",
+                    (duration or None, ev['_at'], station, directory + file))
     elif kind in END_KINDS:
         # the newest open play on that deck (same file when the Core sent one)
         file = text(ev.get('file'), 500)

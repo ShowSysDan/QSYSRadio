@@ -85,7 +85,8 @@
   }
 
   const srcTag = (n) => n && n.queued ? '<span class="src queue">QUEUE</span>'
-    : (n && n.fill ? '<span class="src fill" title="Picked by length so the next ad break lands on time">FOR AD</span>' : '<span class="src rotation">ROTATION</span>');
+    : (n && n.pick === 'ad' ? '<span class="src fill" title="Picked by length so the next ad break lands on time">FOR AD</span>'
+      : '<span class="src rotation" title="' + (n && n.pick ? 'One of the least recently played songs' : 'The Core\'s own shuffle') + '">ROTATION</span>');
 
   function renderKpis() {
     const s = last && last.station, st = core(), lv = liveDeck(st);

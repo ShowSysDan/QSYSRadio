@@ -31,7 +31,7 @@ local function plan()
   local due = (MockCore.clock >= DUE_FROM and hourlyPlays == 0) and { HOURLY } or {}
   local fill = (MockCore.clock >= FILL_FROM and MockCore.clock < FILL_TO) and FILL
                or (MockCore.clock >= 300 and MockCore.clock < 330 and "Test/Tuning/Gone.flac") or nil
-  return { due = due, mix = { "Ads/mix1.wav", "Ads/mix2.wav" }, fill = fill }, "p" .. #due .. tostring(fill)
+  return { due = due, mix = { "Ads/mix1.wav", "Ads/mix2.wav" }, next = fill, next_why = fill and "ad" }, "p" .. #due .. tostring(fill)
 end
 local fillSeen
 MockCore.at(FILL_FROM + 5, function() fillSeen = Station.snapshot(Timer.Now()).next_up end)
@@ -124,7 +124,7 @@ local songsAfterFill = {}
 for _, x in ipairs(seq) do if x.k == "S" and x.e.at > FILL_FROM then songsAfterFill[#songsAfterFill + 1] = x.e.file end end
 local fillPlays = 0
 for _, x in ipairs(seq) do if x.k == "S" and x.e.at > FILL_FROM and x.e.file == "H - Song8.flac" then fillPlays = fillPlays + 1 end end
-check(songsAfterFill[1] == "H - Song8.flac" and fillPlays == 1 and fillSeen and fillSeen.fill and fillSeen.file == "H - Song8.flac",
+check(songsAfterFill[1] == "H - Song8.flac" and fillPlays == 1 and fillSeen and fillSeen.pick == "ad" and fillSeen.file == "H - Song8.flac",
   "the server's fill song plays next (shown as such), once")
 
 local paired = #ads == #adEnds or #ads == #adEnds + 1

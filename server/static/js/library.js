@@ -12,7 +12,7 @@
   };
   const NOUN = { music: 'songs', imaging: 'imaging files', ad: 'ads' };
   const HEAD = {
-    music: ['Artist – Title', 'Length', 'Plays', 'Last played', ''],
+    music: ['Artist – Title', 'Length', 'Without silence', 'Plays', 'Last played', ''],
     imaging: ['Artist – Title', 'Length', 'Plays', 'Last played', ''],
     ad: ['Artist – Title', 'Length', 'Schedule', 'This hour', 'Today', 'Last played', ''],
   };
@@ -46,6 +46,14 @@
       ' title="Plays per clock hour"></span>';
   }
 
+  // length without the quiet start and end the Core measured on earlier plays
+  function audible(it) {
+    const lead = R.num(it.lead_in_s), trail = R.num(it.trail_s);
+    if (!R.num(it.duration_s) || (lead == null && trail == null)) return '<td class="num">–</td>';
+    return '<td class="num" title="quiet start ' + (lead || 0).toFixed(1) + ' s, quiet end ' + (trail || 0).toFixed(1) + ' s">' +
+      R.clock(it.audible_s) + '</td>';
+  }
+
   function row(it) {
     const name = esc(R.whoLine(it)) + (it.unsupported ? ' <span class="tag bad" title="The player cannot load this file">unsupported</span>' : '') +
       '<span class="file">' + esc(it.directory + it.file) + '</span>';
@@ -54,7 +62,7 @@
     const cells = it.kind === 'ad'
       ? len + '<td>' + schedule(it) + slots(it) + '</td><td class="num">' + (R.num(it.plays_hour) || 0) + (it.mode === 'hourly' ? ' / ' + esc(it.per_hour) : '') +
         '</td><td class="num">' + (R.num(it.plays_today) || 0) + '</td>' + last
-      : len + '<td class="num">' + (R.num(it.plays) || 0) + '</td>' + last;
+      : len + (it.kind === 'music' ? audible(it) : '') + '<td class="num">' + (R.num(it.plays) || 0) + '</td>' + last;
     return '<tr data-key="' + esc(it.key) + '" data-label="' + esc(R.whoLine(it)) + '"><td>' + name + '</td>' + cells + '<td class="acts">' + actions(it) + '</td></tr>';
   }
 
@@ -85,6 +93,10 @@
       offset += d.items.length;
       $('lib-more').hidden = offset >= d.total;
       $('lib-info').textContent = d.total + ' ' + NOUN[kind] + (d.station ? ' on ' + d.station : '');
+      const t = d.totals || {};
+      $('lib-totals').textContent = !t.n ? '' : (q ? 'Matching: ' : 'Total: ') + t.n + ' ' + NOUN[kind] + ' · ' + R.clock(t.duration_s) +
+        (kind === 'music' ? ' (' + R.clock(t.audible_s) + ' without leading / trailing silence)' : '') +
+        (t.unknown ? ' · ' + t.unknown + ' not measured yet (length known once played)' : '');
     } catch (e) {
       if (my === seq) R.toast('Library: ' + e.message, 'bad');
     } finally {
