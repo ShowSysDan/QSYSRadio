@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, g, jsonify, redirect, render_template, request, session, url_for
 
-from . import auth, config, control, db, logs, plays
+from . import ads, auth, config, control, db, logs, plays
 from .events import BadRequest
 from .migrate import discover
 
@@ -229,9 +229,9 @@ def core_sync():
 @app.post('/api/v1/core/library')
 @core_endpoint
 def core_library():
-    count, line = control.core_library(dbconn(), _json_body())
+    count, learned, line = control.core_library(dbconn(), _json_body())
     write_logs([line])
-    return jsonify(ok=True, items=count)
+    return jsonify(ok=True, items=count, learned=learned)
 
 
 # ── Web API (signed in) ──────────────────────────────────────────────────────
@@ -275,6 +275,18 @@ def get_library():
     return jsonify(ok=True, station=station, total=total, items=items)
 
 
+@app.post('/api/v1/ads')
+@auth.operator_required
+def post_ad_rule():
+    """{station, key, mode: mix|hourly|off, per_hour} -> the ad's schedule."""
+    body = _json_body()
+    station = _station(body.get('station'))
+    if not station:
+        raise BadRequest('no station has connected yet')
+    write_logs([ads.save_rule(dbconn(), station, body, auth.current_user())])
+    return jsonify(ok=True)
+
+
 @app.get('/api/v1/settings')
 @auth.login_required
 def get_settings():
@@ -302,11 +314,11 @@ def _play_query(fn, *args):
 @app.get('/api/v1/plays')
 @auth.login_required
 def get_plays():
-    """?from=&to= (ISO; default the last 24 h) &q= &kind=music|imaging &station= &limit="""
+    """?from=&to= (ISO; default the last 24 h) &q= &kind=music|imaging|ad &station= &limit="""
     now = datetime.now(timezone.utc)
     kind = _arg('kind')
-    if kind not in (None, 'music', 'imaging'):
-        raise BadRequest('kind must be music or imaging')
+    if kind not in (None,) + control.KINDS:
+        raise BadRequest('kind must be music, imaging or ad')
     rows = _play_query(plays.between, _arg('from', (now - timedelta(days=1)).isoformat()),
                        _arg('to', (now + timedelta(minutes=1)).isoformat()), _arg('q'), kind,
                        _int_arg('limit', 500, 1, 5000))

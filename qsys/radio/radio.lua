@@ -14,8 +14,8 @@ CFG = {
 }
 
 SETTINGS = {
-  music_dir = "Test/Tuning/", imaging_dir = "Test/Imaging/",
-  play_gain_db = 0, imaging_gain_db = 0,
+  music_dir = "Test/Tuning/", imaging_dir = "Test/Imaging/", ads_dir = "",
+  play_gain_db = 0, imaging_gain_db = 0, ad_gain_db = 0, ad_every_n_tracks = 0, ads_per_break = 2,
   crossfade_s = 4, fade_in_s = 0, skip_fade_s = 1.5, silence_fade_s = 1, stop_fade_s = 2, bumper_fade_s = 2,
   silence_threshold_dbfs = -50, silence_hold_s = 2, end_guard_s = 20,
   bumper_every_n_tracks = 4, bumper_tail_s = 1, artist_separation = 2, dead_air_s = 1.5,
@@ -26,13 +26,19 @@ for k, v in pairs(SETTINGS) do DEFAULTS[k] = v end
 -- internals (not settings)
 local K = {
   floor_db = -100, tick_s = 0.25, fast_s = 0.05, load_timeout_s = 1.5, chores_s = 30, log_ring = 200,
-  sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000,
-  learned_save_s = 300, outbox_save_s = 30,
+  sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000, outbox_save_s = 30,
 }
-FILES = { learned = "media/_radio/learned.json", outbox = "media/_radio/outbox.json",
-          settings = "media/_radio/settings.json", state = "media/_radio/state.json" }
+-- only what must survive a reboot while the server is unreachable; everything else lives on the server
+FILES = { outbox = "media/_radio/outbox.json", settings = "media/_radio/settings.json" }
 
 SUPPORTED_EXT = { flac = true, mp3 = true, wav = true, aac = true, m4a = true, ogg = true, aif = true, aiff = true }
+-- per kind: folder setting, level setting, event prefix
+KINDS = {
+  music = { dir = "music_dir", gain = "play_gain_db", event = "track" },
+  imaging = { dir = "imaging_dir", gain = "imaging_gain_db", event = "bumper" },
+  ad = { dir = "ads_dir", gain = "ad_gain_db", event = "ad" },
+}
+KIND_ORDER = { "music", "imaging", "ad" }
 
 -- ── UTILITIES ─────────────────────────────────────────────────────────────────
 -- RapidJSON first: Q-SYS recommends it for large data (no execution-count limit)
@@ -64,6 +70,15 @@ local function push(list, item, max)
   list[#list + 1] = item
   if #list > max then table.remove(list, 1) return true end
   return false
+end
+local function shuffled(list)
+  local out = {}
+  for i, v in ipairs(list) do
+    local j = math.random(i)
+    out[i] = out[j]
+    out[j] = v
+  end
+  return out
 end
 
 LOG = {}
@@ -154,12 +169,10 @@ local function emit(kind, data)
   if UI then UI.lastEvent = kind end
 end
 
--- ── LEARNED PER-FILE DATA (persisted on the Core) ─────────────────────────────
-LEARNED = {}
-Learned = Store.new(FILES.learned, K.learned_save_s, function() return LEARNED end)
-
 -- ── LIBRARY ───────────────────────────────────────────────────────────────────
-Library = { music = {}, imaging = {}, byKey = {}, root = "Audio/" }
+-- per file: { trail = s, unsupported = true }, from the server after each upload + this boot's plays
+LEARNED = {}
+Library = { music = {}, imaging = {}, ad = {}, byKey = {}, root = "Audio/" }
 
 local function mediaPath(dirRel)
   return (("media/" .. Library.root .. "/" .. dirRel):gsub("/+", "/"))
@@ -196,11 +209,10 @@ end
 
 function Library.scan()
   Library.root = normDir(DeckA.c.root.String ~= "" and DeckA.c.root.String or "Audio/")
-  Library.music = listAudio(SETTINGS.music_dir, "music")
-  Library.imaging = listAudio(SETTINGS.imaging_dir, "imaging")
   Library.byKey = {}
-  for _, list in ipairs({ Library.music, Library.imaging }) do
-    for _, tr in ipairs(list) do Library.byKey[tr.key] = tr end
+  for _, kind in ipairs(KIND_ORDER) do
+    Library[kind] = listAudio(SETTINGS[KINDS[kind].dir], kind)
+    for _, tr in ipairs(Library[kind]) do Library.byKey[tr.key] = tr end
   end
   Station.refillBag()
   Server.libraryDirty = true
@@ -209,8 +221,8 @@ function Library.scan()
     Station.emptyNoted = false
     if Station.automation and not (DeckA:isBusy() or DeckB:isBusy()) then Station.kick() end
   end
-  log("library: %d music in %s, %d imaging in %s", #Library.music, mediaPath(SETTINGS.music_dir),
-    #Library.imaging, mediaPath(SETTINGS.imaging_dir))
+  log("library: %d music in %s, %d imaging in %s, %d ads in %s", #Library.music, mediaPath(SETTINGS.music_dir),
+    #Library.imaging, mediaPath(SETTINGS.imaging_dir), #Library.ad, mediaPath(SETTINGS.ads_dir))
 end
 
 local function removeKey(list, key)
@@ -218,10 +230,24 @@ local function removeKey(list, key)
 end
 
 function Library.remove(track)
-  removeKey(track.kind == "imaging" and Library.imaging or Library.music, track.key)
+  removeKey(Library[track.kind], track.key)
   removeKey(Station.queue, track.key)
   removeKey(Station.bag, track.key)
   Library.byKey[track.key] = nil
+end
+
+-- the server's per-file figures (reply to the library upload)
+function Library.learn(map)
+  if type(map) ~= "table" then return end
+  for key, v in pairs(map) do
+    if type(v) == "table" then
+      local L, trail = LEARNED[key] or {}, tonumber(v.trail)
+      if trail then L.trail = math.min(L.trail or trail, trail) end
+      if v.unsupported == true then L.unsupported = true end
+      LEARNED[key] = L
+      if L.unsupported and Library.byKey[key] then Library.remove(Library.byKey[key]) end
+    end
+  end
 end
 
 -- ── DECK ──────────────────────────────────────────────────────────────────────
@@ -295,6 +321,7 @@ function Deck:pollLoad(t)
   self.pending, self.loadCb = nil, nil
   if result == true then
     self.track, self.duration, self.state = pending, rem, "ready"
+    pending.duration = round(rem, 1)
     if cb then cb(self, true) end
   else
     self.state = "idle"
@@ -399,26 +426,24 @@ end
 
 -- ── STATION ───────────────────────────────────────────────────────────────────
 Station = {
-  state = "idle",          -- idle | playing | crossfading | bumper | off
-  live = nil, other = nil, bumperDeck = nil, freeDeck = nil,
-  tracksSinceBumper = 0, history = {}, bag = {}, lastBumper = nil,
-  skipRequested = false, bumperRequested = false, automation = true,
+  state = "idle",          -- idle | playing | crossfading | bumper | ad | off
+  live = nil, other = nil, spotDeck = nil, freeDeck = nil,
+  tracksSinceBumper = 0, tracksSinceAd = 0,   -- songs started since the last bumper / ad
+  history = {}, bag = {}, lastBumper = nil, lastAds = {},
+  skipRequested = false, bumperRequested = false, adRequested = false, automation = true,
   nowPlaying = nil, idleSince = nil, ticks = 0,
   queue = {},              -- operator "play next" list (music), consulted before the bag
   stopAfter = false,       -- stop when the current track ends (no next track)
   nextBumper = nil,        -- operator-chosen bumper for the next bumper slot
+  nextAd = nil,            -- operator-chosen ad for the next break
+  breakList = {},          -- the rest of the break that is playing (ads, then a bumper)
+  adPlan = nil,            -- from the server: { due = {keys owed this hour}, mix = {keys} }; nil = mix every ad
   armed = nil,             -- the crossfade timer's target (deck + play start)
 }
 
-function Station.refillBag()
-  local bag = {}
-  for i, tr in ipairs(Library.music) do
-    local j = math.random(i)
-    bag[i] = bag[j]
-    bag[j] = tr
-  end
-  Station.bag = bag
-end
+local function isSpot(state) return state == "bumper" or state == "ad" end
+
+function Station.refillBag() Station.bag = shuffled(Library.music) end
 
 -- index in the bag of the track the rotation would play next
 local function bagChoice()
@@ -462,34 +487,76 @@ function Station.pickBumper()
   return b
 end
 
+local function adPool()
+  if not Station.adPlan then return Library.ad end
+  local pool = {}
+  for _, k in ipairs(Station.adPlan.mix) do pool[#pool + 1] = Library.byKey[k] end
+  return pool
+end
+
+-- the ads for a break due now, or nil: the operator's pick, then ads owed this
+-- hour, then (at a regular break) mix-ins, up to ads_per_break
+local function adBreak()
+  local list, seen = {}, {}
+  local function add(tr)
+    if tr and tr.kind == "ad" and Library.byKey[tr.key] and not seen[tr.key] and #list < SETTINGS.ads_per_break then
+      seen[tr.key] = true
+      list[#list + 1] = tr
+    end
+  end
+  add(Station.nextAd)
+  local due = Station.adPlan and Station.adPlan.due or {}
+  for _, k in ipairs(due) do add(Library.byKey[k]) end
+  if Station.adRequested or (SETTINGS.ad_every_n_tracks > 0 and Station.tracksSinceAd >= SETTINGS.ad_every_n_tracks) then
+    local pool = shuffled(adPool())
+    for pass = 1, 2 do                 -- the last break's ads only when there is nothing else
+      for _, tr in ipairs(pool) do if pass == 2 or not Station.lastAds[tr.key] then add(tr) end end
+    end
+  end
+  Station.nextAd, Station.adRequested = nil, false
+  if #list == 0 then return nil end
+  Station.lastAds = seen
+  if Station.adPlan then               -- played ads leave the plan; ask the server for a fresh one
+    local keep = {}
+    for _, k in ipairs(due) do if not seen[k] then keep[#keep + 1] = k end end
+    Station.adPlan.due, Server.adsRev = keep, ""
+  end
+  return list
+end
+
+-- what plays between this song and the next: ads (if due), then a bumper (if due)
+local function planBreak()
+  local spots = adBreak() or {}
+  if Station.bumperRequested or
+     (SETTINGS.bumper_every_n_tracks > 0 and Station.tracksSinceBumper >= SETTINGS.bumper_every_n_tracks) then
+    spots[#spots + 1] = Station.pickBumper()
+  end
+  return #spots > 0 and spots or nil
+end
+
 -- requests only make sense while running: never carry them across a stop
 local function clearRequests()
   Station.skipRequested, Station.bumperRequested, Station.nextBumper, Station.stopAfter = false, false, nil, false
+  Station.adRequested, Station.nextAd, Station.breakList = false, nil, {}
 end
 
 function Station.finishTrack(d, reason)
   local tr = d.track
   if not tr then return end
   d.track = nil                        -- finish each play exactly once
-  local played = d.playStart and round(now() - d.playStart, 1) or nil
-  if tr.kind ~= "music" then
-    emit("bumper_end", { deck = d.id, file = tr.name, dir = tr.dir, reason = reason, played = played })
-    return
+  local ev = { deck = d.id, file = tr.name, dir = tr.dir, reason = reason,
+               played = d.playStart and round(now() - d.playStart, 1) or nil }
+  if tr.kind == "music" then           -- this play's measurements; the server keeps them per file
+    if d.firstAudioAt and d.playStart then ev.lead_in = round(d.firstAudioAt - d.playStart, 2) end
+    if (reason == "end" or reason == "silence" or reason == "eof") and d.lastAudioAt and d.playStart and d.duration then
+      ev.trail = round(math.max(0, d.duration - (d.lastAudioAt - d.playStart)), 2)
+      local L = LEARNED[tr.key] or {}
+      L.trail = math.min(L.trail or ev.trail, ev.trail)
+      LEARNED[tr.key] = L
+    end
+    if d.peakMax then ev.peak = round(d.peakMax, 1) end
   end
-  local L = LEARNED[tr.key] or {}
-  L.duration = d.duration and round(d.duration, 2) or L.duration
-  L.plays = (L.plays or 0) + 1
-  if d.firstAudioAt and d.playStart then L.lead_in_s = round(d.firstAudioAt - d.playStart, 2) end
-  if (reason == "end" or reason == "silence" or reason == "eof") and d.lastAudioAt and d.playStart and d.duration then
-    local trail = round(math.max(0, d.duration - (d.lastAudioAt - d.playStart)), 2)
-    L.trail_s = L.trail_s and math.min(L.trail_s, trail) or trail
-  end
-  if d.peakMax then L.peak_dbfs = round(d.peakMax, 1) end
-  L.last_played = utc()
-  LEARNED[tr.key] = L
-  Learned:touch()
-  emit("track_end", { deck = d.id, file = tr.name, dir = tr.dir, reason = reason, played = played,
-    lead_in = L.lead_in_s, trail = L.trail_s, peak = L.peak_dbfs })
+  emit(KINDS[tr.kind].event .. "_end", ev)
 end
 
 local function fadeAndFinish(d, seconds, reason)
@@ -508,31 +575,33 @@ function Station.startTrack(deck, track, opts, attempt)
     if not ok then
       local permanent = startsWith(err, "Unsupported")
       log("! load failed on deck %s: %s (%s)", d.id, track.name, tostring(err))
-      if permanent then                -- the player can never play it: remember across boots
+      if permanent then                -- the player can never play it (the server remembers it)
         LEARNED[track.key] = LEARNED[track.key] or {}
-        LEARNED[track.key].unsupported, LEARNED[track.key].status = true, tostring(err)
-        Learned:touch()
+        LEARNED[track.key].unsupported = true
       end
       Library.remove(track)            -- otherwise skipped until the next scan
       emit(permanent and "file_unsupported" or "file_failed", { file = track.name, dir = track.dir, status = tostring(err) })
       if attempt < 5 then
-        local nxt = (track.kind == "imaging") and Station.pickBumper() or nil
+        local nxt = (track.kind == "imaging" and Station.pickBumper()) or
+                    (track.kind == "ad" and table.remove(Station.breakList, 1)) or nil
         Station.startTrack(deck, nxt or Station.pickNext(), opts, attempt + 1)
       else
         Station.state = "idle"
       end
       return
     end
-    d:play(track.kind == "imaging" and SETTINGS.imaging_gain_db or SETTINGS.play_gain_db, opts.fadeIn or 0)
+    d:play(SETTINGS[KINDS[track.kind].gain], opts.fadeIn or 0)
     if track.kind == "music" then
       Station.nowPlaying, Station.live, Station.other, Station.state = track, d, otherDeck(d), "playing"
+      Station.tracksSinceBumper, Station.tracksSinceAd = Station.tracksSinceBumper + 1, Station.tracksSinceAd + 1
       push(Station.history, track, 50)
       emit("track_start", { deck = d.id, file = track.name, dir = track.dir, artist = track.artist,
         title = track.title, duration = round(d.duration or 0, 1) })
     else
-      Station.bumperDeck, Station.state = d, "bumper"
-      emit("bumper_start", { deck = d.id, file = track.name, dir = track.dir, title = track.title,
-        duration = round(d.duration or 0, 1) })
+      Station.spotDeck, Station.state = d, (track.kind == "ad" and "ad" or "bumper")
+      if track.kind == "ad" then Station.tracksSinceAd = 0 else Station.tracksSinceBumper = 0 end
+      emit(KINDS[track.kind].event .. "_start", { deck = d.id, file = track.name, dir = track.dir, artist = track.artist,
+        title = track.title, duration = round(d.duration or 0, 1) })
     end
   end)
 end
@@ -558,28 +627,46 @@ function Station.transition(reason)
   Station.armed = nil
   local fadeS = (reason == "skip" and SETTINGS.skip_fade_s) or (reason == "silence" and SETTINGS.silence_fade_s)
                 or SETTINGS.crossfade_s
-  local outReason = (reason == "skip" or reason == "bumper") and "cut" or (reason == "silence" and "silence" or "end")
+  local outReason = (reason == "skip" or reason == "break") and "cut" or (reason == "silence" and "silence" or "end")
   if Station.stopAfter then            -- end of the line: fade out, start nothing
-    emit("transition", { reason = reason, from = live.id, fade_s = fadeS, bumper = "-", stop = true })
+    emit("transition", { reason = reason, from = live.id, fade_s = fadeS, spots = "-", stop = true })
     fadeAndFinish(live, fadeS, outReason)
     Station.goOff("stop_after_current")
     return
   end
-  local bumperDue = Station.bumperRequested or
-    (SETTINGS.bumper_every_n_tracks > 0 and Station.tracksSinceBumper >= SETTINGS.bumper_every_n_tracks)
-  local bumper = bumperDue and Station.pickBumper() or nil
-  Station.bumperRequested, Station.skipRequested = false, false
-  emit("transition", { reason = reason, from = live.id, fade_s = fadeS, bumper = bumper and bumper.name or "-" })
+  local spots = planBreak()
+  Station.bumperRequested, Station.adRequested, Station.skipRequested = false, false, false
+  local names = {}
+  for i, tr in ipairs(spots or {}) do names[i] = tr.name end
+  emit("transition", { reason = reason, from = live.id, fade_s = fadeS, spots = #names > 0 and table.concat(names, " + ") or "-" })
   Station.state = "crossfading"
-  if bumper then
-    Station.tracksSinceBumper, Station.freeDeck = 0, live
-    Station.startTrack(other, bumper, {})
-    if reason == "end" then fadeS = SETTINGS.bumper_fade_s end   -- the song dips under the bumper
+  if spots then
+    Station.freeDeck, Station.breakList = live, spots
+    Station.startTrack(other, table.remove(spots, 1), {})
+    if reason == "end" then fadeS = SETTINGS.bumper_fade_s end   -- the song dips under the break
   else
-    Station.tracksSinceBumper = Station.tracksSinceBumper + 1
     Station.startTrack(other, Station.pickNext(), { fadeIn = SETTINGS.fade_in_s })
   end
   fadeAndFinish(live, fadeS, outReason)
+end
+
+-- a break item ended (ended = its deck) or is in its tail (ended = nil):
+-- the rest of the break back to back, then the next song (under the last item's tail)
+local function afterSpot(ended)
+  local free = Station.freeDeck
+  if free.state == "fading" then
+    free.fade = nil
+    Station.finishTrack(free, "end")
+    free:stop()
+  end
+  if Station.stopAfter then return Station.goOff("stop_after_current") end   -- the break item plays out
+  Station.state = "crossfading"
+  local nxt = ended and table.remove(Station.breakList, 1)
+  if nxt then
+    Station.freeDeck = ended
+    return Station.startTrack(free, nxt, {})
+  end
+  Station.startTrack(free, Station.pickNext(), { fadeIn = ended and 0 or SETTINGS.fade_in_s })
 end
 
 function Station.onDeckEnded(d)
@@ -589,11 +676,9 @@ function Station.onDeckEnded(d)
     if Station.stopAfter then Station.goOff("stop_after_current") return end
     Station.state = "crossfading"
     Station.startTrack(Station.other, Station.pickNext(), {})
-  elseif Station.state == "bumper" and d == Station.bumperDeck then
-    Station.finishTrack(d, "eof")
-    if Station.stopAfter then Station.goOff("stop_after_current") return end
-    Station.state = "crossfading"
-    Station.startTrack(Station.freeDeck, Station.pickNext(), {})
+  elseif isSpot(Station.state) and d == Station.spotDeck then
+    Station.finishTrack(d, "end")      -- a break item plays to its end by design
+    afterSpot(d)
   else
     Station.finishTrack(d, "end")      -- e.g. a bumper whose tail the next track started under
     emit("deck_idle", { deck = d.id })
@@ -605,7 +690,6 @@ function Station.goOff(why)
   clearRequests()
   Station.automation, Station.state, Station.armed = false, "off", nil
   UI.syncAutomation()
-  Learned:flush(true)
   emit("automation", { on = false, why = why })
 end
 
@@ -629,7 +713,7 @@ end
 -- with a one-shot timer so the fade starts on time without a fast loop
 local function crossfadeCheck(live, t)
   local L = (live.track and LEARNED[live.track.key]) or {}
-  local due = (live:remainingEst(t) or 999) - (SETTINGS.crossfade_s + (L.trail_s or 0) + 0.25)
+  local due = (live:remainingEst(t) or 999) - (SETTINGS.crossfade_s + (L.trail or 0) + 0.25)
   if due <= 0 then return Station.transition("end") end
   if due < K.tick_s and Station.armed ~= live.playStart then
     Station.armed = live.playStart
@@ -649,31 +733,22 @@ function Station.tick(t)
   if Station.ticks % math.max(1, math.floor(1 / K.tick_s + 0.5)) == 0 then UI.refresh(t) end
   if not Station.automation then return end
 
-  local live = Station.live
+  local live, spot = Station.live, Station.spotDeck
   if Station.state == "playing" and live and live.state == "playing" then
     local playedFor = t - live.playStart
     if Station.skipRequested and playedFor > 1 then
       Station.transition("skip")
-    elseif Station.bumperRequested and playedFor > 1 then
-      Station.transition("bumper")
+    elseif (Station.bumperRequested or Station.adRequested) and playedFor > 1 then
+      Station.transition("break")
     elseif playedFor > 5 and live.silentSince and (t - live.silentSince) >= SETTINGS.silence_hold_s
            and (live:remainingEst(t) or 999) <= SETTINGS.end_guard_s then
       Station.transition("silence")
     elseif playedFor > 5 then
       crossfadeCheck(live, t)
     end
-  elseif Station.state == "bumper" and Station.bumperDeck and Station.bumperDeck.state == "playing" then
-    if (Station.bumperDeck:remainingEst(t) or 0) <= SETTINGS.bumper_tail_s then
-      local free = Station.freeDeck
-      if free.state == "fading" then
-        free.fade = nil
-        Station.finishTrack(free, "end")
-        free:stop()
-      end
-      if Station.stopAfter then return Station.goOff("stop_after_current") end   -- bumper plays out
-      Station.state = "crossfading"
-      Station.startTrack(free, Station.pickNext(), { fadeIn = SETTINGS.fade_in_s })
-    end
+  elseif isSpot(Station.state) and spot and spot.state == "playing" and #Station.breakList == 0
+         and (spot:remainingEst(t) or 0) <= SETTINGS.bumper_tail_s then
+    afterSpot(nil)
   end
 
   -- dead-air guard (backs off while the library is empty)
@@ -705,7 +780,7 @@ Control = {}
 local function trackInfo(tr)
   if not tr then return nil end
   return { key = tr.key, file = tr.name, dir = tr.dir, kind = tr.kind, artist = tr.artist,
-           title = tr.title, duration = LEARNED[tr.key] and LEARNED[tr.key].duration }
+           title = tr.title, duration = tr.duration }
 end
 
 local function libraryTrack(args)
@@ -734,6 +809,25 @@ local function running()
   return true
 end
 
+-- bumper now / ad break now, optionally with a chosen file (kind = "imaging" | "ad")
+local function breakNow(kind, args)
+  local ok, err = running()
+  if not ok then return false, err end
+  if isSpot(Station.state) then return false, "a break is playing" end
+  local flag, pick = kind == "ad" and "adRequested" or "bumperRequested", kind == "ad" and "nextAd" or "nextBumper"
+  if Station[flag] then return false, "already due" end
+  local tr
+  if args.key then
+    tr, err = libraryTrack(args)
+    if not tr then return false, err end
+    if tr.kind ~= kind then return false, kind == "ad" and "not an ad" or "not an imaging file" end
+  elseif #Library[kind] == 0 then
+    return false, kind == "ad" and "no ads" or "no imaging files"
+  end
+  Station[pick], Station[flag] = tr, true
+  return true
+end
+
 Control.handlers = {
   skip = function()
     if not Station.automation then return false, "automation is off" end
@@ -741,20 +835,8 @@ Control.handlers = {
     Station.skipRequested = true
     return true
   end,
-  bumper_now = function(args)
-    if not Station.automation then return false, "automation is off" end
-    if Station.state == "bumper" or Station.bumperRequested then return false, "a bumper is already playing or due" end
-    if args.key then
-      local tr, err = libraryTrack(args)
-      if not tr then return false, err end
-      if tr.kind ~= "imaging" then return false, "not an imaging file" end
-      Station.nextBumper = tr
-    elseif #Library.imaging == 0 then
-      return false, "no imaging files"
-    end
-    Station.bumperRequested = true
-    return true
-  end,
+  bumper_now = function(args) return breakNow("imaging", args) end,
+  ad_now = function(args) return breakNow("ad", args) end,
   stop_after = function(args)
     if args.on == false then Station.stopAfter = false; return true, "cancelled" end
     local ok, err = running()
@@ -776,22 +858,21 @@ Control.handlers = {
   queue_add = function(args)
     local tr, err = libraryTrack(args)
     if not tr then return false, err end
-    if tr.kind ~= "music" then return false, "use bumper_now for imaging" end
+    if tr.kind ~= "music" then return false, "only music can be queued" end
     return enqueue(tr, args.position == "next")
   end,
   play_now = function(args)
     local tr, err = libraryTrack(args)
     if not tr then return false, err end
-    if tr.kind == "imaging" then
-      if Station.state == "bumper" then return false, "a bumper is already playing" end
-      Station.nextBumper, Station.bumperRequested = tr, true
-    else
-      local ok, why = enqueue(tr, true)
-      if not ok then return false, why end
+    if tr.kind ~= "music" then
+      if not Station.automation then Station.setAutomation(true, "play_now") end
+      return breakNow(tr.kind, args)
     end
+    local ok, why = enqueue(tr, true)
+    if not ok then return false, why end
     if not Station.automation then
       Station.setAutomation(true, "play_now")
-    elseif Station.state == "playing" and tr.kind == "music" then
+    elseif Station.state == "playing" then
       Station.skipRequested = true
     end
     return true
@@ -817,7 +898,7 @@ Control.handlers = {
   end,
   rescan = function()
     Library.scan()
-    return true, string.format("%d music, %d imaging", #Library.music, #Library.imaging)
+    return true, string.format("%d music, %d imaging, %d ads", #Library.music, #Library.imaging, #Library.ad)
   end,
 }
 
@@ -857,7 +938,9 @@ function Station.snapshot(t)
     decks = { A = deck(DeckA), B = deck(DeckB) }, next_up = nextUp, queue = queue,
     next_bumper = trackInfo(Station.nextBumper), bumper_requested = Station.bumperRequested,
     tracks_since_bumper = Station.tracksSinceBumper, bumper_every = SETTINGS.bumper_every_n_tracks,
-    library = { music = #Library.music, imaging = #Library.imaging },
+    next_ad = trackInfo(Station.nextAd), ad_requested = Station.adRequested, tracks_since_ad = Station.tracksSinceAd,
+    ad_every = SETTINGS.ad_every_n_tracks, ads_due = Station.adPlan and #Station.adPlan.due or 0,
+    library = { music = #Library.music, imaging = #Library.imaging, ad = #Library.ad },
     settings = settings, uptime = round(t - BOOT_T, 0), outbox = #Server.outbox,
   }
 end
@@ -913,17 +996,20 @@ function UI.refresh(t)
 end
 
 -- ── SERVER: one sync request a second, plus the library after each scan ───────
-Server = { outbox = {}, dropped = 0, lastCmd = 0, settingsRev = "", fails = 0, nextTry = 0,
-           busy = {}, libraryDirty = false, sentRev = -1, stateAt = -1e9 }
-Outbox = Store.new(FILES.outbox, K.outbox_save_s, function() return Server.outbox end)
-CmdState = Store.new(FILES.state, 0, function() return { last_cmd = Server.lastCmd } end)
+Server = { outbox = {}, dropped = 0, lastCmd = 0, settingsRev = "", adsRev = "", fails = 0, nextTry = 0,
+           busy = {}, libraryDirty = false, sentRev = -1, stateAt = -1e9, onDisk = false }
+-- the outbox is written only while the server is unreachable (and once more to clear it)
+Outbox = Store.new(FILES.outbox, K.outbox_save_s, function()
+  Server.onDisk = #Server.outbox > 0
+  return Server.outbox
+end)
 
 function Server.enabled() return type(CFG.SERVER_URL) == "string" and CFG.SERVER_URL ~= "" end
 
 function Server.queue(ev)
   if not Server.enabled() then return end
   if push(Server.outbox, ev, K.outbox_max) then Server.dropped = Server.dropped + 1 end
-  Outbox:touch()
+  if Server.fails > 0 or Server.onDisk then Outbox:touch() end
 end
 
 local function stationName() return CFG.STATION_ID ~= "" and CFG.STATION_ID or STATION_NAME end
@@ -954,8 +1040,12 @@ function Server.applySettings(s, rev, fromFile)
   for k, v in pairs(s) do
     if DEFAULTS[k] ~= nil and type(v) == type(DEFAULTS[k]) then new[k], n = v, n + 1 end
   end
-  new.music_dir, new.imaging_dir = normDir(new.music_dir), normDir(new.imaging_dir)
-  local rescan = new.music_dir ~= SETTINGS.music_dir or new.imaging_dir ~= SETTINGS.imaging_dir
+  local rescan = false
+  for _, kind in ipairs(KIND_ORDER) do
+    local key = KINDS[kind].dir
+    new[key] = normDir(new[key])
+    rescan = rescan or new[key] ~= SETTINGS[key]
+  end
   SETTINGS = new
   Server.settingsRev = tostring(rev or "")
   log("settings: %d server value(s) applied (rev %s)%s", n, Server.settingsRev, fromFile and " from file" or "")
@@ -965,35 +1055,51 @@ function Server.applySettings(s, rev, fromFile)
   if rescan then Library.scan() end
 end
 
+local function decoded(code, data)
+  if code ~= 200 then return nil end
+  local ok, resp = pcall(json.decode, data or "")
+  return ok and type(resp) == "table" and resp or nil
+end
+
 function Server.postLibrary()
   local items = {}
-  for _, list in ipairs({ Library.music, Library.imaging }) do
-    for _, tr in ipairs(list) do
-      local L = LEARNED[tr.key] or {}
-      items[#items + 1] = { key = tr.key, dir = tr.dir, file = tr.name, kind = tr.kind, artist = tr.artist,
-        title = tr.title, size = tr.size, duration = L.duration, lead_in = L.lead_in_s, trail = L.trail_s,
-        peak = L.peak_dbfs }
+  for _, kind in ipairs(KIND_ORDER) do
+    for _, tr in ipairs(Library[kind]) do
+      items[#items + 1] = { key = tr.key, dir = tr.dir, file = tr.name, kind = kind, artist = tr.artist,
+        title = tr.title, size = tr.size }
     end
   end
   local sent = post("library", "/api/v1/core/library", { station = stationName(), boot = BOOT_ID,
-    music_dir = SETTINGS.music_dir, imaging_dir = SETTINGS.imaging_dir, items = items }, function(code)
-    if not (code and code >= 200 and code < 300) then Server.libraryDirty = true end
-  end)
+    music_dir = SETTINGS.music_dir, imaging_dir = SETTINGS.imaging_dir, ads_dir = SETTINGS.ads_dir, items = items },
+    function(code, data)
+      local resp = decoded(code, data)
+      if resp then Library.learn(resp.learned) else Server.libraryDirty = true end
+    end)
   if sent then Server.libraryDirty = false end
 end
 
+function Server.applyAdPlan(p, rev)
+  local function keys(list)
+    local out = {}
+    for _, k in ipairs(type(list) == "table" and list or {}) do if type(k) == "string" then out[#out + 1] = k end end
+    return out
+  end
+  Station.adPlan = { due = keys(p.due), mix = keys(p.mix) }
+  Server.adsRev = tostring(rev or "")
+  STATE_REV = STATE_REV + 1
+end
+
 local function handleReply(resp)
-  if tonumber(resp.ack_reset) then Server.lastCmd = tonumber(resp.ack_reset); CmdState:touch() end
+  if tonumber(resp.ack_reset) then Server.lastCmd = tonumber(resp.ack_reset) end
   if type(resp.settings) == "table" then Server.applySettings(resp.settings, resp.settings_rev) end
+  if type(resp.ads) == "table" then Server.applyAdPlan(resp.ads, resp.ads_rev) end
   for _, c in ipairs(type(resp.commands) == "table" and resp.commands or {}) do
     local id = tonumber(c.id)
     if id and id > Server.lastCmd then
       Server.lastCmd = id
-      CmdState:touch()
       Control.run(c)
     end
   end
-  CmdState:flush()
 end
 
 function Server.sync()
@@ -1001,16 +1107,16 @@ function Server.sync()
   if Server.libraryDirty and Server.fails == 0 then Server.postLibrary() end
   local t = now()
   local body = { station = stationName(), version = RADIO_VERSION, boot = BOOT_ID,
-                 ack = Server.lastCmd, settings_rev = Server.settingsRev }
+                 ack = Server.lastCmd, settings_rev = Server.settingsRev, ads_rev = Server.adsRev }
   local rev = STATE_REV
   if rev ~= Server.sentRev or t - Server.stateAt >= K.state_every_s then body.state = Station.snapshot(t) end
   local batch = {}
   for i = 1, math.min(K.sync_batch, #Server.outbox) do batch[i] = Server.outbox[i] end
   if #batch > 0 then body.events, body.dropped = batch, Server.dropped end
   post("sync", "/api/v1/core/sync", body, function(code, data, httpErr)
-    local ok, resp = false, nil
-    if code == 200 then ok, resp = pcall(json.decode, data or "") end
-    if not (ok and type(resp) == "table") then
+    local resp = decoded(code, data)
+    if not resp then
+      if Server.fails == 0 then Outbox:touch() end
       Server.fails = Server.fails + 1
       Server.nextTry = now() + math.min(30, K.sync_s * 2 ^ math.min(Server.fails, 5))
       if Server.fails == 1 or Server.fails % 20 == 0 then
@@ -1030,21 +1136,19 @@ function Server.sync()
       for _, e in ipairs(batch) do sent[e] = true end
       for _, e in ipairs(Server.outbox) do if not sent[e] then keep[#keep + 1] = e end end
       Server.outbox, Server.dropped = keep, 0
-      Outbox:touch()
+      if Server.onDisk then Outbox:touch() end
     end
     handleReply(resp)
   end)
 end
 
 function Server.loadLocal()
-  local st = readJson(FILES.state)
-  if st and tonumber(st.last_cmd) then Server.lastCmd = tonumber(st.last_cmd) end
   local saved = readJson(FILES.settings)
   if saved and type(saved.settings) == "table" then Server.applySettings(saved.settings, saved.rev, true) end
   if Server.enabled() then
     local box = readJson(FILES.outbox)
     if box and #box > 0 then
-      Server.outbox = box
+      Server.outbox, Server.onDisk = box, true
       log("server: %d unsent events from the last run queued for replay", #box)
     end
   end
@@ -1065,7 +1169,7 @@ local function boot()
   local st = {}
   pcall(function() st = Design.GetStatus() end)
   log("radio %s starting on %s (%s)", RADIO_VERSION, tostring(st.Platform), tostring(st.DesignName))
-  if not json then log("! no json library: learning, settings and the server link are disabled") end
+  if not json then log("! no json library: saved settings and the server link are disabled") end
   local ok, m = pcall(Component.New, CFG.METER)
   if not ok or not m then error("meter component '" .. CFG.METER .. "' not found") end
   Meter = m
@@ -1082,9 +1186,8 @@ local function boot()
   BOOT_T = now()
   BOOT_ID = os.date("!%Y%m%dT%H%M%SZ") .. string.format("-%04x", math.random(0, 0xffff))
   STATION_NAME = tostring(st.DesignName or "core")
-  LEARNED = readJson(FILES.learned) or {}
   Server.loadLocal()
-  SETTINGS.music_dir, SETTINGS.imaging_dir = normDir(SETTINGS.music_dir), normDir(SETTINGS.imaging_dir)
+  for _, kind in ipairs(KIND_ORDER) do SETTINGS[KINDS[kind].dir] = normDir(SETTINGS[KINDS[kind].dir]) end
   Library.scan()
   UI.init()
 
@@ -1097,7 +1200,6 @@ local function boot()
   Sync = every(K.sync_s, Server.sync, "sync")
   Chores = every(K.chores_s, function()
     log("heartbeat: %s", Station.statusLine(now()))
-    Learned:flush()
     Outbox:flush()
   end, "chores")
   emit("boot", { version = RADIO_VERSION, platform = tostring(st.Platform), design = STATION_NAME,

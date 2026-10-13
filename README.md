@@ -27,14 +27,15 @@ station settings, the library, syslog.
  │   • keeps playing on its own if the server is gone             │
  │   • once a second: POST /api/v1/core/sync                      │
  │       → queued events, state (only when it changed)            │
- │       ← operator commands, settings                            │
+ │       ← operator commands, settings, ad plan                   │
  │  Audio_Player_01 ──► PlayerOutput01 meter.1                    │
  │  Audio_Player_02 ──► PlayerOutput01 meter.2                    │
  └──────────────────────────────┬─────────────────────────────────┘
                                 │ HTTP (the Core pulls)
  ┌──────────────────────── App server ────────────────────────────┐
  │  Flask (gunicorn 4 × 8)                                        │
- │   • play log, library, station settings, commands              │
+ │   • play log, library + learned figures, settings, commands    │
+ │   • ad schedules: which ads are owed this hour                 │
  │   • web control panel for many viewers (short polls)           │
  │   • shared sign-in with 321Theater & co., syslog               │
  └──────────────────────────────┬─────────────────────────────────┘
@@ -51,19 +52,26 @@ station settings, the library, syslog.
 - **Never go dead.** If the server is unreachable, Lua keeps playing (local
   shuffle) and keeps events in an outbox to replay later.
 - **Lua stays light.** One 250 ms timer; a 50 ms timer only while a deck is
-  fading or loading; one HTTP request a second; controls looked up once;
-  files written at most every 30 s / 5 min.
+  fading or loading; one HTTP request a second; controls looked up once.
+  The Core keeps only two files: the last settings (written when they change)
+  and the event outbox (written only while the server is unreachable).
 - **Settings live in Python.** Every station setting is defined, documented
   and validated in `server/core_settings.py`, edited on the web page and
   pushed to the Core. `radio.lua` only carries fallback values (a test keeps
   the two in step).
 - **Per-deck metering.** Player 1 → `meter.1`, Player 2 → `meter.2`.
-- **Two decks only.** A bumper plays on the free deck; the next track starts
-  under it on the other deck.
-- **One imaging pool.** Ads / bumpers / stingers / IDs are one category.
+- **Two decks only.** A bumper or ad plays on the free deck; the next track
+  starts under it on the other deck. Ads in one break play back to back,
+  alternating decks.
+- **Three kinds of file.** Music, imaging (bumpers, stingers, IDs: one pool)
+  and ads, each in its own folder.
+- **Ads are scheduled on the server.** Each ad is mixed in, played N times an
+  hour, or off; the server works out which ads are owed and sends the Core a
+  plan, the Core only plays it.
 - **Learning.** Lua measures lead-in, trailing silence and peak while a track
-  plays cleanly (never during a fade), starts crossfades early by the learned
-  tail, and reports the figures to the server.
+  plays cleanly (never during a fade) and reports them with each play; the
+  server keeps them per file and gives the Core back what it needs (trailing
+  silence, unsupported files) after each library upload.
 
 ## What the Core told us (probe 0.1.0, 2026-10-12)
 
@@ -105,15 +113,26 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   starts on time. Fades step gain every 50 ms on a timer that runs only while
   a deck is fading or loading (~3% of the time).
 - **Transitions.** Normal end (crossfade early by the learned tail), skip,
-  silence in the last `end_guard_s`, bumper on the free deck every N songs
-  with the next song starting under its tail, stop after current, stop now.
+  silence in the last `end_guard_s`, a break on the free deck (ads, then a
+  bumper) with the next song starting under its tail, stop after current,
+  stop now.
+- **Breaks.** A bumper every `bumper_every_n_tracks` songs; an ad break every
+  `ad_every_n_tracks` songs, and at the first song change after an hourly ad
+  falls due. A break holds up to `ads_per_break` ads: the operator's pick,
+  then ads owed this hour (the server's plan), then mix-ins (shuffled, not
+  the last break's when there is a choice). Without a plan from the server
+  (standalone, or before the first sync) every ad is a mix-in.
 - **Rotation.** Shuffle bag with artist separation; the operator queue comes
   first.
-- **Learning** (`media/_radio/learned.json`, saved every 5 min and on stop):
-  duration, lead-in, minimum trailing silence, peak at unity, play count.
-  A file the player cannot play ("Unsupported…") is remembered; any other
-  load failure only skips the file until the next scan. An unreadable
-  learned.json is kept as `learned.json.bad`, never overwritten.
+- **Learning** (kept on the server, `library` table): duration, lead-in,
+  minimum trailing silence, peak at unity. A file the player cannot play
+  ("Unsupported…") is remembered there until its size changes; any other
+  load failure only skips the file until the next scan.
+- **Files on the Core** (`media/_radio/`): `settings.json` (the server's
+  settings, so a reboot during an outage plays the right folders) and
+  `outbox.json` (events not yet delivered; written every 30 s only while the
+  server is unreachable). An unreadable file is kept as `<name>.bad`, never
+  overwritten.
 - **Never dead.** If neither deck is busy for `dead_air_s`, something starts;
   with an empty music folder it backs off and logs once.
 - **Panel controls (optional).** Text Controller: named controls `Skip`,
@@ -131,6 +150,7 @@ Needs `pip install lupa`.
 python3 qsys/test/run_mock.py qsys/test/scenario_basic.lua        # rotation, bumpers, silence, learning
 python3 qsys/test/run_mock.py qsys/test/scenario_server.lua       # server outage, outbox, replay
 python3 qsys/test/run_mock.py qsys/test/scenario_control.lua      # every panel command, settings push
+python3 qsys/test/run_mock.py qsys/test/scenario_ads.lua          # ad breaks, hourly ads, ad plan
 python3 qsys/test/run_mock.py qsys/test/scenario_regressions.lua  # one case per bug found in review
 ```
 
@@ -520,7 +540,8 @@ In Q-SYS Designer, with the station's design open:
    `Test/Tuning/` and `Test/Imaging/` under `Audio`. Change them later on the
    Settings page (Music folder, Imaging folder). FLAC, MP3 and WAV are proven
    on the Core; WMA does not load. Put a few bumpers in the imaging folder,
-   or set "Bumper every N songs" to 0.
+   or set "Bumper every N songs" to 0. Ads are optional: put them in their
+   own folder and set the Ads folder on the Settings page.
 5. **Script.** Add a Text Controller (or Control Script). Open its Lua
    editor, paste all of `qsys/radio/radio.lua`, and change only `CFG`:
    ```lua
@@ -578,7 +599,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (7 in 0.3.0-dev).
+The last line prints the number of tables (8 in 0.3.0-dev).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -588,8 +609,9 @@ The last line prints the number of tables (7 in 0.3.0-dev).
 - The accounts (`shared`) are 321Theater's to back up.
 - `.env` holds the database password and the Core token. Keep the copy
   private.
-- On the Core, `media/_radio/learned.json` holds what the script has learned
-  about each file.
+- What the script learns about each file is in the database (`library`).
+  The Core's `media/_radio/` only holds the last settings and, during an
+  outage, undelivered events.
 
 ### 12. Update
 
@@ -883,12 +905,16 @@ MockCore scenarios and `live_core.py`.
 
 ## Web control panel
 
-- **Dashboard:** on-air countdown, up next (queue or rotation), bumper
-  countdown, library size; transport (Skip, Bumper now, Stop after current,
-  Stop now / Start); both decks live; the queue (reorder, remove, clear);
+- **Dashboard:** on-air countdown, up next (queue or rotation), songs until
+  the next bumper and the next ad break (and hourly ads owed), library size;
+  transport (Skip, Bumper now, Ad break now, Stop after current, Stop now /
+  Start); both decks live; the queue (reorder, remove, clear);
   activity (every command, who sent it, and the Core's answer); recent plays.
-- **Library:** search, sort (artist, title, most / least recently played),
-  Play next, Queue, Play now; imaging files: Bumper now. Rescan.
+- **Library:** music, imaging and ads; search, sort (artist, title, most /
+  least recently played), Play next, Queue, Play now; imaging files: Bumper
+  now; ads: Play now and the schedule (Mix in / Per hour with the count /
+  Off) with plays this hour and today. Rescan. The list reloads by itself
+  after the Core uploads a new scan and whenever something new plays.
 - **Play log:** a day (search, type), what was on air at a moment, CSV.
 - **Settings** (admins): every station setting in groups (Library, Bumpers &
   ads, Fades, Levels, Silence detection, Rotation, Safety), with what the
@@ -907,7 +933,7 @@ The same accounts and sessions as 321Theater and the other apps
 | Who | Can |
 |---|---|
 | `is_app_user`, `is_app_admin` or role `admin` | sign in and watch |
-| … and not `is_readonly` | operate (transport, queue, rescan) |
+| … and not `is_readonly` | operate (transport, queue, rescan, ad schedules) |
 | `is_app_admin` or role `admin` | change station settings |
 
 The flags are set in 321Theater (Installation, step 7). QSYSRadio re-checks
@@ -919,7 +945,7 @@ in elsewhere. Signing out signs out of every app that shares the cookie
 ## Play log: what played when
 
 `qsysradio.play_log` holds one row per airing: `started_at` / `ended_at`
-(timestamptz, the Core's clock), `kind` (`music` / `imaging`), `file`,
+(timestamptz, the Core's clock), `kind` (`music` / `imaging` / `ad`), `file`,
 `directory`, `artist`, `title`, `deck`, `duration_s`, `played_s`,
 `end_reason` (`end`, `silence`, `cut`, `eof`, `core_restart`). During a
 crossfade two rows overlap. Every raw event is kept in
@@ -953,7 +979,24 @@ WHERE started_at <= '2026-10-12 14:03' AND ended_at > '2026-10-12 14:03';
 SELECT artist, title, count(*) FROM qsysradio.play_log
 WHERE kind = 'music' AND started_at >= date_trunc('month', now())
 GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 25;
+
+-- ad plays per hour yesterday (proof of play)
+SELECT date_trunc('hour', started_at) AS hour, directory || file AS ad, count(*)
+FROM qsysradio.play_log
+WHERE kind = 'ad' AND started_at >= current_date - 1 AND started_at < current_date
+GROUP BY 1, 2 ORDER BY 1, 2;
 ```
+
+### Ad schedules
+
+Set on the Library page (Ads), one row per ad in `qsysradio.ad_rules`; an ad
+with no row is mixed in.
+
+| Schedule | Plays |
+|---|---|
+| Mix in | in ad breaks (every `ad_every_n_tracks` songs), shuffled with the other mix-ins |
+| Per hour, N | N times each clock hour (server time), spread out: the k-th play is owed at (k − ½)/N of the hour, e.g. N = 4 at :07, :22, :37, :52, and goes in the first break after that; an owed ad starts a break at the next song change. Plays are counted from the play log |
+| Off | never |
 
 ## Syslog
 
@@ -987,7 +1030,7 @@ complete record.
 | 0.1 | Probe |
 | 0.2 | Standalone deck controller |
 | 0.3 | Server: play log, control panel, settings, sign-in, syslog *(in progress)* |
-| 0.4 | Rotation rules on the server: no-repeat window, scheduled ad breaks, time-of-day rules |
+| 0.4 | Rotation rules on the server: no-repeat window, time-of-day rules, ad flights (start / end dates, dayparts) |
 | 0.5 | Learning v2: loudness normalisation from learned peak, lead-in aware starts |
 | 1.0 | Stable: alerts, docs |
 

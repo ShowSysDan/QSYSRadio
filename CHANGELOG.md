@@ -43,6 +43,19 @@ versions follow [Semantic Versioning](https://semver.org/).
   (radio.lua in real time against a real server); `tests/test_server.py`
   (pytest against real PostgreSQL: Core API, commands, sign-in, permissions,
   settings, play log, failure handling).
+- **Ads**, a third kind of file next to music and imaging: own folder
+  (`ads_dir`), level (`ad_gain_db`), `ad_every_n_tracks` and `ads_per_break`
+  settings. Each ad is scheduled on the Library page: **Mix in** (rotated
+  through ad breaks), **Per hour** with a count (spread over each clock hour,
+  plays counted from the play log), or **Off**. The server works out which
+  ads are owed and sends the Core an ad plan on its sync (`ads` / `ads_rev`);
+  an owed ad starts a break at the next song change. A break plays ads back
+  to back, then a bumper if one is due. `ad_start` / `ad_end` events, `ad`
+  rows in the play log (Play log filter, CSV), "Ad break now" on the
+  dashboard and Play now for an ad in the library (`ad_now` command), a "Next
+  ad break" card, `POST /api/v1/ads`. Migration
+  `0005_ads_and_learned_on_server` (`ad_rules` table).
+- MockCore `scenario_ads.lua`; `live_core.py` has ads.
 - README **Installation**: one numbered path from `git clone` to a linked
   Core: packages, PostgreSQL role and least-privilege grants (joining
   321Theater's database, or a new one), `.env`, `install.sh`, service and
@@ -52,6 +65,24 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- **The Core keeps almost nothing on its media drive.** `learned.json` is
+  gone: the server's `library` table keeps duration, lead-in, shortest
+  trailing silence and peak per file (from each play's `track_end`) and
+  "unsupported" (from `file_unsupported`, cleared when the file's size
+  changes), and returns the trail and unsupported files to the Core in the
+  reply to each library upload. `state.json` is gone: a Core that restarts
+  asks for commands from 0 and the server fails any command it had picked up
+  but not reported ("the Core restarted before reporting"). `outbox.json` is
+  written only while the server is unreachable (and once more to clear it).
+  Only `settings.json` and `outbox.json` remain. `media/_radio/learned.json`
+  and `state.json` on an existing Core can be deleted.
+- Queue and up-next lengths on the dashboard come from the server's library.
+- `bumper_every_n_tracks` = N now means N songs between bumpers (it played
+  N + 1). The Bumpers card is now "Next bumper": songs still to play after
+  the current one, or NEXT, and the pool size says "bumpers", so "0 songs …
+  5 in pool" no longer reads as an empty library.
+- Settings: "Bumper / ad level" is now "Bumper level" (ads have their own);
+  the imaging folder no longer holds ads.
 - Install is now: fill in `.env`, run `sudo ./install.sh`. The database,
   the `qsysradio` role and schema are assumed to exist; the setup SQL moved to
   a "Database access" reference section and the steps are renumbered (1–13).
@@ -112,6 +143,11 @@ versions follow [Semantic Versioning](https://semver.org/).
   local time; commands with no result stayed "sent" forever; several 500s
   that should be 400s; settings accepted `true` and non-string folders.
 - Event identity is per station (`0004_events_unique_per_station`).
+- Library page: it did not update after Rescan (or as things played) until
+  reloaded; it now reloads the rows shown when the Core uploads a scan and
+  when something new plays (never while an ad's schedule is being edited).
+- radio.lua: Play now on a bumper while the station was stopped started the
+  music but dropped the bumper.
 - MockCore keeps the scenario seed and follows simulated time in `os.date`.
 
 ## [0.2.0] - 2026-10-12

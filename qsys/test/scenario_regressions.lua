@@ -10,7 +10,7 @@ local function count(kind) return #evs(kind) end
 local function when(cond, fn) local function chk() if cond() then fn() else MockCore.at(MockCore.clock + 0.05, chk) end end MockCore.at(0.05, chk) end
 
 local function boot(music, imaging, before)
-  for _, f in ipairs({ "learned", "outbox", "settings", "state" }) do os.remove("media/_radio/" .. f .. ".json") end
+  for _, f in ipairs({ "outbox", "settings" }) do os.remove("media/_radio/" .. f .. ".json") end
   MockCore.setup{ seed = 2, dirs = { ["Test/Tuning/"] = music, ["Test/Imaging/"] = imaging or {} }, controls = { inputs = 3, outputs = 6 } }
   if before then before() end
   dofile("qsys/radio/radio.lua")
@@ -35,7 +35,7 @@ boot(songs(4, 7), { { name = "b3.wav", duration = 3, level = -6 } })
 SETTINGS.bumper_every_n_tracks = 1
 MockCore.run(40)
 local maxPeak = -200
-for _, L in pairs(LEARNED) do if L.peak_dbfs and L.peak_dbfs > maxPeak then maxPeak = L.peak_dbfs end end
+for _, e in ipairs(evs("track_end")) do if e.peak and e.peak > maxPeak then maxPeak = e.peak end end
 check(count("dead_air_guard") == 0, "short bumper: no dead air")
 check(maxPeak <= -5, string.format("learned peak not inflated by fades (max %.1f dBFS, files peak at -10)", maxPeak))
 
@@ -106,14 +106,14 @@ boot(songs(4, 40), BUMPERS, function() MockCore.clock = 5000 end)
 MockCore.run(12)
 check(Station.snapshot(Timer.Now()).uptime <= 13, "uptime counts from boot, not from the Core clock's epoch")
 
-print("-- corrupt learned.json is kept, not overwritten")
+print("-- corrupt settings.json is kept, not overwritten")
 boot(songs(4, 7), BUMPERS, function()
-  local f = io.open("media/_radio/learned.json", "w"); f:write('{"Test/Tuning/A - Song1.flac": {"plays": 9'); f:close()
+  local f = io.open("media/_radio/settings.json", "w"); f:write('{"rev": "r1", "settings": {"crossfade_s": 9'); f:close()
 end)
-MockCore.run(30)
-Learned:flush(true)
-local bad = io.open("media/_radio/learned.json.bad", "r")
-check(bad ~= nil and bad:read("*a"):find('"plays": 9', 1, true) ~= nil, "unreadable learned.json saved as learned.json.bad")
+MockCore.run(5)
+local bad = io.open("media/_radio/settings.json.bad", "r")
+check(bad ~= nil and bad:read("*a"):find('"crossfade_s": 9', 1, true) ~= nil and SETTINGS.crossfade_s == DEFAULTS.crossfade_s,
+  "unreadable settings.json saved as settings.json.bad; fallback settings used")
 if bad then bad:close() end
 
 print("-- transient load failures are not blacklisted forever")
@@ -122,6 +122,58 @@ boot({ { name = "A - Song1.flac", duration = 40, level = -10 }, { name = "Z - Go
 MockCore.run(130)
 check(not (LEARNED["Test/Tuning/Z - Gone.flac"] and LEARNED["Test/Tuning/Z - Gone.flac"].unsupported) and count("file_failed") >= 1,
   "a 'Missing' file is skipped for now, not marked unsupported")
+
+print("-- bumper every N songs: exactly N songs between bumpers")
+boot(songs(6, 20), BUMPERS)
+SETTINGS.bumper_every_n_tracks = 2
+MockCore.run(200)
+local order = {}
+for _, e in ipairs(EVENTS) do
+  if e.kind == "track_start" then order[#order + 1] = "S" elseif e.kind == "bumper_start" then order[#order + 1] = "B" end
+end
+local seqStr = table.concat(order)
+check(seqStr:sub(1, 8) == "SSBSSBSS" and not seqStr:find("SSS", 1, true), "every 2 songs: SSBSSB... (" .. seqStr .. ")")
+
+print("-- play now on a bumper while stopped plays that bumper")
+boot(songs(4, 40), BUMPERS)
+MockCore.run(5)
+Station.setAutomation(false, "t")
+MockCore.run(5)
+Control.run({ cmd = "play_now", args = { key = "Test/Imaging/b2.wav" } })
+MockCore.run(10)
+local b2
+for _, e in ipairs(evs("bumper_start")) do if e.file == "b2.wav" then b2 = e end end
+check(Station.automation and b2 ~= nil, "station started and the chosen bumper played")
+
+print("-- a file the server knows is unsupported leaves the rotation")
+boot(songs(4, 40), BUMPERS)
+Library.learn({ ["Test/Tuning/B - Song2.flac"] = { unsupported = true }, ["Test/Tuning/C - Song3.flac"] = { trail = 1.5 } })
+check(Library.byKey["Test/Tuning/B - Song2.flac"] == nil and #Library.music == 3 and LEARNED["Test/Tuning/C - Song3.flac"].trail == 1.5,
+  "dropped from the library; learned trail kept")
+Library.scan()
+check(Library.byKey["Test/Tuning/B - Song2.flac"] == nil, "and stays out after a rescan")
+
+print("-- the outbox is written only while the server is unreachable")
+boot(songs(4, 20), BUMPERS, function()
+  MockCore.httpHandler = function(req)
+    if MockCore.clock >= 60 and MockCore.clock < 100 then return 0, "", "timeout" end
+    return 200, '{"commands":[]}'
+  end
+end)
+CFG.SERVER_URL = "http://radio-server:5410"
+local function outboxFile()
+  local f = io.open(FILES.outbox, "r")
+  if not f then return nil end
+  local d = json.decode(f:read("*a")); f:close(); return d
+end
+MockCore.run(59)
+check(outboxFile() == nil, "nothing written while the server answers")
+MockCore.run(40)
+local during = outboxFile()
+check(during and #during > 0, string.format("written during the outage (%d events)", during and #during or 0))
+MockCore.run(60)
+local after = outboxFile()
+check(after and #after == 0 and #Server.outbox == 0, "emptied once delivered")
 
 print("-- lightweight: fast timer only while fading/loading, panel writes only on change")
 boot(songs(6, 60), BUMPERS)

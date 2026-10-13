@@ -9,6 +9,7 @@
   R.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   R.num = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
   R.REASONS = { end: 'End', silence: 'Silence', cut: 'Skipped', eof: 'End of file', core_restart: 'Core restart' };
+  R.KINDS = { music: 'Music', imaging: 'Imaging', ad: 'Ad' };
 
   R.clock = (sec) => {
     sec = R.num(sec);
@@ -149,7 +150,7 @@
     const played = R.num(p.played_s), dur = R.num(p.duration_s);
     return '<tr class="' + (open ? 'open' : '') + '">' +
       '<td class="t">' + R.esc(R.timeOf(p.started_at, withDate)) + '</td>' +
-      '<td><span class="tag ' + (p.kind === 'imaging' ? 'imaging' : 'music') + '">' + (p.kind === 'imaging' ? 'Imaging' : 'Music') + '</span></td>' +
+      '<td><span class="tag ' + (R.KINDS[p.kind] ? p.kind : 'music') + '">' + (R.KINDS[p.kind] || 'Music') + '</span></td>' +
       '<td>' + R.esc(R.whoLine(p)) + '<span class="file">' + R.esc((p.directory || '') + p.file) + '</span></td>' +
       '<td class="num">' + R.esc(p.deck || '') + '</td>' +
       '<td class="num">' + (played != null ? R.clock(played) : '') + (dur ? ' / ' + R.clock(dur) : '') + '</td>' +

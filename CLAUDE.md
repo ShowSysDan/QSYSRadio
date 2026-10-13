@@ -31,9 +31,12 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 - Use the documented Q-SYS APIs (HttpClient.Upload, Timer, Component, dir,
   io on media/, rapidjson). Keep `Tick`, `Fast`, `Sync`, `Chores` timers
   global (a local timer can be garbage-collected).
-- After any change run all four MockCore scenarios
-  (`python3 qsys/test/run_mock.py qsys/test/scenario_*.lua`); add a case to
-  `scenario_regressions.lua` for every bug fixed.
+- After any change run every MockCore scenario (`for s in
+  qsys/test/scenario_*.lua; do python3 qsys/test/run_mock.py $s; done`); add a
+  case to `scenario_regressions.lua` for every bug fixed.
+- The Core's only files are `settings.json` and `outbox.json` (both for when
+  the server is unreachable). Per-file data (learned figures, unsupported)
+  and command state live on the server; don't add Core files.
 
 ## PostgreSQL: its own schema, PostgreSQL only
 - Every QSYSRadio table lives in `PG_APP_SCHEMA` (default `qsysradio`).
@@ -62,7 +65,10 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   seq unique; stored once, each in a savepoint), optional state, command ack;
   reply: commands with id > ack, settings when the rev differs, ack_reset.
   One advisory lock per station serialises sync and `add_command`.
-- `POST /api/v1/core/library` after every scan (bulk `execute_values`).
+- `POST /api/v1/core/library` after every scan (bulk `execute_values`);
+  reply: `learned` {key: {trail} | {unsupported}} for the Core.
+- Ads: the server sends `ads` {due, mix} when `ads_rev` differs (`ads.py`);
+  the Core only plays the plan (without one, every ad is a mix-in).
 
 ## Web panel
 - Pages poll through `Radio.status()` (one loop per page, 8 s timeout);

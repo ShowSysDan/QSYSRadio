@@ -22,9 +22,9 @@
     if ($('log-kind').value) qs.set('kind', $('log-kind').value);
     try {
       const d = await R.api(R.withStation('/api/v1/plays?' + qs));
-      const music = d.plays.filter((p) => p.kind === 'music').length;
+      const n = (k) => d.plays.filter((p) => p.kind === k).length;
       show(d.plays, d.plays.length + ' plays on ' + from.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' }) +
-        ' (' + music + ' music, ' + (d.plays.length - music) + ' imaging)', false, 'playlog-' + day);
+        ' (' + n('music') + ' music, ' + n('imaging') + ' imaging, ' + n('ad') + ' ads)', false, 'playlog-' + day);
     } catch (err) { $('log-summary').textContent = 'Error: ' + err.message; }
   }
 

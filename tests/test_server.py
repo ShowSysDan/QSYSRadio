@@ -19,7 +19,7 @@ os.environ.update(PG_APP_SCHEMA='qsr_test', PG_SHARED_SCHEMA='qsr_test_shared', 
                   WEB_THREADS='8', SYSLOG_HOST='')
 os.environ.pop('RADIO_ALLOW_NO_TOKEN', None)
 
-from server import config, control, core_settings, db, logs, migrate  # noqa: E402
+from server import ads, config, control, core_settings, db, logs, migrate  # noqa: E402
 
 if not db.is_configured():
     pytest.skip('no test database configured (QSYSRADIO_ENV_FILE)', allow_module_level=True)
@@ -208,6 +208,99 @@ def test_commands_never_skipped_by_commit_order(app):
     later = out['r'].json['id']
     assert later > held
     assert [c['id'] for c in sync(app, station='S6', ack=0).json['commands']] == [held, later]
+
+
+def test_core_restart_does_not_rerun_commands(app):
+    """No command state on the Core: a restarted Core asks from ack 0."""
+    sync(app, station='S8', boot='B1', state=STATE)
+    op = signed_in(app, 'operator')
+    first = op.post('/api/v1/control', json={'station': 'S8', 'cmd': 'skip'}, headers=WEB).json['id']
+    assert [c['id'] for c in sync(app, station='S8', boot='B1', ack=0).json['commands']] == [first]   # delivered, no result
+    second = op.post('/api/v1/control', json={'station': 'S8', 'cmd': 'rescan'}, headers=WEB).json['id']
+    got = sync(app, station='S8', boot='B2', ack=0).json['commands']                                 # restarted
+    assert [c['id'] for c in got] == [second]
+    note = sql('SELECT ok, note FROM qsr_test.commands WHERE id = %s', (first,), fetch=True)[0]
+    assert note[0] is False and 'restarted' in note[1]
+
+
+# ── Library figures and ads ──────────────────────────────────────────────────
+
+def library_post(app, station, items, **extra):
+    return app.test_client().post('/api/v1/core/library', json=dict(station=station, items=items, **extra), headers=CORE)
+
+
+def test_learned_figures_live_on_the_server(app):
+    items = [{'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music', 'size': 10},
+             {'key': 'M/bad.wma', 'dir': 'M/', 'file': 'bad.wma', 'kind': 'music', 'size': 20}]
+    assert library_post(app, 'L1', items).json['learned'] == {}
+    sync(app, station='L1', events=[
+        ev(1, 'track_start', deck='A', file='a.mp3', dir='M/', duration=200.0),
+        ev(2, 'track_end', deck='A', file='a.mp3', dir='M/', reason='end', lead_in=0.8, trail=3.0, peak=-4.5),
+        ev(3, 'track_start', deck='B', file='a.mp3', dir='M/', duration=200.0),
+        ev(4, 'track_end', deck='B', file='a.mp3', dir='M/', reason='cut', lead_in=0.6, peak=-5.0),
+        ev(5, 'file_unsupported', file='bad.wma', dir='M/', status='Unsupported file format')])
+    row = sql("SELECT duration_s, lead_in_s, trail_s, peak_dbfs FROM qsr_test.library WHERE station='L1' AND key='M/a.mp3'",
+              fetch=True)[0]
+    assert tuple(row) == (200.0, 0.6, 3.0, -5.0)             # a cut play keeps the trail it cannot measure
+    assert library_post(app, 'L1', items).json['learned'] == {'M/a.mp3': {'trail': 3.0}, 'M/bad.wma': {'unsupported': True}}
+    op = signed_in(app, 'operator')
+    assert op.post('/api/v1/control', json={'station': 'L1', 'cmd': 'queue_add', 'args': {'key': 'M/bad.wma'}},
+                   headers=WEB).status_code == 400
+    assert op.get('/api/v1/library?station=L1&q=bad').json['items'][0]['unsupported'] is True
+    items[1]['size'] = 21                                       # replaced with a new file: try it again
+    assert 'M/bad.wma' not in library_post(app, 'L1', items).json['learned']
+
+
+def test_queue_lengths_come_from_the_library(app):
+    library_post(app, 'L2', [{'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music'}])
+    sync(app, station='L2', events=[ev(1, 'track_start', deck='A', file='a.mp3', dir='M/', duration=123.0)],
+         state=dict(STATE, next_up={'key': 'M/a.mp3', 'file': 'a.mp3'}, queue=[{'key': 'M/a.mp3', 'file': 'a.mp3'}]))
+    st = signed_in(app, 'viewer').get('/api/v1/now?station=L2').json['station']['state']
+    assert st['next_up']['duration'] == 123.0 and st['queue'][0]['duration'] == 123.0
+
+
+def test_owed_spreads_plays_over_the_hour():
+    assert [ads.owed(4, m / 60) for m in (0, 7, 8, 22, 23, 52, 53, 59)] == [0, 0, 1, 1, 2, 3, 4, 4]
+    assert ads.owed(1, 0.49) == 0 and ads.owed(1, 0.5) == 1
+
+
+def test_ads_plan_rules_and_play_log(app):
+    items = [{'key': f'Ads/{n}.wav', 'dir': 'Ads/', 'file': f'{n}.wav', 'kind': 'ad'} for n in ('m1', 'm2', 'h', 'off')]
+    assert library_post(app, 'A1', items, ads_dir='Ads/').status_code == 200
+    op, viewer = signed_in(app, 'operator'), signed_in(app, 'viewer')
+    rule = lambda c, **b: c.post('/api/v1/ads', json=dict(station='A1', **b), headers=WEB)
+    assert rule(viewer, key='Ads/h.wav', mode='off').status_code == 403
+    assert rule(op, key='Ads/h.wav', mode='often').status_code == 400
+    assert rule(op, key='Ads/h.wav', mode='hourly', per_hour=0).status_code == 400
+    assert rule(op, key='Ads/h.wav', mode='hourly', per_hour=True).status_code == 400
+    assert rule(op, key='Ads/nope.wav', mode='off').status_code == 400
+    assert rule(op, key='Ads/h.wav', mode='hourly', per_hour=30).status_code == 200
+    assert rule(op, key='Ads/off.wav', mode='off').status_code == 200
+
+    frac = float(sql("SELECT EXTRACT(EPOCH FROM NOW() - date_trunc('hour', NOW())) / 3600", fetch=True)[0][0])
+    first = sync(app, station='A1', ads_rev='').json
+    assert first['ads']['mix'] == ['Ads/m1.wav', 'Ads/m2.wav']
+    assert first['ads']['due'] == (['Ads/h.wav'] if ads.owed(30, frac) > 0 else [])
+    assert 'ads' not in sync(app, station='A1', ads_rev=first['ads_rev']).json             # unchanged: not resent
+
+    # 30 plays this hour: nothing owed any more; the ad is logged as kind 'ad'
+    now = datetime.now(timezone.utc)
+    hour_start = now.replace(minute=0, second=0, microsecond=0)
+    evs = [ev(10 + i, 'ad_start', t=(hour_start + timedelta(seconds=i)).strftime('%Y-%m-%dT%H:%M:%SZ'), deck='A',
+              file='h.wav', dir='Ads/', duration=30.0) for i in range(30)]
+    reply = sync(app, station='A1', events=evs, ads_rev=first['ads_rev']).json
+    if first['ads']['due']:
+        assert reply['ads']['due'] == []
+    lib = op.get('/api/v1/library?station=A1&kind=ad').json['items']
+    h = next(i for i in lib if i['key'] == 'Ads/h.wav')
+    assert (h['mode'], h['per_hour'], h['plays_hour']) == ('hourly', 30, 30) and h['plays_today'] >= 30
+    assert next(i for i in lib if i['key'] == 'Ads/m1.wav')['mode'] == 'mix'
+    assert op.get('/api/v1/plays?station=A1&kind=ad').json['plays'][0]['kind'] == 'ad'
+    # operator commands for ads
+    post = lambda cmd, **a: op.post('/api/v1/control', json={'station': 'A1', 'cmd': cmd, 'args': a}, headers=WEB)
+    assert post('ad_now', key='Ads/m1.wav').status_code == 200 and post('ad_now').status_code == 200
+    assert post('bumper_now', key='Ads/m1.wav').status_code == 400 and post('queue_add', key='Ads/m1.wav').status_code == 400
+    assert post('play_now', key='Ads/m1.wav').status_code == 200
 
 
 # ── Sign-in and permissions ──────────────────────────────────────────────────
