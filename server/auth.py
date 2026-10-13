@@ -54,12 +54,31 @@ class SignInUnavailable(RuntimeError):
     pass
 
 
+SIGNIN_UNAVAILABLE = ('Sign-in is not available: QSYSRadio cannot use the shared user tables. '
+                      'An administrator should check the server log.')
+
+
+_shared_check = {'at': -1e9, 'problems': []}
+
+
+def shared_problems():
+    """What is missing in the shared schema for sign-in (re-checked once a minute)."""
+    if time.monotonic() - _shared_check['at'] > 60:
+        from .migrate import shared_problems as check
+        with _conn().cursor() as cur:
+            problems = check(cur)
+        if problems:
+            log.error('sign-in unavailable: %s', '; '.join(problems))
+        _shared_check.update(at=time.monotonic(), problems=problems)
+    return _shared_check['problems']
+
+
 def _shared_failed(exc):
     _conn().rollback()
     log.error('sign-in unavailable: %s (see the "sign-in will not work" lines from migrate at startup)',
               str(exc).strip().splitlines()[0])
-    return SignInUnavailable('Sign-in is not available: QSYSRadio cannot use the shared user tables. '
-                             'An administrator should check the server log.')
+    _shared_check['at'] = -1e9              # re-check (and log the details) on the next sign-in
+    return SignInUnavailable(SIGNIN_UNAVAILABLE)
 
 
 def utcnow():
@@ -212,6 +231,8 @@ def attempt_login(username, password):
     if _rate_limited(request.remote_addr or '-'):
         return False, 'Too many sign-in attempts. Wait a minute and try again.'
     try:
+        if shared_problems():
+            raise SignInUnavailable(SIGNIN_UNAVAILABLE)
         user = _get_user('username', username)
     except SignInUnavailable as exc:
         return False, str(exc)

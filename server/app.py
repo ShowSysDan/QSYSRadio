@@ -147,6 +147,8 @@ def login():
     if auth.current_user() and not auth.current_user()['deny']:
         return redirect(nxt)
     error, username = None, ''
+    if request.method == 'GET' and auth.shared_problems():
+        error = auth.SIGNIN_UNAVAILABLE           # say so before anyone types a password
     if request.method == 'POST':
         origin = request.headers.get('Origin')
         if origin and urlparse(origin).netloc != request.host:     # login CSRF

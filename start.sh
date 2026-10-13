@@ -30,6 +30,9 @@ fi
 PORT="$("${VENV}/bin/python" -m server.config APP_PORT 5410)"
 WORKERS="$("${VENV}/bin/python" -m server.config WEB_WORKERS 4)"
 THREADS="$("${VENV}/bin/python" -m server.config WEB_THREADS 8)"
+# Every Core sync and browser poll is a request: an access log is opt-in (ACCESS_LOG=1)
+ACCESS_LOG=()
+[ "$("${VENV}/bin/python" -m server.config ACCESS_LOG 0)" = "1" ] && ACCESS_LOG=(--access-logfile -)
 echo "[qsysradio] $(cat VERSION) starting on port ${PORT} (${WORKERS}x${THREADS})"
 
 exec "${VENV}/bin/gunicorn" \
@@ -37,6 +40,6 @@ exec "${VENV}/bin/gunicorn" \
     --threads "${THREADS}" \
     --bind "0.0.0.0:${PORT}" \
     --timeout 120 \
-    --access-logfile - \
+    ${ACCESS_LOG[@]+"${ACCESS_LOG[@]}"} \
     --chdir "${APP_DIR}" \
     server.app:app

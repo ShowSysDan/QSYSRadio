@@ -160,6 +160,11 @@ def run(log=print):
                 for problem in shared_problems(cur):
                     log(f'migrate: WARNING sign-in will not work: {problem}')
                 latest = migrations[-1][0] if migrations else 0
+                newer = sorted(v for v in applied if v > latest)
+                if newer:
+                    log(f'migrate: WARNING the database has migration(s) {", ".join(f"{v:04d}" for v in newer)} '
+                        f'that this code does not know (code rolled back?). Running anyway; '
+                        f'restore the matching backup or update the code if anything misbehaves')
                 log(f'migrate: schema "{app_schema}" at version {latest:04d}'
                     + ('' if count else ' (nothing to do)'))
                 return count

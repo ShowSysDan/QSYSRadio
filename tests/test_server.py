@@ -279,16 +279,31 @@ def test_app_never_creates_anything_in_shared(monkeypatch):
 
 
 def test_signin_without_shared_tables_says_so(app, monkeypatch):
+    from server import auth
     c = signed_in(app, 'operator')
     sql('ALTER TABLE qsr_test_shared.app_sessions RENAME TO app_sessions_hidden')
+    auth._shared_check['at'] = -1e9
     try:
         r = c.get('/')
         assert r.status_code == 503 and b'Sign-in is not available' in r.data
         assert c.get('/api/v1/now').status_code == 503
-        login = app.test_client().post('/login', data={'username': 'operator', 'password': 'pw'})
-        assert login.status_code in (302, 401, 503)          # never a 500
+        fresh = app.test_client()
+        assert b'Sign-in is not available' in fresh.get('/login').data          # before typing a password
+        login = fresh.post('/login', data={'username': 'operator', 'password': 'pw'})
+        assert login.status_code == 401 and b'Sign-in is not available' in login.data
     finally:
         sql('ALTER TABLE qsr_test_shared.app_sessions_hidden RENAME TO app_sessions')
+        auth._shared_check['at'] = -1e9
+
+
+def test_database_newer_than_code_warns():
+    sql("INSERT INTO qsr_test.schema_migrations (version, name, checksum) VALUES (9999, 'from_the_future', 'x')")
+    try:
+        lines = []
+        migrate.run(log=lines.append)
+        assert any('9999' in line and 'does not know' in line for line in lines)
+    finally:
+        sql('DELETE FROM qsr_test.schema_migrations WHERE version = 9999')
 
 
 def test_database_down_gives_503_not_500(app, monkeypatch):

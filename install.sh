@@ -92,7 +92,7 @@ cat > "$SERVICE_FILE" <<UNIT
 [Unit]
 Description=QSYSRadio - Q-SYS radio automation server
 Documentation=https://github.com/ShowSysDan/QSYSRadio
-After=network-online.target
+After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]

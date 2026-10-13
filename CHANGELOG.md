@@ -52,6 +52,13 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- From the fresh-install walkthroughs: HTTP requests are no longer written to
+  the journal (the Core alone made one a second); `ACCESS_LOG=1` turns them
+  back on. The systemd unit starts after a local `postgresql.service`.
+  `migrate` warns when the database has migrations the code does not know
+  (after a code rollback). The sign-in page says "Sign-in is not available"
+  up front when 321Theater's tables are missing or not granted, instead of
+  accepting a password and bouncing back.
 - QSYSRadio never creates or alters anything in the `shared` schema
   (321Theater owns it). It only SELECTs `users` and reads/writes
   `app_sessions` rows. At startup `migrate` checks those tables and grants and
