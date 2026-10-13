@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **1.0.1** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.0.2** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **1.0.1** — stable; standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **1.0.1** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **1.0.1** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.0.2** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.0.2** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.0.2** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -134,11 +134,15 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   on every play, nothing stored.
 - **Break items** hand over at their learned quiet end (or fade-out): the
   next ad starts when the last one goes quiet, not at its end of file.
-- **Quiet starts skipped.** Songs, bumpers and ads start past its measured lead-in minus
-  `lead_skip_keep_s` (0.3 s), skipping at most `lead_skip_max_s` (3 s; 0 =
-  off): the Core presses play, then seeks (`locate`). The first play of a
-  file is from 0:00 (nothing measured yet); lead-in is always reported from
-  the file start, so skipping never shrinks it.
+- **Quiet starts skipped.** Songs, bumpers and ads start past their measured
+  lead-in minus `lead_skip_keep_s` (0.3 s), skipping at most
+  `lead_skip_max_s` (3 s; 0 = off): the Core presses play, then seeks
+  (`locate`). The first play of a file is from 0:00 (nothing measured yet);
+  lead-in is always reported from the file start, so skipping never shrinks
+  it. Lead-in is where the file rises above `silence_threshold_dbfs`
+  (−50 dBFS), so a file's own soft fade-in counts as sound, not silence. A
+  play the Core fades in (`fade_in_s` > 0) reports no lead-in: the meter is
+  not read while the gain moves, so the start can't be seen.
 - **Learning** (kept on the server, `library` table, every kind): duration,
   lead-in, minimum trailing silence, peak at unity; an operator's figures
   (`lead_set_s`, `trail_set_s`) win over them. After each library upload the
@@ -278,7 +282,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `1.0.1`.
+Expect the version, e.g. `1.0.2`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -382,7 +386,7 @@ Keep the two `CFG` lines for step 10.
   networks, use the one the Core can reach.
 - Print the token again any time: `grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`.
 - Re-running is safe: the secrets in `.env` are kept and only pending
-  migrations run (`... at version 0009 (nothing to do)`).
+  migrations run (`... at version 0010 (nothing to do)`).
 - Without sudo (`./install.sh`) it sets up the venv, `.env` and the database,
   ends with `Done (no systemd service without sudo).` and prints no `CFG`
   lines. `./start.sh` then runs the server in the foreground.
@@ -410,13 +414,13 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `migrate: schema "qsysradio" at version 0009 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 1.0.1 starting on port
+- In the journal: `migrate: schema "qsysradio" at version 0010 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 1.0.2 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":9,"schema_version":9,"version":"1.0.1"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":10,"schema_version":10,"version":"1.0.2"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -580,14 +584,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 1.0.1 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.0.2 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 1.0.1`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.0.2`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -618,7 +622,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (8 in 1.0.1).
+The last line prints the number of tables (8 in 1.0.2).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.

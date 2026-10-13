@@ -5,6 +5,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.0.2] - 2026-10-13
+
+### Fixed
+- **With Fade in set above 0, songs lost more of their start on every
+  play.** The Core doesn't read the meter while a fade-in moves the gain, so
+  the first sound it saw came after the fade. It learned that as the song's
+  quiet start, skipped it next time, and measured again after another
+  fade-in, until the 3 s skip limit (a song starting at 0.5 s was learned at
+  5 s). Plays the Core fades in no longer report a quiet start. Migration
+  0010 forgets the measured quiet starts on stations that had Fade in above
+  0; figures set by an operator stay. With Fade in at 0 (the default)
+  nothing was affected. A file's own soft fade-in was never the problem: it
+  counts as sound from −50 dBFS up.
+
+Redeploy both: the Core (paste radio.lua) and the server (`git pull && sudo
+systemctl restart qsysradio`, runs migration 0010).
+
 ## [1.0.1] - 2026-10-13
 
 First stable version: the same code as 0.3.0, declared solid. From here on

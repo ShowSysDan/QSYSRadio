@@ -1,7 +1,7 @@
 -- QSYSRadio deck controller (Q-SYS Lua 5.3). Docs: README.md. Station settings are
 -- edited on the server's web page and pushed here; SETTINGS below are only the
 -- fallback until the server has been reached once.
-RADIO_VERSION = "1.0.1"
+RADIO_VERSION = "1.0.2"
 
 CFG = {
   PLAYER_A = "Audio_Player_01", METER_A = 1,
@@ -305,7 +305,7 @@ function Deck:play(gainDb, fadeInS, skip)
   self.expectStop = false
   trigger(self.c.play)
   if skip > 0 then set(self.c.locate, "Value", skip) end
-  self.state, self.playStart = "playing", now() - skip   -- times stay file positions
+  self.state, self.playStart, self.fadedIn = "playing", now() - skip, fadeInS and fadeInS > 0   -- times stay file positions
   self.firstAudioAt, self.lastAudioAt, self.silentSince, self.peakMax, self.loudAt, self.fadedAt = nil, nil, nil, nil, nil, nil
 end
 
@@ -515,7 +515,7 @@ function Station.finishTrack(d, reason)
                played = d.playStart and round(now() - d.playStart, 1) or nil }
   local L = LEARNED[tr.key] or {}       -- this play's measurements; the server keeps them per file
   LEARNED[tr.key] = L
-  if d.firstAudioAt and d.playStart then
+  if d.firstAudioAt and d.playStart and not d.fadedIn then   -- a fade-in hides where the sound starts
     ev.lead_in = round(d.firstAudioAt - d.playStart, 2)
     if not L.fixed then L.lead = ev.lead_in end
   end

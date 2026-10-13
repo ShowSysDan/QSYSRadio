@@ -270,6 +270,16 @@ end
 check(learnedAd.trail and math.abs(learnedAd.trail - 3) < 0.6, "an ad's silent tail is learned (" .. tostring(learnedAd.trail) .. " s)")
 check(#gaps >= 2 and gaps[#gaps] <= 10.5, string.format("the next ad starts at the quiet end (last gap %.1f s of a 12 s ad)", gaps[#gaps] or -1))
 
+print("-- a fade-in is not a quiet start: the lead-in is not learned from it, the skip never creeps")
+boot(songs(3, 30), {})
+SETTINGS.bumper_every_n_tracks, SETTINGS.artist_separation, SETTINGS.fade_in_s = 0, 0, 2
+MockCore.run(240)
+local maxLead, maxSkip = 0, 0
+for _, e in ipairs(evs("track_end")) do if e.lead_in and e.lead_in > maxLead then maxLead = e.lead_in end end
+for _, e in ipairs(evs("track_start")) do if e.skip and e.skip > maxSkip then maxSkip = e.skip end end
+check(maxLead < 1, string.format("lead-in stays the file's own (largest %.2f s, files start at 0.3 s)", maxLead))
+check(maxSkip < 0.5, string.format("skip stays under the quiet start (largest %.1f s)", maxSkip))
+
 print("-- lightweight: fast timer only while fading/loading")
 boot(songs(6, 60), BUMPERS)
 SETTINGS.bumper_every_n_tracks = 0
