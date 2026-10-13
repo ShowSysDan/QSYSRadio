@@ -126,6 +126,11 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   (see [Rotation](#rotation-every-song-gets-played)); without one (server
   unreachable) a local shuffle bag with artist separation, which a rescan
   does not restart.
+- **Quiet starts skipped.** A song starts past its measured lead-in minus
+  `lead_skip_keep_s` (0.3 s), skipping at most `lead_skip_max_s` (3 s; 0 =
+  off): the Core presses play, then seeks (`locate`). The first play of a
+  file is from 0:00 (nothing measured yet); lead-in is always reported from
+  the file start, so skipping never shrinks it.
 - **Learning** (kept on the server, `library` table): duration, lead-in,
   minimum trailing silence, peak at unity. A file the player cannot play
   ("Unsupported…") is remembered there until its size changes; any other

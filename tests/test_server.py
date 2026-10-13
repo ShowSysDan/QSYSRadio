@@ -242,7 +242,8 @@ def test_learned_figures_live_on_the_server(app):
     row = sql("SELECT duration_s, lead_in_s, trail_s, peak_dbfs FROM qsr_test.library WHERE station='L1' AND key='M/a.mp3'",
               fetch=True)[0]
     assert tuple(row) == (200.0, 0.6, 3.0, -5.0)             # a cut play keeps the trail it cannot measure
-    assert library_post(app, 'L1', items).json['learned'] == {'M/a.mp3': {'trail': 3.0}, 'M/bad.wma': {'unsupported': True}}
+    assert library_post(app, 'L1', items).json['learned'] == {'M/a.mp3': {'trail': 3.0, 'lead': 0.6},
+                                                           'M/bad.wma': {'unsupported': True}}
     op = signed_in(app, 'operator')
     assert op.post('/api/v1/control', json={'station': 'L1', 'cmd': 'queue_add', 'args': {'key': 'M/bad.wma'}},
                    headers=WEB).status_code == 400

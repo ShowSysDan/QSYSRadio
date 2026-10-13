@@ -140,7 +140,7 @@ def core_sync(conn, payload, now):
 
 def core_library(conn, payload):
     """The Core's file list after a scan. Returns (count, per-file figures the
-    Core uses: {key: {trail, unsupported}}, log_line)."""
+    Core uses: {key: {trail, lead} | {unsupported}}, log_line)."""
     station = _station_name(payload)
     items = payload.get('items')
     if items == {}:                 # Lua encodes an empty table as {}
@@ -177,9 +177,13 @@ def core_library(conn, payload):
                            imaging_dir = EXCLUDED.imaging_dir, ads_dir = EXCLUDED.ads_dir""",
                     (station, text(payload.get('music_dir'), 500), text(payload.get('imaging_dir'), 500),
                      text(payload.get('ads_dir'), 500)))
-        cur.execute("""SELECT key, trail_s, unsupported FROM library
-                       WHERE station = %s AND present AND (trail_s IS NOT NULL OR unsupported)""", (station,))
-        learned = {r['key']: ({'unsupported': True} if r['unsupported'] else {'trail': round(r['trail_s'], 2)})
+        # what the Core uses: unsupported files, and for music the quiet start / end (where to start, when to crossfade)
+        cur.execute("""SELECT key, trail_s, lead_in_s, unsupported FROM library
+                       WHERE station = %s AND present
+                         AND (unsupported OR (kind = 'music' AND (trail_s IS NOT NULL OR lead_in_s IS NOT NULL)))""",
+                    (station,))
+        learned = {r['key']: {'unsupported': True} if r['unsupported'] else
+                   {k: round(r[c], 2) for k, c in (('trail', 'trail_s'), ('lead', 'lead_in_s')) if r[c] is not None}
                    for r in cur.fetchall()}
     conn.commit()
     counts = ' '.join(f'{k}={sum(1 for r in rows.values() if r[2] == k)}' for k in KINDS)

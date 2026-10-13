@@ -17,7 +17,7 @@ SETTINGS = {
   music_dir = "Test/Tuning/", imaging_dir = "Test/Imaging/", ads_dir = "",
   play_gain_db = 0, imaging_gain_db = 0, ad_gain_db = 0, ad_every_n_tracks = 0, ads_per_break = 2,
   crossfade_s = 4, fade_in_s = 0, skip_fade_s = 1.5, silence_fade_s = 1, stop_fade_s = 2, bumper_fade_s = 2,
-  silence_threshold_dbfs = -50, silence_hold_s = 2, end_guard_s = 20,
+  silence_threshold_dbfs = -50, silence_hold_s = 2, end_guard_s = 20, lead_skip_max_s = 3, lead_skip_keep_s = 0.3,
   bumper_every_n_tracks = 4, bumper_tail_s = 1, artist_separation = 2, dead_air_s = 1.5,
 }
 DEFAULTS = {}
@@ -129,7 +129,7 @@ local function emit(kind, data)
 end
 
 -- ── LIBRARY ───────────────────────────────────────────────────────────────────
--- per file: { trail = s, unsupported = true }, from the server after each upload + this boot's plays
+-- per file: { trail = s, lead = s, unsupported = true }, from the server after each upload + this boot's plays
 LEARNED = {}
 Library = { music = {}, imaging = {}, ad = {}, byKey = {}, root = "Audio/" }
 
@@ -204,6 +204,7 @@ function Library.learn(map)
     if type(v) == "table" then
       local L, trail = LEARNED[key] or {}, tonumber(v.trail)
       if trail then L.trail = math.min(L.trail or trail, trail) end
+      L.lead = tonumber(v.lead) or L.lead
       if v.unsupported == true then L.unsupported = true end
       LEARNED[key] = L
       if L.unsupported and Library.byKey[key] then Library.remove(Library.byKey[key]) end
@@ -214,7 +215,7 @@ end
 -- ── DECK ──────────────────────────────────────────────────────────────────────
 Deck = {}
 Deck.__index = Deck
-local DECK_CONTROLS = { "gain", "play", "stop", "playing", "filename", "filename.ui", "directory", "root",
+local DECK_CONTROLS = { "gain", "play", "stop", "playing", "locate", "filename", "filename.ui", "directory", "root",
                         "status", "remaining", "loop", "mute" }
 
 function Deck.new(id, compName, meterIdx)
@@ -290,7 +291,8 @@ function Deck:pollLoad(t)
   end
 end
 
-function Deck:play(gainDb, fadeInS)
+-- skip = seconds of quiet start to jump over (seek right after play: an early seek only plays silence)
+function Deck:play(gainDb, fadeInS, skip)
   self.fade = nil
   if fadeInS and fadeInS > 0 then
     self:setGain(K.floor_db)
@@ -301,7 +303,8 @@ function Deck:play(gainDb, fadeInS)
   end
   self.expectStop = false
   trigger(self.c.play)
-  self.state, self.playStart = "playing", now()
+  if skip > 0 then set(self.c.locate, "Value", skip) end
+  self.state, self.playStart = "playing", now() - skip   -- times stay file positions
   self.firstAudioAt, self.lastAudioAt, self.silentSince, self.peakMax = nil, nil, nil, nil
 end
 
@@ -499,7 +502,11 @@ function Station.finishTrack(d, reason)
   local ev = { deck = d.id, file = tr.name, dir = tr.dir, reason = reason,
                played = d.playStart and round(now() - d.playStart, 1) or nil }
   if tr.kind == "music" then           -- this play's measurements; the server keeps them per file
-    if d.firstAudioAt and d.playStart then ev.lead_in = round(d.firstAudioAt - d.playStart, 2) end
+    if d.firstAudioAt and d.playStart then
+      ev.lead_in = round(d.firstAudioAt - d.playStart, 2)
+      LEARNED[tr.key] = LEARNED[tr.key] or {}
+      LEARNED[tr.key].lead = ev.lead_in
+    end
     if (reason == "end" or reason == "silence" or reason == "eof") and d.lastAudioAt and d.playStart and d.duration then
       ev.trail = round(math.max(0, d.duration - (d.lastAudioAt - d.playStart)), 2)
       local L = LEARNED[tr.key] or {}
@@ -542,13 +549,15 @@ function Station.startTrack(deck, track, opts, attempt)
       end
       return
     end
-    d:play(SETTINGS[KINDS[track.kind].gain], opts.fadeIn or 0)
+    local L = track.kind == "music" and LEARNED[track.key] or {}
+    local skip = L.lead and math.min(SETTINGS.lead_skip_max_s, math.max(0, L.lead - SETTINGS.lead_skip_keep_s)) or 0
+    d:play(SETTINGS[KINDS[track.kind].gain], opts.fadeIn or 0, skip)
     if track.kind == "music" then
       Station.live, Station.other, Station.state = d, otherDeck(d), "playing"
       Station.tracksSinceBumper, Station.tracksSinceAd = Station.tracksSinceBumper + 1, Station.tracksSinceAd + 1
       push(Station.history, track, 50)
       emit("track_start", { deck = d.id, file = track.name, dir = track.dir, artist = track.artist,
-        title = track.title, duration = round(d.duration or 0, 1) })
+        title = track.title, duration = round(d.duration or 0, 1), skip = skip > 0 and round(skip, 1) or nil })
     else
       Station.spotDeck, Station.state = d, (track.kind == "ad" and "ad" or "bumper")
       if track.kind == "ad" then Station.tracksSinceAd = 0 else Station.tracksSinceBumper = 0 end

@@ -165,6 +165,9 @@ MockCore.run(40)
 local during = outboxFile()
 check(during and #during > 0, string.format("written during the outage (%d events)", during and #during or 0))
 MockCore.run(60)
+Tick:Stop()                            -- no new events, then let the sender and the 30 s file write catch up
+MockCore.run(35)
+Tick:Start(0.25)
 local after = outboxFile()
 check(after and #after == 0 and #Server.outbox == 0, "emptied once delivered")
 
@@ -180,6 +183,32 @@ for _, e in ipairs(evs("track_start")) do heard[e.file] = true end
 local missing = 0
 for _, tr in ipairs(many) do if not heard[tr.name] then missing = missing + 1 end end
 check(missing == 0, string.format("all 24 songs played in %d plays with a rescan every 75 s (%d never)", count("track_start"), missing))
+
+print("-- quiet start skipped from the second play on; lead-in still measured from the file start")
+boot({ { name = "A - Quiet.flac", duration = 25, lead = 4.0, trail = 0.5, level = -10 },
+       { name = "B - Song.flac", duration = 25, lead = 0.2, trail = 0.5, level = -10 } }, {})
+SETTINGS.bumper_every_n_tracks, SETTINGS.artist_separation = 0, 0
+MockCore.run(140)
+local quiet = {}
+for _, e in ipairs(EVENTS) do
+  if e.file == "A - Quiet.flac" and (e.kind == "track_start" or e.kind == "track_end") then quiet[#quiet + 1] = e end
+end
+local firstStart, laterStart, laterEnd
+for _, e in ipairs(quiet) do
+  if e.kind == "track_start" then
+    if not firstStart then firstStart = e elseif not laterStart then laterStart = e end
+  elseif laterStart and not laterEnd and e.kind == "track_end" then laterEnd = e end
+end
+check(firstStart and not firstStart.skip and laterStart and laterStart.skip == 3,
+  string.format("first play from 0:00, later play skips %s s (capped at 3)", laterStart and tostring(laterStart.skip) or "-"))
+check(laterEnd and laterEnd.lead_in and math.abs(laterEnd.lead_in - 4) <= 0.5,
+  string.format("lead-in still reported from the file start (%s s)", laterEnd and tostring(laterEnd.lead_in) or "-"))
+SETTINGS.lead_skip_max_s = 0
+local before = #evs("track_start")
+MockCore.run(60)
+local off = true
+for i, e in ipairs(evs("track_start")) do if i > before and e.skip then off = false end end
+check(off, "lead_skip_max_s = 0: every song from the start")
 
 print("-- lightweight: fast timer only while fading/loading")
 boot(songs(6, 60), BUMPERS)
