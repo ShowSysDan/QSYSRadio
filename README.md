@@ -176,17 +176,26 @@ The Core can also run on its own, without the server: do only
 | Need | Details |
 |---|---|
 | App server | Debian 11+ or Ubuntu 22.04+ (Python 3.9 or later, systemd) and a login user with sudo |
-| PostgreSQL | 13 or later (what 321Theater needs; QSYSRadio is tested on 16), normally the server 321Theater already uses |
-| 321Theater | Installed in that database first. It creates `shared.users`, the accounts everyone signs in with |
+| PostgreSQL | 13 or later (what 321Theater needs; QSYSRadio is tested on 16): normally the server 321Theater already uses (2A), or a new one on this machine (2B) |
+| 321Theater | Needed for sign-in. It creates `shared.users`, the accounts everyone signs in with, and it is where you manage them: QSYSRadio has no account admin of its own. 2B shows how to install it |
 | Q-SYS | Designer 9.x / 10.x and a Core that runs scripts (a Core Nano or Core 8 Flex needs the Scripting Engine licence; if the probe ran, you have it) |
 | Network | Core → server TCP 5410, staff browsers → server TCP 5410, server → PostgreSQL TCP 5432 |
+
+Replace these placeholders with yours:
+
+| Placeholder | What to put |
+|---|---|
+| `<db-host>` | The PostgreSQL server; `localhost` when it runs on this machine |
+| `<dbname>` | `321theater`; `radio` only in 2B without sign-in |
+| `<password>` | The password of the `qsysradio` role (step 2) |
+| `<server-ip>` | This server's address on the Core's network |
+| `<core-ip>`, `<staff-subnet>` | The Core's address; the staff PCs' subnet, e.g. `10.0.20.0/24` |
 
 The commands use 321Theater's defaults: database `321theater`, role
 `showadvance`, shared schema `shared`. If its `.env` (`PG_DBNAME`, `PG_USER`,
 `PG_SHARED_SCHEMA`; usually `~/321theater/.env` on its server) says
-otherwise, use its values. Replace `<db-host>` (the PostgreSQL server),
-`<server-ip>` (this server's address on the Core's network), `<core-ip>` and
-`<password>` with yours.
+otherwise, use its values. They also use QSYSRadio's port 5410: if you set
+another `APP_PORT` in step 4, use yours in every command below.
 
 ### 1. Install the packages
 
@@ -211,7 +220,8 @@ Expect `Python 3.9` or later. Ubuntu 20.04 has 3.8, which install.sh refuses.
 
 ### 2. Prepare PostgreSQL
 
-Do 2A (the normal case) or 2B.
+Do 2A when 321Theater already runs somewhere (the normal case), or 2B for a
+new PostgreSQL on this machine.
 
 #### 2A. Join 321Theater's database (normal case)
 
@@ -249,14 +259,18 @@ ALTER DEFAULT PRIVILEGES FOR ROLE qsysradio IN SCHEMA qsysradio GRANT SELECT ON 
 \q
 ```
 
-- Without `USAGE` on `shared` the migration fails and the service cannot
-  start. Without the other two `shared` grants it starts, but sign-in fails.
+Each line answers `CREATE ROLE`, `GRANT`, `CREATE SCHEMA` or
+`ALTER DEFAULT PRIVILEGES`, with no `ERROR`.
+
+- Without the three `shared` grants the service still starts, but nobody
+  can sign in. At every start the journal names what is missing, e.g.
+  `migrate: WARNING sign-in will not work: GRANT SELECT ON "shared".users TO "qsysradio";`.
 - Without the last five lines, 321Theater's own backups fail with
   `permission denied for schema qsysradio` once QSYSRadio has tables. With
   them, its backups include the radio data. Restore QSYSRadio from its own
   dump (step 12), not from 321Theater's.
-- Do not grant `CREATE` on `shared`. If QSYSRadio created `app_sessions`
-  itself, the table would belong to `qsysradio`.
+- QSYSRadio needs no `CREATE` on `shared`: it never creates or changes
+  anything there.
 - Simpler, less isolated: use 321Theater's role as `PG_USER`. It owns the
   database, so none of the above is needed.
 
@@ -291,28 +305,91 @@ failed` point to the list just above.
 
 #### 2B. A new PostgreSQL on this machine
 
-Sign-in reads `shared.users`, which only 321Theater creates. Choose one:
+Sign-in reads `shared.users`, which only 321Theater creates, and accounts
+are added and enabled in 321Theater. So there are two options: install
+321Theater here first, or run without sign-in until you do.
 
-- **With sign-in (recommended).** Install PostgreSQL
-  (`sudo apt-get install -y postgresql`). Install 321Theater on it first,
-  following its README: you create the database `321theater` and its role,
-  and its installer adds the shared tables and an `admin` account. Then do
-  2A with `localhost`, skipping the remote-access list.
-- **Without sign-in for now.** Give QSYSRadio its own database:
-  ```
-  sudo apt-get install -y postgresql
-  sudo -u postgres psql -c "CREATE ROLE qsysradio LOGIN PASSWORD '<password>';"
-  sudo -u postgres psql -c "CREATE DATABASE radio OWNER qsysradio;"
-  psql "host=localhost dbname=radio user=qsysradio" -c 'SELECT version();'
-  ```
-  The service, the Core link and the play log all work (read the play log
-  with SQL; see [Play log](#play-log-what-played-when)). Nobody can sign in
-  to the web panel, though. The sign-in page says "The shared user directory
-  is not available. Ask an administrator." To add sign-in later:
-  1. Install 321Theater into this same database. Set its `PG_DBNAME=radio`
-     and first run `GRANT CREATE ON DATABASE radio TO showadvance;`.
-  2. Run the lines of 2A that come after `CREATE SCHEMA`.
-  3. Run `sudo systemctl restart qsysradio`.
+**With sign-in (recommended): 321Theater first, then 2A.** Its own README
+(<https://github.com/ShowSysDan/321Theater>) has the details; this is the
+short path.
+
+1. Install PostgreSQL and the libraries 321Theater's PDF export needs:
+   ```
+   sudo apt-get update
+   sudo apt-get install -y postgresql libpango-1.0-0 libpangoft2-1.0-0 libffi-dev libcairo2
+   sudo -u postgres psql -c 'SELECT version();'
+   ```
+   Expect a `version` row starting `PostgreSQL 1`.
+2. Make a password for 321Theater's role (letters and digits, as in 2A),
+   then create the role and its database:
+   ```
+   python3 -c 'import secrets; print(secrets.token_hex(16))'
+   sudo -u postgres psql -c "CREATE ROLE showadvance LOGIN PASSWORD '<theater-password>';"
+   sudo -u postgres psql -c 'CREATE DATABASE "321theater" OWNER showadvance;'
+   ```
+   Expect `CREATE ROLE`, then `CREATE DATABASE`.
+3. Install 321Theater:
+   ```
+   cd ~
+   git clone https://github.com/ShowSysDan/321Theater.git 321theater
+   cd 321theater
+   cp .env.example .env
+   chmod 600 .env
+   nano .env
+   sudo ./install.sh
+   ```
+   In its `.env`, set `PG_PASSWORD=<theater-password>`. Its other defaults
+   fit (`PG_HOST=localhost`, `PG_DBNAME=321theater`, `PG_USER=showadvance`,
+   `PG_SHARED_SCHEMA=shared`). With sudo, its installer also installs
+   LibreOffice, a large download. Expect
+   `✓ Admin account:   username=admin  password=admin123`, then
+   `Service is running.` and `Open 321Theater at: http://<server-ip>:5400`.
+4. Allow port 5400 for the staff PCs as in step 7. Open
+   `http://<server-ip>:5400/`, sign in as `admin` / `admin123` and set a
+   new password when asked. The installer's closing banner says
+   `admin / admin`; the password is `admin123`.
+5. Do 2A on this machine: `<db-host>` is `localhost`, and skip the
+   remote-access list.
+
+**Without sign-in for now: QSYSRadio's own database.** The service, the
+Core link and the play log all work (read the play log with SQL; see
+[Play log](#play-log-what-played-when)). Nobody can sign in to the web
+panel, though.
+
+```
+sudo apt-get update
+sudo apt-get install -y postgresql
+python3 -c 'import secrets; print(secrets.token_hex(16))'
+sudo -u postgres psql -c "CREATE ROLE qsysradio LOGIN PASSWORD '<password>';"
+sudo -u postgres psql -c "CREATE DATABASE radio OWNER qsysradio;"
+psql "host=localhost dbname=radio user=qsysradio" -c 'SELECT version();'
+```
+
+The third line makes `<password>` (letters and digits only, see 2A). The
+last one asks for it; expect a `version` row starting `PostgreSQL 1`. From
+here on `<db-host>` is `localhost` and `<dbname>` is `radio`. Skip steps
+8–10. The sign-in page says "Sign-in is not available: QSYSRadio cannot use
+the shared user tables. An administrator should check the server log."
+
+To add sign-in later, install 321Theater into this same database:
+
+1. Make a password for its role (as above), then create the role and let it
+   create its schemas in `radio`:
+   ```
+   sudo -u postgres psql -c "CREATE ROLE showadvance LOGIN PASSWORD '<theater-password>';"
+   sudo -u postgres psql -d radio -c 'GRANT CREATE ON DATABASE radio TO showadvance;'
+   ```
+2. Do steps 1, 3 and 4 of "With sign-in" above, with `PG_DBNAME=radio` as
+   well as `PG_PASSWORD` in 321Theater's `.env`. Skip its step 2.
+3. Open `sudo -u postgres psql -d radio`, paste the 2A SQL from
+   `GRANT USAGE ON SCHEMA shared` to the end, and `\q`.
+4. Check, with the `qsysradio` password. Expect two counts:
+   ```
+   psql "host=localhost dbname=radio user=qsysradio" \
+     -c 'SELECT count(*) FROM shared.users;' -c 'SELECT count(*) FROM shared.app_sessions;'
+   ```
+5. Run `sudo systemctl restart qsysradio`, then do steps 8–10. `<dbname>`
+   stays `radio`.
 
 ### 3. Clone the code
 
@@ -326,14 +403,27 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `0.3.0-dev`.
+Expect the version, e.g. `0.3.0-dev`. If `cat` says
+`No such file or directory`, the branch you cloned does not hold the server
+yet. List the branches with `git branch -r` and switch with
+`git checkout <branch>` (the name without `origin/`).
 
 - To install a branch other than the default, add `-b <branch>` to the clone.
 - A private repository needs a GitHub token or SSH key.
 - install.sh refuses a root shell ("Run as your own user via sudo (sudo
-  ./install.sh), not as root directly."). To run the service as an account
-  without sudo (e.g. `radio`), clone into that account's home. Then run the
-  installer from a root shell as `SUDO_USER=radio ./install.sh`.
+  ./install.sh), not as root directly.").
+- To run the service as an account without sudo (e.g. `radio`), clone and
+  fill in `.env` as that account, then run the installer for it from your
+  own login:
+  ```
+  sudo -u radio -H git clone https://github.com/ShowSysDan/QSYSRadio.git /home/radio/QSYSRadio
+  sudo -u radio cp /home/radio/QSYSRadio/.env.example /home/radio/QSYSRadio/.env
+  sudo -u radio chmod 600 /home/radio/QSYSRadio/.env
+  sudo -u radio nano /home/radio/QSYSRadio/.env
+  sudo env SUDO_USER=radio /home/radio/QSYSRadio/install.sh
+  ```
+  Later commands that say `~/QSYSRadio` then mean `/home/radio/QSYSRadio`,
+  run as that account, e.g. `sudo -u radio -H git -C /home/radio/QSYSRadio pull`.
 
 ### 4. Fill in .env
 
@@ -345,14 +435,14 @@ nano .env
 
 | Key | What to put |
 |---|---|
-| `PG_HOST` | `<db-host>`; `localhost` when PostgreSQL is on this machine (`/var/run/postgresql` for the local socket) |
+| `PG_HOST` | `<db-host>` (`localhost` when PostgreSQL is on this machine). Not the socket path `/var/run/postgresql`: Debian's default `peer` rule refuses it for this role |
 | `PG_PORT` | `5432` unless 321Theater's `.env` says otherwise |
-| `PG_DBNAME` | `321theater` (2A) or `radio` (2B without sign-in) |
+| `PG_DBNAME` | `<dbname>`: `321theater`, or `radio` in 2B without sign-in |
 | `PG_USER`, `PG_PASSWORD` | `qsysradio` and the password from step 2 |
 | `PG_APP_SCHEMA` | leave `qsysradio` |
 | `PG_SHARED_SCHEMA` | 321Theater's `PG_SHARED_SCHEMA` (`shared`) |
 | `TIMEZONE` | uncomment and set the station's zone, e.g. `America/New_York` (empty = the PostgreSQL server's zone) |
-| `APP_PORT` | `5410` unless something else uses it |
+| `APP_PORT` | `5410` unless something else uses it. If you change it, use your port wherever this guide says 5410 (health, firewall, `CFG.SERVER_URL`) |
 | `SECRET_KEY`, `RADIO_API_TOKEN` | leave empty: install.sh generates them |
 | `WEB_WORKERS`, `WEB_THREADS`, `PG_POOL_MAX_IDLE` | leave commented (4 × 8, 4). A server can open up to WEB_WORKERS × (WEB_THREADS + 2) = 40 PostgreSQL connections; check `SHOW max_connections;` (default 100) covers the sister apps too |
 | `SESSION_COOKIE_SECURE`, `SESSION_COOKIE_DOMAIN` | leave unset unless step 10 says otherwise |
@@ -360,7 +450,14 @@ nano .env
 | `RADIO_ALLOW_NO_TOKEN` | never on a real station |
 
 One `KEY=value` per line, no spaces around `=`, no comment on the same line.
-Check with `grep -E '^PG_' .env`.
+Check:
+
+```
+ls -l .env
+grep -E '^(PG_|APP_PORT|TIMEZONE)' .env
+```
+
+Expect `-rw-------` and your values.
 
 ### 5. Run the installer
 
@@ -401,15 +498,18 @@ migrate: schema "qsysradio" at version 0004
   Logs:    journalctl -u qsysradio -f
 ```
 
-Keep the two `CFG` lines for step 11. In 2B you also see
-`migrate: created schema "qsysradio"`, and without 321Theater the warning
-`migrate: WARNING "shared".users not found; ...`.
+Keep the two `CFG` lines for step 11.
 
+- In 2B without sign-in you also see `migrate: created schema "qsysradio"`
+  before the `applied` lines, and before the last line
+  `migrate: WARNING sign-in will not work: schema "shared" does not exist (321Theater creates it; check PG_SHARED_SCHEMA)`.
+  Anywhere else, a `sign-in will not work` line names a missing grant (see
+  [Troubleshooting](#troubleshooting)).
 - The address shown is the first from `hostname -I`. On a server with several
   networks, use the one the Core can reach.
 - Print the token again any time: `grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`.
 - Re-running is safe: the secrets in `.env` are kept and only pending
-  migrations run.
+  migrations run (`... at version 0004 (nothing to do)`).
 - Without sudo (`./install.sh`) it sets up the venv, `.env` and the database,
   ends with `Done (no systemd service without sudo).` and prints no `CFG`
   lines. `./start.sh` then runs the server in the foreground.
@@ -421,9 +521,13 @@ Keep the two `CFG` lines for step 11. In 2B you also see
 
 ### 6. Check the service
 
+gunicorn logs every request (with a Core connected, one a second), so the
+journal commands in this guide filter those lines out with
+`grep -v ' HTTP/1\.'`.
+
 ```
 systemctl status qsysradio --no-pager
-journalctl -u qsysradio -n 30 --no-pager
+journalctl -u qsysradio --since "10 min ago" --no-pager | grep -v ' HTTP/1\.'
 curl -s http://localhost:5410/api/v1/health; echo
 ```
 
@@ -431,8 +535,10 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `[qsysradio] 0.3.0-dev starting on port 5410 (4x8)` and
-  gunicorn's `Listening at: http://0.0.0.0:5410`.
+- In the journal: `migrate: schema "qsysradio" at version 0004 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 0.3.0-dev starting on port
+  5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
+  `sign-in will not work` line, except in 2B without sign-in.
 - From curl:
   ```
   {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":4,"schema_version":4,"version":"0.3.0-dev"}
@@ -441,8 +547,9 @@ Expect:
 `"ok":false` (still HTTP 200) means the schema version differs from the
 code's. HTTP 503 with "The radio server cannot reach its database" means
 PostgreSQL is unreachable. The health check does not test the `shared`
-grants; signing in (step 9) does. To list applied and pending migrations,
-run `venv/bin/python -m server.migrate --status` from `~/QSYSRadio`.
+grants; the `sign-in will not work` lines and signing in (step 9) do. To
+list applied and pending migrations, run
+`venv/bin/python -m server.migrate --status` from `~/QSYSRadio`.
 
 ### 7. Open the port
 
@@ -455,8 +562,16 @@ sudo ufw allow from <staff-subnet> to any port 5410 proto tcp
 sudo ufw status
 ```
 
-With firewalld:
-`sudo firewall-cmd --permanent --add-port=5410/tcp && sudo firewall-cmd --reload`.
+Expect `5410/tcp  ALLOW  <core-ip>` and the same for `<staff-subnet>`
+(`Status: inactive` means ufw is off). With firewalld:
+
+```
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="<core-ip>/32" port port="5410" protocol="tcp" accept'
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="<staff-subnet>" port port="5410" protocol="tcp" accept'
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-rich-rules
+```
+
 If neither is active, there is nothing to open here. Firewalls between VLANs
 still need the same rule. Check from a staff PC:
 `http://<server-ip>:5410/api/v1/health` shows the JSON from step 6.
@@ -465,6 +580,8 @@ The server itself connects out to PostgreSQL (5432) and, if `SYSLOG_HOST` is
 set, to syslog (514).
 
 ### 8. Give people access (in 321Theater)
+
+In 2B without sign-in, skip steps 8–10 and go on with step 11.
 
 QSYSRadio never writes accounts. Access comes from two flags on each
 321Theater account, set by a 321Theater admin:
@@ -477,7 +594,8 @@ QSYSRadio never writes accounts. Access comes from two flags on each
 3. Under **OTHER APPLICATIONS**, tick **Is App User** (watch and operate),
    and **Is App Admin** for station settings. Click **Save Changes**.
 
-What each flag allows is under [Sign-in](#sign-in).
+What each flag allows is under [Sign-in](#sign-in). 321Theater's `admin`
+role counts as Is App Admin here.
 
 - Accounts made with **Add User** start with both flags off. Edit them
   afterwards.
@@ -491,7 +609,8 @@ What each flag allows is under [Sign-in](#sign-in).
 ### 9. First sign-in
 
 Open `http://<server-ip>:5410/` and sign in with your 321Theater username and
-password. The dashboard says "No Core has connected yet" until step 11.
+password. Expect the dashboard; it says "No Core has connected yet" until
+step 11.
 
 | The sign-in page says | Fix |
 |---|---|
@@ -499,8 +618,8 @@ password. The dashboard says "No Core has connected yet" until step 11.
 | Your account does not have access to QSYSRadio. Ask an administrator to enable it. | Step 8 |
 | You must change your password in 321Theater before using QSYSRadio. | Change it in 321Theater |
 | Too many sign-in attempts. Wait a minute and try again. | Wait a minute |
-| The shared user directory is not available. Ask an administrator. | See [Troubleshooting](#troubleshooting) |
-| Internal Server Error | A `shared` grant is missing (step 2A); the journal says which table |
+| Sign-in is not available: QSYSRadio cannot use the shared user tables. An administrator should check the server log. | 321Theater's tables are missing or not granted: see [Troubleshooting](#troubleshooting) |
+| No message, but you are back on the sign-in page | The `shared.app_sessions` grant (step 2A), or a cookie setting (step 10): see [Troubleshooting](#troubleshooting) |
 
 ### 10. Shared sign-in with the other apps
 
@@ -525,7 +644,9 @@ sends both the same `session` cookie:
 - Keep the app servers' clocks in sync (`timedatectl` shows
   `System clock synchronized: yes`): sessions expire by the clock.
 
-Restart after editing `.env`: `sudo systemctl restart qsysradio`.
+Restart after editing `.env`: `sudo systemctl restart qsysradio`. To check,
+sign in to 321Theater, then open QSYSRadio on the same host name: with an
+account that has access, the dashboard opens without asking.
 
 ### 11. Connect the Q-SYS Core
 
@@ -577,8 +698,12 @@ In Q-SYS Designer, with the station's design open:
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds the dashboard shows
    `· Main · radio.lua 0.3.0-dev` next to Transport, in place of "No Core has
-   connected yet". The journal (`journalctl -u qsysradio -f`) shows
-   `INFO BOOT station=Main ...` and then `PLAY` lines.
+   connected yet". The journal shows `INFO BOOT station=Main ...` and then
+   `PLAY` lines:
+   ```
+   journalctl -u qsysradio -f | grep -v ' HTTP/1\.'
+   ```
+   Ctrl+C stops it.
 
 The Core only makes outbound HTTP requests. Its control LAN (usually LAN A)
 must reach `<server-ip>` by one of three routes: the same subnet, its default
@@ -594,10 +719,11 @@ Debug Output from `===== PROBE START` to `===== PROBE END`.
 
 ### 12. Back up
 
-Back up before every update, and on a schedule if you like:
+Back up before every update, and on a schedule if you like. On the app
+server (it asks for the `qsysradio` password):
 
 ```
-pg_dump -h <db-host> -p 5432 -U qsysradio -d 321theater -n qsysradio -Fc -f ~/qsysradio-$(date +%F).dump
+pg_dump -h <db-host> -p 5432 -U qsysradio -d <dbname> -n qsysradio -Fc -f ~/qsysradio-$(date +%F).dump
 cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
@@ -607,7 +733,7 @@ The last line prints the number of tables (7 in 0.3.0-dev).
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
 - To skip the password prompt (e.g. from cron), put
-  `<db-host>:5432:321theater:qsysradio:<password>` in `~/.pgpass`, then run
+  `<db-host>:5432:<dbname>:qsysradio:<password>` in `~/.pgpass`, then run
   `chmod 600 ~/.pgpass`.
 - The accounts (`shared`) are 321Theater's to back up.
 - `.env` holds the database password and the Core token. Keep the copy
@@ -623,7 +749,7 @@ Take a backup first (step 12). Then:
 cd ~/QSYSRadio
 git pull
 sudo systemctl restart qsysradio
-journalctl -u qsysradio -n 30 --no-pager
+journalctl -u qsysradio --since "5 min ago" --no-pager | grep -v ' HTTP/1\.'
 curl -s http://localhost:5410/api/v1/health; echo
 ```
 
@@ -632,7 +758,8 @@ migrations) and `starting on port`, then `"ok":true` from curl.
 
 Every start (`start.sh`) does three things in order:
 
-1. It installs Python packages if `requirements.txt` changed. This needs
+1. It installs Python packages if `requirements.txt` changed
+   (`requirements.txt changed, installing dependencies...`). This needs
    PyPI (step 1); without it the service restarts every 5 s.
 2. It applies new `server/migrations/NNNN_*.sql` in order. Each runs in one
    transaction, is recorded in `qsysradio.schema_migrations`, and is
@@ -646,6 +773,8 @@ Every start (`start.sh`) does three things in order:
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
+- The Core keeps playing during the restart. Its Debug Output may show one
+  `! server: sync failed`, then `server: reachable again`.
 
 ### 14. Roll back
 
@@ -657,32 +786,65 @@ cd ~/QSYSRadio
 git log --oneline -n 10
 git checkout <commit>
 sudo systemctl restart qsysradio
+curl -s http://localhost:5410/api/v1/health; echo
 ```
 
 The database stays at the newer schema. The service still starts, and health
-shows `"ok":false` (`schema_version` above `schema_expected`). If the old
-code does not work with the newer schema, restore the backup taken before the
-update:
+shows `"ok":false` with `schema_version` above `schema_expected`. Only
+health shows that: `migrate` and `--status` list just the migrations the
+older code knows.
+
+If the old code does not work with the newer schema, restore the backup
+taken before the update. Stop the service first:
 
 ```
 sudo systemctl stop qsysradio
-psql -h <db-host> -U qsysradio -d 321theater -c 'DROP SCHEMA qsysradio CASCADE;'
-# then, on the database server, as the PostgreSQL superuser:
-sudo -u postgres pg_restore -d 321theater < qsysradio-YYYY-MM-DD.dump
-# back on the app server:
-sudo systemctl start qsysradio
 ```
 
-This brings back the schema, its owner and its grants. In 2B the role owns
-the database and can restore it alone:
-`pg_restore -h localhost -U qsysradio -d radio < qsysradio-YYYY-MM-DD.dump`.
-Go back to current code with `git checkout main && git pull` (or the branch
-you deploy).
+When `<dbname>` is `321theater` (2A, 2B with sign-in), the PostgreSQL
+superuser restores it, because QSYSRadio's role may not create schemas there.
+If the database runs on another machine, copy the dump to your home folder
+there first (add `user@` before `<db-host>` if your login there differs):
+
+```
+scp ~/qsysradio-YYYY-MM-DD.dump <db-host>:
+```
+
+Then, on the database server:
+
+```
+sudo -u postgres psql -p 5432 -d 321theater -c 'DROP SCHEMA qsysradio CASCADE;'
+sudo -u postgres pg_restore -p 5432 -d 321theater < ~/qsysradio-YYYY-MM-DD.dump
+```
+
+When `<dbname>` is `radio` (2B without sign-in, also after adding 321Theater
+later), the role owns the database and restores it alone, on this machine:
+
+```
+psql -h localhost -p 5432 -U qsysradio -d radio -c 'DROP SCHEMA qsysradio CASCADE;'
+pg_restore -h localhost -p 5432 -U qsysradio -d radio < ~/qsysradio-YYYY-MM-DD.dump
+```
+
+Expect `DROP SCHEMA` (after a notice listing the tables) and no output from
+`pg_restore`. This brings back the schema, its owner and its grants. Then, on the app server:
+
+```
+sudo systemctl start qsysradio
+curl -s http://localhost:5410/api/v1/health; echo
+```
+
+Expect `"ok":true` again. Go back to current code with
+`git checkout main && git pull` (or the branch you deploy), then
+`sudo systemctl restart qsysradio`.
 
 ### Troubleshooting
 
-Messages come from the installer, from `journalctl -u qsysradio -n 50 --no-pager`,
-or from the Core's Debug Output.
+Messages come from the installer, from the journal, or from the Core's
+Debug Output. The journal's last hour, without the request lines:
+
+```
+journalctl -u qsysradio --since "1 hour ago" --no-pager | grep -v ' HTTP/1\.' | tail -n 50
+```
 
 **Install and start**
 
@@ -693,13 +855,15 @@ or from the Core's Debug Output.
 | `Created …/.env from .env.example. Fill in PG_DBNAME / PG_USER / PG_PASSWORD, then re-run.` | Step 4 (for a remote database also `PG_HOST`, `PG_PORT`) |
 | `migrate: PostgreSQL is not configured: set PG_HOST / PG_DBNAME / PG_USER / PG_PASSWORD in …` | `PG_DBNAME` or `PG_USER` is empty |
 | `migrate: PostgreSQL unreachable: … Connection refused` | Wrong `PG_HOST` / `PG_PORT`, `listen_addresses`, or a firewall (step 2A) |
+| `Connection refused` a few times right after a reboot, then the service runs | It started before PostgreSQL on the same machine and retried every 5 s. Nothing to fix |
+| `… Peer authentication failed for user "qsysradio"` | `PG_HOST` is a socket path: set `PG_HOST=localhost` |
 | `… no pg_hba.conf entry for host "…", user "…", database "…"` | Add the `pg_hba.conf` line and reload (step 2A) |
 | `… password authentication failed for user "…"` | `PG_USER` / `PG_PASSWORD` do not match the role |
 | `… database "…" does not exist` | `PG_DBNAME` |
 | `psycopg2.errors.InsufficientPrivilege: permission denied for database …` | The role may not create the schema: `CREATE SCHEMA qsysradio AUTHORIZATION qsysradio;` as superuser (step 2A) |
-| `psycopg2.errors.InsufficientPrivilege: permission denied for schema shared` (after `migrate: applied …`) | `GRANT USAGE ON SCHEMA shared TO qsysradio;` (step 2A). The service cannot start without it |
-| `migrate: WARNING "shared".users not found; sign-in will not work …` | 321Theater is not in this database, or `PG_SHARED_SCHEMA` differs from its value |
-| `migrate: WARNING could not create "shared".app_sessions (…)` | Start 321Theater once (it creates the table), then restart qsysradio |
+| `migrate: WARNING sign-in will not work: schema "shared" does not exist (…)` | 321Theater is not in this database (expected in 2B without sign-in), or `PG_SHARED_SCHEMA` differs from its value |
+| `migrate: WARNING sign-in will not work: GRANT …` (or `… no USAGE on schema "shared": GRANT …`) | Run the `GRANT` it shows as the PostgreSQL superuser in this database (step 2A), then `sudo systemctl restart qsysradio`. The service runs meanwhile; only sign-in fails |
+| `migrate: WARNING sign-in will not work: "shared".app_sessions does not exist (…)` | Start or update 321Theater once (it creates the table), then restart qsysradio |
 | `migrate: FAILED NNNN_name.sql; rolled back` | The lines above say why. Nothing was changed; fix it and restart |
 | `[qsysradio] No virtualenv at …/venv. Run: sudo ./install.sh` | As it says |
 | `Connection in use: ('0.0.0.0', 5410)`, then `Can't connect to ('0.0.0.0', 5410)` | Another program has the port (`sudo ss -ltnp 'sport = :5410'`). Set `APP_PORT`, restart, then change `CFG.SERVER_URL` and the firewall to match |
@@ -711,10 +875,10 @@ or from the Core's Debug Output.
 |---|---|
 | Health: HTTP 503, `The radio server cannot reach its database. Reload in a moment.` | PostgreSQL is down or unreachable; the journal shows `database unavailable: …` |
 | Health: `"ok":false` (HTTP 200) | `schema_version` ≠ `schema_expected`: a migration failed (journal), or the code was rolled back (step 14) |
-| "The shared user directory is not available. Ask an administrator." (journal: `login: shared users table not found (is PG_SHARED_SCHEMA right?)`) | `PG_SHARED_SCHEMA` differs from 321Theater's, 321Theater is not in this database, or `USAGE` on `shared` is missing |
-| Sign-in shows "Internal Server Error" (journal: `permission denied for table users` or `… app_sessions`) | The grants on `shared.users` / `shared.app_sessions` (step 2A) |
+| "Sign-in is not available: QSYSRadio cannot use the shared user tables. …", or a "Sign-in unavailable" page (journal: `sign-in unavailable: relation "users" does not exist` or `permission denied for table …`) | 321Theater is not in this database, `PG_SHARED_SCHEMA` differs from its value, or a `shared` grant is missing. `journalctl -u qsysradio -g 'will not work' --no-pager` shows the `GRANT` to run (step 2A) |
+| Sign-in seems to work but lands on the sign-in page again; journal: `sign-in unavailable: permission denied for table app_sessions` | `GRANT SELECT, INSERT, UPDATE, DELETE ON shared.app_sessions TO qsysradio;` (step 2A) |
+| Sign-in lands on the sign-in page again, nothing in the journal | `SESSION_COOKIE_SECURE=1` over plain HTTP, or a `SESSION_COOKIE_DOMAIN` the other apps do not use (step 10) |
 | "Sign in from the QSYSRadio page." | The reverse proxy must pass the Host header (step 10) |
-| Sign-in succeeds but lands on the sign-in page again | `SESSION_COOKIE_SECURE=1` over plain HTTP, or a `SESSION_COOKIE_DOMAIN` the other apps do not use (step 10) |
 | "Your account is read-only." / "Administrators only." | Step 8 |
 
 **Core**
@@ -737,26 +901,34 @@ sudo rm /etc/systemd/system/qsysradio.service
 sudo systemctl daemon-reload
 ```
 
-Take a final backup (step 12). Then on the database server run
-`sudo -u postgres psql -d 321theater` and check who owns the shared sessions
-table:
+Take a final backup (step 12) first if you want the data. Then, on the
+database server, remove the schema and the role. In 2A, in 2B with sign-in,
+and in 2B where 321Theater was added to `radio` later, the database also
+holds 321Theater's data, so drop only QSYSRadio's part. Run
+`sudo -u postgres psql -d <dbname>` and first check who owns the shared
+sessions table:
 
 ```sql
 SELECT tableowner FROM pg_tables WHERE schemaname = 'shared' AND tablename = 'app_sessions';
 ```
 
-If it says `qsysradio`, first run
+If it says `qsysradio` (early 0.3.0-dev builds could create it), first run
 `ALTER TABLE shared.app_sessions OWNER TO showadvance;`. Otherwise
-`DROP OWNED` below would drop the table the other apps use. Then:
+`DROP OWNED` below would drop the table the other apps use. When
+`<dbname>` is `radio`, also run `ALTER DATABASE radio OWNER TO showadvance;`
+first: the role owns that database and could not be dropped. Then:
 
 ```sql
 DROP SCHEMA qsysradio CASCADE;
 DROP OWNED BY qsysradio;
 DROP ROLE qsysradio;
+\q
 ```
 
-In 2B (own database, nothing else in it), run instead
+Only in 2B without sign-in, where `radio` holds nothing else, drop the
+whole database instead:
 `sudo -u postgres psql -c 'DROP DATABASE radio;' -c 'DROP ROLE qsysradio;'`.
+
 Then remove the clone, which holds `.env` with the secrets:
 `rm -rf ~/QSYSRadio`. On the Core, remove the script and, if you like,
 `media/_radio/` in Core Manager.
@@ -794,7 +966,8 @@ so any number of people can watch at once.
 ### Sign-in
 
 The same accounts and sessions as 321Theater and the other apps
-(`shared.users`, `shared.app_sessions`; see FetchLog's SHARED_AUTH.md).
+(`shared.users`, `shared.app_sessions`; see FetchLog's
+[SHARED_AUTH.md](https://github.com/ShowSysDan/FetchLog/blob/main/SHARED_AUTH.md)).
 
 | Who | Can |
 |---|---|
