@@ -126,8 +126,10 @@
     if (loop.busy) return;
     loop.busy = true;
     try {
+      const sent = Date.now();
       const d = await R.api(R.withStation('/api/v1/now?plays=' + loop.plays));
       d.receivedAt = Date.now();
+      setClock(d.clock, sent, d.receivedAt);
       fillStations(d.stations || []);
       pillFor(d.station);
       noteCommands(d.station && d.station.commands);
@@ -157,8 +159,25 @@
       '<td>' + ended + '</td></tr>';
   };
 
+  // ── header clock: the server's time in its zone, 24 h; ticks locally between polls ──
   const clk = R.$('server-clock');
-  const tickClock = () => { if (clk) clk.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); };
-  tickClock();
+  let clock = null;                       // { offset: server ms - browser ms, zoneMin, zone, ntp }
+  function setClock(c, sent, received) {
+    if (!c || !R.num(c.server_ms)) return;
+    clock = { offset: c.server_ms - (sent + received) / 2, zoneMin: c.utc_offset_min || 0, zone: c.zone || '', ntp: c.ntp || {} };
+    const n = clock.ntp, off = R.num(n.offset_s);
+    clk.classList.toggle('bad', n.ok === false);
+    clk.classList.toggle('ok', n.ok === true);
+    clk.title = 'Server time (' + clock.zone + '). ' + (!n.server ? 'No NTP check: set an NTP server in Settings → Server settings.'
+      : n.error ? 'NTP ' + n.server + ' unreachable: ' + n.error
+      : off == null ? 'Checking NTP ' + n.server + '…'
+      : 'NTP ' + n.server + ': server is ' + (off >= 0 ? '+' : '') + off.toFixed(3) + ' s off (allowed ' + n.max_s + ' s), checked ' +
+        Math.round((n.checked_ago_s || 0) / 60) + ' min ago.');
+    tickClock();
+  }
+  function tickClock() {
+    if (!clk || !clock) return;
+    clk.textContent = new Date(Date.now() + clock.offset + clock.zoneMin * 60000).toISOString().slice(11, 19);
+  }
   setInterval(tickClock, 1000);
 })();

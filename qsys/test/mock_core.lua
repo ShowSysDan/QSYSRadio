@@ -154,7 +154,7 @@ local function mkPlayer(name, meterCtl)
     p.ctl[k] = mkctl{}
   end
   p.ctl["root"].String = "Audio/"
-  for _, k in ipairs({ "gain", "progress", "remaining" }) do p.ctl[k] = mkctl{ v = 0 } end
+  for _, k in ipairs({ "gain", "progress", "remaining", "locate" }) do p.ctl[k] = mkctl{ v = 0 } end
   for _, k in ipairs({ "loop", "mute", "playlist.repeat", "playlist.shuffle", "play.on.startup", "playing", "paused", "stopped" }) do
     p.ctl[k] = mkctl{}
   end
@@ -172,6 +172,17 @@ local function mkPlayer(name, meterCtl)
           __index = function(_, f) return c[f] end,
           __newindex = function(_, f, v)
             if f == "String" then p:requestLoad(v) else c[f] = v end
+          end,
+        })
+      elseif k == "locate" then       -- write-only seek (seconds) on the Core
+        return setmetatable({}, {
+          __index = function(_, f) return c[f] end,
+          __newindex = function(_, f, v)
+            c[f] = v
+            if f == "Value" and p.file then
+              p.pos = math.max(0, math.min(v, p.file.duration))
+              MockCore.note(p.name .. string.format(" LOCATE %.1f", p.pos))
+            end
           end,
         })
       elseif k == "directory" then

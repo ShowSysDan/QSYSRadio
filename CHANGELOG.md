@@ -7,6 +7,18 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Header clock is the server's time**, 24-hour and larger (it was the
+  browser's local time): every status poll carries the server time and zone,
+  the browser ticks between polls. Optional **NTP check** (Settings → Server
+  settings, or `NTP_SERVER`): the clock turns green / red against an
+  allowed error, with the measured offset in its tooltip; one warning is
+  logged when it goes wrong.
+- **Quiet starts skipped.** Songs start just before their first sound,
+  measured on earlier plays: settings "Skip quiet start, at most" (3 s, 0 =
+  off) and "Keep before the music" (0.3 s). The server sends each song's
+  lead-in with the library reply; the Core seeks the player (`locate`)
+  right after play. Lead-in is still measured from the file start; the ad
+  timing allows for the skip. `track_start` carries `skip`.
 - **Every song gets played; breaks land on time.** The server names the
   next song (`next` in the ad plan): a random one of the least recently
   played quarter of the music (never-played first, artist separation kept),

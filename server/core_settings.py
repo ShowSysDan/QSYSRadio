@@ -54,6 +54,11 @@ SPEC = [
      'How long it must stay below the threshold (seconds).'),
     ('end_guard_s', 'End guard', 'Silence detection', 'float', 0, 120, 1, 20,
      'Silence only counts within this many seconds of the end of a song.'),
+    ('lead_skip_max_s', 'Skip quiet start, at most', 'Silence detection', 'float', 0, 10, 0.5, 3,
+     'Songs start past their quiet beginning (measured on earlier plays), skipping at most this much '
+     '(seconds). 0 = always play from the start.'),
+    ('lead_skip_keep_s', 'Keep before the music', 'Silence detection', 'float', 0, 2, 0.1, 0.3,
+     'Start this long before the measured first sound, so soft fade-ins are not clipped (seconds).'),
 
     ('artist_separation', 'Artist separation', 'Rotation', 'int', 0, 20, 1, 2,
      'Avoid repeating an artist within the last N songs.'),

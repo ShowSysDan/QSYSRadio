@@ -99,7 +99,7 @@ def next_song(cur, station, slot_at=None):
     (or the best follow-up's end) falls soonest after the slot opens. Stable while one
     song plays (seeded by its play). None when the operator queue has songs,
     automation is off or nothing qualifies."""
-    cur.execute("""SELECT s.state, p.id, p.started_at, p.duration_s, l.trail_s, l.key
+    cur.execute("""SELECT s.state, p.id, p.started_at, p.duration_s, l.trail_s, l.lead_in_s, l.key
                    FROM stations s
                    LEFT JOIN LATERAL (SELECT * FROM play_log WHERE station = s.station AND kind = 'music' AND ended_at IS NULL
                                       ORDER BY started_at DESC LIMIT 1) p ON TRUE
@@ -109,7 +109,7 @@ def next_song(cur, station, slot_at=None):
     state = (on_air and on_air['state']) or {}
     if not on_air or state.get('queue') or state.get('automation') is not True:
         return None, None
-    cur.execute("""SELECT key, duration_s, trail_s, count(*) OVER () AS n FROM library
+    cur.execute("""SELECT key, duration_s, trail_s, lead_in_s, count(*) OVER () AS n FROM library
                    WHERE station = %s AND present AND NOT unsupported AND kind = 'music' AND key IS DISTINCT FROM %s
                      AND lower(COALESCE(artist, '')) NOT IN (
                          SELECT lower(artist) FROM (SELECT artist FROM play_log WHERE station = %s AND kind = 'music'
@@ -130,12 +130,12 @@ def next_song(cur, station, slot_at=None):
 
 def _fit(cur, on_air, pool, slot_at):
     """The pool song that lands the break soonest after slot_at, or None."""
-    xfade = float(_setting(cur, 'crossfade_s'))
+    xfade, skip_max, keep = (float(_setting(cur, n)) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s'))
 
-    def air(duration, trail):          # start to the next item's start: crossfade early by the learned tail
-        return duration - xfade - (trail or 0)
-    gap = (slot_at - on_air['started_at']).total_seconds() - air(on_air['duration_s'], on_air['trail_s'])
-    cands = [(r['key'], air(r['duration_s'], r['trail_s'])) for r in pool if r['duration_s']]
+    def air(r):                        # start to the next item's start: quiet start skipped, crossfade early by the tail
+        return r['duration_s'] - xfade - (r['trail_s'] or 0) - min(skip_max, max(0, (r['lead_in_s'] or 0) - keep))
+    gap = (slot_at - on_air['started_at']).total_seconds() - air(on_air)
+    cands = [(r['key'], air(r)) for r in pool if r['duration_s']]
     if gap <= 0 or not cands or gap > 2 * max(length for _, length in cands):
         return None                    # the break comes anyway, or too far off to plan
 
