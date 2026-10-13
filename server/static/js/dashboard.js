@@ -113,7 +113,7 @@
       e.stopPropagation();
       menuFor = b.dataset.hold;
       const h = ((last && last.station && last.station.holds) || {})[menuFor];
-      menu.querySelector('.hm-title').textContent = 'Pause ' + (menuFor === 'ads' ? 'ads' : 'bumpers');
+      menu.querySelector('.hm-title').textContent = 'Pause ' + (menuFor === 'ads' ? 'advertisements' : 'bumpers');
       menu.querySelector('.hm-held').textContent = h ? 'Paused ' + heldUntil(h) : '';
       menu.querySelector('[data-resume]').hidden = !h;
       const r = b.getBoundingClientRect();
@@ -127,7 +127,7 @@
     menu.hidden = true;
     try {
       await R.post('/api/v1/hold', { station: R.station || undefined, what: menuFor, until });
-      R.toast((menuFor === 'ads' ? 'Ads ' : 'Bumpers ') + label, 'ok');
+      R.toast((menuFor === 'ads' ? 'Advertisements ' : 'Bumpers ') + label, 'ok');
       R.refresh();
     } catch (err) { R.toast('Pause: ' + err.message, 'bad'); }
   }
@@ -197,14 +197,14 @@
         $('ad-meter').style.width = Math.max(0, 100 - mins / 60 * 100) + '%';
       } else {
         R.setHTML($('ad-big'), adCount ? ad.big : 'NONE');
-        R.marquee($('ad-sub'), !adCount ? 'No ads (set the Ads folder in Settings)' : [
+        R.marquee($('ad-sub'), !adCount ? 'No advertisements (set the Advertisements folder in Settings)' : [
           st.next_ad ? R.who(st.next_ad).title : '', due ? plural(due, 'hourly ad') + ' owed' : '', ad.big === 'OFF' ? 'no ad schedule' : ad.sub,
           !due && na.at ? 'hourly: ' + na.title + ' at ' + R.serverHM(na.at) : '',
         ].filter(Boolean).join(' · '));
         $('ad-meter').style.width = ad.pct;
       }
       R.setHTML($('lib-big'), (num(lib.music) || 0) + ' <small>songs</small>');
-      $('lib-sub').textContent = plural(imaging, 'bumper') + ' · ' + plural(adCount, 'ad') + ' · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
+      $('lib-sub').textContent = plural(imaging, 'bumper') + ' · ' + plural(adCount, 'advertisement') + ' · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
       $('core-meter').style.width = '100%';
     } else {
       ['bump', 'ad', 'lib'].forEach((k) => { $(k + '-big').textContent = '–'; R.marquee($(k + '-sub'), ' '); });

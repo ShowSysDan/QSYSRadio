@@ -194,7 +194,7 @@ def dashboard():
     return _page('dashboard.html', 'dashboard')
 
 
-LIBRARY_PAGES = {'music': ('music', 'Music'), 'imaging': ('imaging', 'Imaging & IDs'), 'ads': ('ad', 'Ads')}
+LIBRARY_PAGES = {'music': ('music', 'Music'), 'imaging': ('imaging', 'Imaging & IDs'), 'ads': ('ad', 'Advertisements')}
 
 
 @app.get('/library')
@@ -206,7 +206,7 @@ def library_page():
 @app.get('/library/<which>')
 @auth.login_required
 def library_kind(which):
-    """One page per kind of file: Music, Imaging & IDs, Ads."""
+    """One page per kind of file: Music, Imaging & IDs, Advertisements."""
     if which not in LIBRARY_PAGES:
         return redirect(url_for('library_kind', which='music'))
     kind, title = LIBRARY_PAGES[which]

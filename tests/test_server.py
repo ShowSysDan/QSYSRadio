@@ -553,7 +553,7 @@ def test_library_pages(app):
     c = signed_in(app, 'viewer')
     assert c.get('/library').headers['Location'].endswith('/library/music')
     assert c.get('/library/nope').headers['Location'].endswith('/library/music')
-    for which, title in (('music', b'Music'), ('imaging', b'Imaging &amp; IDs'), ('ads', b'Ads')):
+    for which, title in (('music', b'Music'), ('imaging', b'Imaging &amp; IDs'), ('ads', b'Advertisements')):
         r = c.get('/library/' + which)
         assert r.status_code == 200 and b'<title>' + title in r.data, which
     assert app.test_client().get('/library/music').status_code == 302                # signed out

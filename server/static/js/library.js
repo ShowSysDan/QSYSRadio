@@ -1,4 +1,4 @@
-// Library pages (Music, Imaging & IDs, Ads): search, filter, play next / queue /
+// Library pages (Music, Imaging & IDs, Advertisements): search, filter, play next / queue /
 // play now / bumper now, mark station IDs, schedule ads. Reloads itself when the
 // Core uploads a new scan or something plays. Search, sort and filter live in the URL.
 (function () {
@@ -12,7 +12,7 @@
     queue: '<svg viewBox="0 0 24 24"><path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h10v2H4z"/></svg>',
     play: '<svg viewBox="0 0 24 24"><path d="M7 5v14l11-7z"/></svg>',
   };
-  const NOUN = { music: 'songs', imaging: 'imaging files', ad: 'ads' };
+  const NOUN = { music: 'songs', imaging: 'imaging files', ad: 'advertisements' };
   const FILTERS = {
     music: [['', 'All'], ['never', 'Never played'], ['unsupported', 'Unsupported']],
     imaging: [['', 'All'], ['ident', 'Station IDs'], ['never', 'Never played'], ['unsupported', 'Unsupported']],
@@ -104,7 +104,7 @@
       } else {
         if (kind === 'ad' && !q && !only) hourLine(d.items);
         R.setHTML($('lib'), html || '<tr><td colspan="' + HEAD[kind].length + '" class="empty-state">' + (q || only ? 'Nothing matches.'
-          : kind === 'ad' ? 'No ads yet. Set the Ads folder in Settings; the Core uploads its files after each scan.'
+          : kind === 'ad' ? 'No advertisements yet. Set the Advertisements folder in Settings; the Core uploads its files after each scan.'
           : 'No files yet. The Core uploads its library after each scan.') + '</td></tr>');
       }
       offset += d.items.length;
@@ -143,7 +143,7 @@
     refresh();
   }
 
-  // every per-hour ad's slots this hour, in time order (Ads page)
+  // every per-hour ad's slots this hour, in time order (Advertisements page)
   function hourLine(items) {
     const all = [];
     items.forEach((it) => (it.slots || []).forEach((x) => all.push({ at: x.at, state: x.state, name: R.whoLine(it) })));

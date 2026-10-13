@@ -549,7 +549,7 @@ In Q-SYS Designer, with the station's design open:
    Settings page (Music folder, Imaging folder). FLAC, MP3 and WAV are proven
    on the Core; WMA does not load. Put a few bumpers in the imaging folder,
    or set "Bumper every N songs" to 0. Ads are optional: put them in their
-   own folder and set the Ads folder on the Settings page.
+   own folder and set the Advertisements folder on the Settings page.
 5. **Script.** Add a Text Controller (or Control Script). Open its Lua
    editor, paste all of `qsys/radio/radio.lua`, and change only `CFG`:
    ```lua
@@ -921,12 +921,12 @@ MockCore scenarios and `live_core.py`.
   transport (Skip, Bumper now, Ad break now, Stop after current, Stop now /
   Start); both decks live; the queue (reorder, remove, clear);
   activity (every command, who sent it, and the Core's answer); recent plays.
-- **Music**, **Imaging & IDs** and **Ads** pages (one tab each): search
+- **Music**, **Imaging & IDs** and **Advertisements** pages (one tab each): search
   (`/` jumps to it, Esc clears), sort, quick filters (never played,
   unsupported; station IDs; per hour / mix in / off), all kept in the URL so
   a view can be bookmarked. Length and length without the measured silence,
   totals. Music: Play next, Queue, Play now. Imaging: Bumper now and the
-  **ID** toggle (marks a station ID). Ads: Play now, the schedule (Mix in /
+  **ID** toggle (marks a station ID). Advertisements: Play now, the schedule (Mix in /
   Per hour with the count / Off) with plays this hour and today, and a
   **This hour** line of every per-hour slot in time order. Rescan. Lists
   reload by themselves after a new scan and whenever something plays.
@@ -1011,7 +1011,7 @@ GROUP BY 1, 2 ORDER BY 1, 2;
 ### Station IDs
 
 Mark imaging files as IDs (the **ID** button on Imaging & IDs) and pick a
-**Station ID schedule** (Settings → Bumpers & ads): hourly (:00), half-hourly
+**Station ID schedule** (Settings → Bumpers & advertisements): hourly (:00), half-hourly
 (:00, :30) or every quarter hour. At the first song change after each time
 (within **Station ID may be late by**, 8 min) the server names a random ID,
 never the one that played last, and the Core plays it first in that break,
@@ -1020,7 +1020,7 @@ do for ad slots. Coming up shows it as **ID**.
 
 ### Ad schedules
 
-Set on the Library page (Ads), one row per ad in `qsysradio.ad_rules`; an ad
+Set on the Advertisements page, one row per ad in `qsysradio.ad_rules`; an ad
 with no row is mixed in.
 
 | Schedule | Plays |

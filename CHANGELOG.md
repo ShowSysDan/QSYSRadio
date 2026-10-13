@@ -148,6 +148,9 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- **"Ads" is spelled out as "Advertisements"** wherever the panel has room:
+  the tab and page title, the Settings group and labels, the pause menu, the
+  play log filter. Short tags ("AD", "Next ad break") stay short.
 - Dashboard: long titles in Up next slide back and forth instead of being
   cut off (still when the system asks for reduced motion); the Next ad
   break card shows the full time (17:32, not :32); the on-air row in Recent
