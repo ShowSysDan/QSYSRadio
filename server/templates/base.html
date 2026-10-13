@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}QSYSRadio{% endblock %}</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}">
+  <link rel="preload" href="{{ url_for('static', filename='fonts/outfit-latin-wght-normal.woff2') }}" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/radio.css') }}?v={{ version }}">
+</head>
+<body data-can-operate="{{ 1 if user and user.can_operate else 0 }}" data-is-admin="{{ 1 if user and user.is_admin else 0 }}">
+  <header class="header">
+    <div class="header-left">
+      <a class="logo" href="{{ url_for('dashboard') }}">QSYS<span>Radio</span></a>
+      <span class="version">v{{ version }}</span>
+      <span id="station-pill" class="status-pill wait"><i></i><span>connecting</span></span>
+      <select id="station-select" class="station-select" hidden title="Station"></select>
+    </div>
+    <div class="header-actions">
+      <span id="server-clock" class="server-clock" title="This browser's local time">--:--:--</span>
+      {% if user %}
+      <span class="userbox">{{ user.display_name }}{% if not user.can_operate %} <span class="tag ro">read-only</span>{% endif %}
+        <a href="{{ url_for('logout') }}" title="Sign out of QSYSRadio and the other apps">Sign out</a></span>
+      {% endif %}
+    </div>
+  </header>
+  <nav class="tabs">
+    <a href="{{ url_for('dashboard') }}" class="tab {{ 'active' if page == 'dashboard' }}">Dashboard</a>
+    <a href="{{ url_for('library_page') }}" class="tab {{ 'active' if page == 'library' }}">Library</a>
+    <a href="{{ url_for('log_page') }}" class="tab {{ 'active' if page == 'log' }}">Play log</a>
+    {% if user and user.is_admin %}<a href="{{ url_for('settings_page') }}" class="tab {{ 'active' if page == 'settings' }}">Settings</a>{% endif %}
+  </nav>
+  <main class="main">{% block main %}{% endblock %}</main>
+  <div class="toasts" id="toasts"></div>
+  <script src="{{ url_for('static', filename='js/common.js') }}?v={{ version }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

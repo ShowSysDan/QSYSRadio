@@ -1,0 +1,16 @@
+{% extends 'base.html' %}
+{% block title %}Settings · QSYSRadio{% endblock %}
+{% block main %}
+<div class="section-header">
+  <div class="section-title">Station settings</div>
+  <span class="dim small">Sent to the Core within a second of saving. It keeps them if the server goes away.</span>
+</div>
+<section class="tile purple">
+  <div id="sync" class="banner"></div>
+  <form id="set-form"><div id="groups"></div>
+    <div class="form-actions"><button type="submit" class="primary">Save settings</button>
+      <button type="button" id="btn-revert">Discard changes</button></div>
+  </form>
+</section>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/settings.js') }}?v={{ version }}"></script>{% endblock %}

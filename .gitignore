@@ -17,3 +17,6 @@ Thumbs.db
 
 # Probe output copied from the Core
 *probe_*.txt
+
+# Test caches
+.pytest_cache/

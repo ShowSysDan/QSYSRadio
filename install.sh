@@ -61,6 +61,15 @@ if ! grep -q '^SECRET_KEY=.' "$ENV_FILE"; then
     fi
     info "Generated SECRET_KEY"
 fi
+if ! grep -q '^RADIO_API_TOKEN=.' "$ENV_FILE"; then
+    TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+    if grep -q '^#\?RADIO_API_TOKEN=[[:space:]]*$' "$ENV_FILE"; then
+        sed -i "s/^#\?RADIO_API_TOKEN=[[:space:]]*\$/RADIO_API_TOKEN=${TOKEN}/" "$ENV_FILE"
+    else
+        echo "RADIO_API_TOKEN=${TOKEN}" >> "$ENV_FILE"
+    fi
+    info "Generated RADIO_API_TOKEN (put it in radio.lua as CFG.SERVER_TOKEN)"
+fi
 chmod 600 "$ENV_FILE"
 [ "$(id -u)" -eq 0 ] && chown "${RUN_USER}:" "$ENV_FILE"
 
@@ -118,5 +127,7 @@ PORT="$(cd "$APP_DIR" && "${VENV}/bin/python" -m server.config APP_PORT 5410)"
 LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo ""
 echo -e "  Health:  ${CYAN}http://${LAN_IP:-localhost}:${PORT}/api/v1/health${NC}"
+echo "  Core:    in radio.lua set CFG.SERVER_URL = \"http://${LAN_IP:-<this server>}:${PORT}\""
+echo "           and CFG.SERVER_TOKEN = \"$(grep '^RADIO_API_TOKEN=' "$ENV_FILE" | cut -d= -f2-)\""
 echo "  Update:  cd ${APP_DIR} && git pull && sudo systemctl restart ${APP_NAME}"
 echo "  Logs:    journalctl -u ${APP_NAME} -f"

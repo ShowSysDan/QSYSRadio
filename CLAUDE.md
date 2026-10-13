@@ -1,73 +1,77 @@
 # QSYSRadio: notes for Claude
 
 Two-deck radio automation: Lua on the Q-SYS Core (`qsys/`) does real time;
-a Flask + PostgreSQL server (`server/`) does library, rotation, logging and
-the web UI. See README.md for the design.
+a Flask + PostgreSQL server (`server/`) does everything else (play log, web
+control panel, settings, library, sign-in, syslog). README.md has the design.
 
-## Every change: CHANGELOG + version
-Record every change under `## [Unreleased]` in CHANGELOG.md in the same
-commit. At release, roll it into a numbered section and bump `VERSION`
-(semver). Lua scripts carry their own `Version:` header.
+## Every change
+- Record it under `## [Unreleased]` in CHANGELOG.md in the same commit.
+  At release, roll it into a numbered section and bump `VERSION` and
+  `RADIO_VERSION` in radio.lua (semver).
+- Tell the user what to redeploy: the Core (paste radio.lua), the server
+  (`git pull && sudo systemctl restart qsysradio`), both, or neither.
+- No duplicated code: reuse the helpers (Lua: `push`, `set`/`trigger`,
+  `readJson`/`writeJson`, `Store`, `post`, `emit`; Python: `db.text`,
+  `db.number`, `db.clean_json`, `db.like`, `db.iso`, `dbconn()`,
+  `write_logs`; JS: `Radio.api/post/command/setHTML/esc/num/status`).
+
+## radio.lua: keep it slim and light
+- Real time only. Anything that can live on the server does.
+- Station settings are defined ONLY in `server/core_settings.py` (label,
+  range, default, help). radio.lua's `SETTINGS` holds the same names with
+  fallback values and nothing else; `tests/test_server.py` fails if the two
+  drift. Internals (timer rates, timeouts, paths) are constants in `K` /
+  `FILES`, not settings.
+- No header essays; one-line comments only where the line needs one.
+- Overhead budget: one 250 ms timer; the 50 ms `Fast` timer only while a deck
+  fades or loads (`Engine.wake()`); one HTTP request per second; control
+  objects cached in `Deck.new`; panel writes only on change; files written via
+  `Store` (debounced). Never add per-tick allocation, polling of the server,
+  or whole-file writes on every event.
+- Use the documented Q-SYS APIs (HttpClient.Upload, Timer, Component, dir,
+  io on media/, rapidjson). Keep `Tick`, `Fast`, `Sync`, `Chores` timers
+  global (a local timer can be garbage-collected).
+- After any change run all four MockCore scenarios
+  (`python3 qsys/test/run_mock.py qsys/test/scenario_*.lua`); add a case to
+  `scenario_regressions.lua` for every bug fixed.
 
 ## PostgreSQL: its own schema, PostgreSQL only
-- Shares a database with the other apps (321Theater, Leash, FetchLog, ...).
-  Every QSYSRadio table lives in `PG_APP_SCHEMA` (default `qsysradio`).
-  `PG_SHARED_SCHEMA` (default `shared`) is second on the search_path for the
-  cross-app users table: read it, never create or alter anything there.
-- Connect only through `server.db.connect()`; it sets the search_path and
-  raises `DatabaseUnavailable` when PG is unconfigured or down. Never catch
-  that and carry on with made-up data; requests get a 503.
-- Write unqualified table names (the search_path resolves them). Placeholders
-  are `%s`; new ids via `RETURNING id`; never `REAL` (use `DOUBLE PRECISION`);
-  timestamps are `TIMESTAMPTZ`.
+- Every QSYSRadio table lives in `PG_APP_SCHEMA` (default `qsysradio`).
+  `PG_SHARED_SCHEMA` (default `shared`) is second on the search_path: read
+  `users`, read/write `app_sessions` rows, never create or alter anything else.
+- Web requests use ONE pooled connection each: `dbconn()` in app.py (also
+  used by the session layer); it goes back to the pool, rolled back, at
+  teardown. Never borrow a second connection in a request. CLI/migrations use
+  `db.connect()`. `DatabaseUnavailable` means 503; never carry on without data.
+- Log after commit (`write_logs(lines)`), never inside a transaction.
+- Placeholders `%s`; `RETURNING id`; no `REAL`; timestamps `TIMESTAMPTZ`
+  (except `shared.app_sessions`, naive UTC via `auth.utcnow()`).
+- Anything from the Core is untrusted: clean it (`db.text`, `db.number`,
+  `db.clean_json`, `control._clean_state`) and escape it in the browser.
 
 ## Migrations (server/migrations/, applied by start.sh on every start)
-- Schema changes go in a NEW file `NNNN_short_name.sql` (next number). Never
-  edit, rename or renumber a migration that is on main: the runner records a
-  checksum and only warns, it will not re-run it.
-- Each file runs in one transaction with search_path = app schema only, so
-  plain `CREATE TABLE x` lands in the app schema. No `BEGIN`/`COMMIT` in the
-  file. Data backfills go in the same numbered files.
-- Test against a real PostgreSQL (16 is installed in the cloud sandbox):
-  fresh schema, then upgrade from the previous version.
+- A NEW file `NNNN_short_name.sql` per change. Never edit or renumber one that
+  has been pushed; one transaction each; no BEGIN/COMMIT inside.
+- Test against a real PostgreSQL: `QSYSRADIO_ENV_FILE=... python -m pytest tests/`
+  (own throw-away schemas). PG 16 is installed in the cloud sandbox.
 
-## Web workers and background jobs
-gunicorn runs several workers x threads (default 4 x 8) so many browsers can
-watch at once. Never assume one process: anything that must run once
-(scheduler, "what's next" decisions) takes a PostgreSQL advisory lock
-(`pg_try_advisory_lock(hashtext('qsysradio:<job>'))`) and skips when another
-process holds it. Pages that show live state poll short GETs (`/api/v1/now`);
-no long-held connections or websockets.
+## Core <-> server protocol
+- `POST /api/v1/core/sync` (≈1/s, X-Radio-Token): events (station, boot,
+  seq unique; stored once, each in a savepoint), optional state, command ack;
+  reply: commands with id > ack, settings when the rev differs, ack_reset.
+  One advisory lock per station serialises sync and `add_command`.
+- `POST /api/v1/core/library` after every scan (bulk `execute_values`).
 
-## Core events and the play log
-- radio.lua events carry `boot` + `seq` (unique); the server stores each
-  once in `core_events` (ON CONFLICT DO NOTHING) and only NEW events touch
-  `play_log` or syslog, so outbox replays are harmless. Keep it idempotent.
-- Adding an event field: emit it in radio.lua, read it in server/events.py;
-  raw JSON is always kept in `core_events.data`.
-- Run both MockCore scenarios after any radio.lua change.
-
-## Logging / syslog
-Log through `server.logs.log` (logger `qsysradio`). It goes to stderr
-(journald) and, when `SYSLOG_HOST` is set, to remote syslog with a full
-RFC 3164/5424 header (app name `QSYSRadio`, English month names). A dead
-syslog server must never break a request.
+## Web panel
+- Pages poll through `Radio.status()` (one loop per page, 8 s timeout);
+  no websockets, no long-held connections. Escape every server value
+  (`esc`, `num`); write lists with `setHTML` (only on change).
+- Permissions are QSYSRadio's own verdict (`auth.current_user()`), re-read
+  from `shared.users` every 5 min, even for sessions made by sister apps.
 
 ## Config
-Per-machine settings are `.env` keys (document them in `.env.example`), read
-via `server.config.get()`: process env first (systemd `EnvironmentFile=`),
-then the file. Server-managed settings shared by every server go in the
-`app_settings` table.
-
-## Deployment
-Installed as a git clone in the service user's home folder
-(`~/QSYSRadio`), venv at `venv/`, systemd unit `qsysradio` written by
-`install.sh` with `ExecStart=start.sh`. Updates must keep working as
-`git pull && sudo systemctl restart qsysradio`: put launch logic in
-`start.sh`, not the unit. If a change needs `sudo ./install.sh` re-run (unit
-changes, OS packages), say so in the CHANGELOG and to the user. At the end of
-every change, tell the user what to redeploy: the Core (paste a Lua script),
-the server (pull + restart), both, or neither.
+Per-machine settings are `.env` keys (documented in `.env.example`), read via
+`server.config.get()`: process env first, then the file.
 
 ## Git
 Develop on the assigned branch; push with `git push -u origin <branch>`. No

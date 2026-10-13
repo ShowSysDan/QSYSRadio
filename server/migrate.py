@@ -82,6 +82,32 @@ def status():
         print(f'  {version:04d}_{name}: {state}')
 
 
+def _ensure_shared_sessions(cur, log):
+    """Sign-in shares shared.app_sessions with the sister apps (SHARED_AUTH.md).
+    Create it if shared.users exists and it does not; never fail startup over it."""
+    _, shared = db.schemas()
+    if not _table_exists(cur, shared, 'users'):
+        log(f'migrate: WARNING "{shared}".users not found; sign-in will not work until the '
+            f'shared user directory (321Theater) exists in this database')
+        return
+    if _table_exists(cur, shared, 'app_sessions'):
+        return
+    try:
+        cur.execute(f'''CREATE TABLE IF NOT EXISTS "{shared}".app_sessions (
+            sid TEXT PRIMARY KEY,
+            user_id INTEGER REFERENCES "{shared}".users(id) ON DELETE CASCADE,
+            data TEXT NOT NULL DEFAULT '{{}}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL)''')
+        cur.execute(f'CREATE INDEX IF NOT EXISTS idx_app_sessions_expires ON "{shared}".app_sessions(expires_at)')
+        cur.execute(f'CREATE INDEX IF NOT EXISTS idx_app_sessions_user ON "{shared}".app_sessions(user_id)')
+        log(f'migrate: created "{shared}".app_sessions')
+    except Exception as exc:   # no CREATE on the shared schema: another app will make it
+        log(f'migrate: WARNING could not create "{shared}".app_sessions ({exc}); '
+            f'sign-in needs it (321Theater creates it on start)')
+
+
 def run(log=print):
     """Apply every pending migration. Returns the number applied."""
     app_schema, _ = db.schemas()
@@ -90,13 +116,13 @@ def run(log=print):
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
-            # Create the app schema only when missing, so a PG user without
-            # CREATE on the database still works once a DBA has made it.
-            if not _schema_exists(cur, app_schema):
-                cur.execute(f'CREATE SCHEMA "{app_schema}"')
-                log(f'migrate: created schema "{app_schema}"')
             cur.execute('SELECT pg_advisory_lock(hashtext(%s))', (f'qsysradio:migrate:{app_schema}',))
             try:
+                # Create the app schema only when missing, so a PG user without
+                # CREATE on the database still works once a DBA has made it.
+                if not _schema_exists(cur, app_schema):
+                    cur.execute(f'CREATE SCHEMA "{app_schema}"')
+                    log(f'migrate: created schema "{app_schema}"')
                 if not _table_exists(cur, app_schema, 'schema_migrations'):
                     cur.execute(f'''CREATE TABLE IF NOT EXISTS "{app_schema}".schema_migrations (
                         version    INTEGER PRIMARY KEY,
@@ -127,6 +153,7 @@ def run(log=print):
                         raise
                     log(f'migrate: applied {path.name}')
                     count += 1
+                _ensure_shared_sessions(cur, log)
                 latest = migrations[-1][0] if migrations else 0
                 log(f'migrate: schema "{app_schema}" at version {latest:04d}'
                     + ('' if count else ' (nothing to do)'))

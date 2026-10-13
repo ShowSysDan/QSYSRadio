@@ -28,7 +28,10 @@ MockCore.httpHandler = function(req)
   local t = MockCore.clock
   if t >= 30 and t < 80 then return 0, "", "timeout" end
   if t >= 80 and t < 120 then return 503, "" end
-  bodies[#bodies + 1] = req.Data
+  if req.Url:match("/api/v1/core/sync$") then
+    if req.Data:find('"events"') then bodies[#bodies + 1] = req.Data end
+    return 200, '{"commands":[]}'
+  end
   return 200, '{"ok":true}'
 end
 
@@ -42,7 +45,7 @@ Server.queue(EVENTS[#EVENTS])   -- the boot event was emitted before SERVER_URL 
 local midOutbox, midFile = 0, 0
 MockCore.at(115, function()
   midOutbox = #Server.outbox
-  local f = io.open(SETTINGS.outbox_path, "r")
+  local f = io.open(FILES.outbox, "r")
   if f then midFile = #(json.decode(f:read("*a")) or {}); f:close() end
 end)
 MockCore.run(240)
@@ -55,12 +58,12 @@ local function check(cond, msg) print((cond and "PASS  " or "FAIL  ") .. msg); i
 local got, dupes, okHeaders = {}, 0, true
 for _, h in ipairs(MockCore.http) do
   if h.req.Headers["X-Radio-Token"] ~= "secret" or h.req.Method ~= "POST"
-     or h.req.Url ~= "http://radio-server:5410/api/v1/events" then okHeaders = false end
+     or not h.req.Url:match("^http://radio%-server:5410/api/v1/") then okHeaders = false end
 end
 local starts = 0
 for _, b in ipairs(bodies) do
   local d = json.decode(b)
-  for _, ev in ipairs(d.events) do
+  for _, ev in ipairs(d.events or {}) do
     if got[ev.seq] then dupes = dupes + 1 end
     got[ev.seq] = ev
     if ev.kind == "track_start" then starts = starts + 1 end
@@ -69,9 +72,9 @@ end
 local missing = 0
 for s = 1, EVENT_SEQ do if not got[s] then missing = missing + 1 end end
 
-check(okHeaders, "POSTs go to /api/v1/events with the token header")
+check(okHeaders, "POSTs go to /api/v1/... with the token header")
 check(midOutbox > 5, string.format("events queued during the outage (%d at t=115)", midOutbox))
-check(midFile == midOutbox, "outbox persisted to outbox.json during the outage")
+check(midFile > 0 and midFile <= midOutbox, string.format("outbox persisted during the outage (file %d, memory %d; written every 30 s)", midFile, midOutbox))
 check(missing == 0, string.format("all %d events delivered after the outage (%d missing)", EVENT_SEQ, missing))
 check(#Server.outbox == 0, "outbox empty at the end")
 check(starts >= 6, string.format("%d track_start events delivered", starts))

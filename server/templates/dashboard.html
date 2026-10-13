@@ -1,0 +1,74 @@
+{% extends 'base.html' %}
+{% block main %}
+<div class="bento">
+  <div class="tile kpi red" id="kpi-air">
+    <div class="t-label">On air <span id="air-lamp" class="lamp-off">OFF</span></div>
+    <div class="t-big" id="air-rem">-:--</div>
+    <div class="t-sub" id="air-sub">Waiting for the Core</div>
+    <div class="kpi-meter"><span id="air-meter"></span></div>
+  </div>
+  <div class="tile kpi" id="kpi-next">
+    <div class="t-label">Up next <span id="next-src"></span></div>
+    <div class="t-big text" id="next-title">–</div>
+    <div class="t-sub" id="next-sub">&nbsp;</div>
+    <div class="kpi-meter"><span id="next-meter" style="width:0"></span></div>
+  </div>
+  <div class="tile kpi purple">
+    <div class="t-label">Bumpers</div>
+    <div class="t-big purple" id="bump-big">–</div>
+    <div class="t-sub" id="bump-sub">&nbsp;</div>
+    <div class="kpi-meter"><span id="bump-meter" style="width:0;background:var(--purple)"></span></div>
+  </div>
+  <div class="tile kpi blue">
+    <div class="t-label">Library</div>
+    <div class="t-big blue" id="lib-big">–</div>
+    <div class="t-sub" id="lib-sub">&nbsp;</div>
+    <div class="kpi-meter"><span id="core-meter" style="width:0"></span></div>
+  </div>
+</div>
+
+<div class="tile cyan" style="margin-top:16px">
+  <div class="t-head">
+    <div class="t-label">Transport <span id="core-info" class="dim small" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
+  </div>
+  <div class="transport" id="transport">
+    <button class="big" data-cmd="skip" title="Fade to the next track"><svg viewBox="0 0 24 24"><path d="M5 5v14l9-7zM15 5h3v14h-3z"/></svg>Skip</button>
+    <button class="big" data-cmd="bumper_now" title="Play a bumper at the next transition, now"><svg viewBox="0 0 24 24"><path d="M3 10v4h4l5 5V5L7 10zm13.5 2A4.5 4.5 0 0 0 14 8v8a4.5 4.5 0 0 0 2.5-4z"/></svg>Bumper now</button>
+    <button class="big warn" data-cmd="stop_after" id="btn-stop-after" title="Stop when the current track ends"><svg viewBox="0 0 24 24"><path d="M6 6h5v12H6zm7 0h5v12h-5z"/></svg><span>Stop after current</span></button>
+    <button class="big danger" data-cmd="stop_now" id="btn-stop" title="Fade out now and stop"><svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>Stop now</button>
+    <button class="big primary" data-cmd="start" id="btn-start" hidden title="Start automation"><svg viewBox="0 0 24 24"><path d="M7 5v14l11-7z"/></svg>Start</button>
+  </div>
+</div>
+
+<div class="ov-body">
+  <div class="ov-main">
+    <section class="tile">
+      <div class="t-head"><div class="t-label">Decks</div><span class="t-link" id="decks-note"></span></div>
+      <div class="decks" id="decks"></div>
+    </section>
+    <section class="tile blue">
+      <div class="t-head"><div class="t-label">Recent plays</div><a class="t-link" href="{{ url_for('log_page') }}">Full play log →</a></div>
+      <div class="table-wrap">
+        <table class="plays">
+          <thead><tr><th>Time</th><th>Type</th><th>Artist – Title</th><th>Deck</th><th>Played</th><th>Ended</th></tr></thead>
+          <tbody id="recent"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+  <div class="ov-side">
+    <section class="tile">
+      <div class="t-head"><div class="t-label">Up next</div><a class="t-link" href="{{ url_for('library_page') }}">Library →</a></div>
+      <div id="next" class="next"></div>
+      <div class="subhead"><span>Queue <span id="qcount" class="dim"></span></span>
+        <button class="sm ghost-danger" id="btn-clear" hidden>Clear</button></div>
+      <ul class="qlist" id="queue"></ul>
+    </section>
+    <section class="tile amber">
+      <div class="t-head"><div class="t-label">Activity</div></div>
+      <ul class="activity" id="activity"></ul>
+    </section>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/dashboard.js') }}?v={{ version }}"></script>{% endblock %}

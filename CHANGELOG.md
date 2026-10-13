@@ -7,43 +7,83 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- App server scaffold, set up like the other apps on the shared PostgreSQL
-  server: own `qsysradio` schema (`PG_APP_SCHEMA`) with the cross-app
-  `shared` schema second on the search path; config in `.env`
-  (`.env.example`); `install.sh` (venv, dependencies, `SECRET_KEY`, schema +
-  migrations, systemd unit running as the sudo user from the home-folder
-  clone); `start.sh` (deps sync when `requirements.txt` changes, migrations,
-  gunicorn) so updates are `git pull && sudo systemctl restart qsysradio`.
-- Numbered SQL migrations (`server/migrations/`, tracked in
-  `schema_migrations`, advisory-locked, one transaction per file);
-  `0001_app_settings`.
-- `GET /api/v1/health`: version, schema, applied vs expected migration.
-- Play log. `radio.lua` gives every event a `boot` id + `seq`, keeps unsent
-  events in an outbox persisted to `media/_radio/outbox.json` (cap 5000),
-  and POSTs them to `/api/v1/events` every 2 s when `CFG.SERVER_URL` is set
-  (`CFG.SERVER_TOKEN`, `CFG.STATION_ID`); emits a `boot` event; start/end
-  events now carry `dir`, `artist`, `title`, `played`. Server migration
-  `0002_core_events_play_log`: `core_events` (every event once, keyed by
-  boot + seq) and `play_log` (one row per airing with start/end times). A
-  new boot closes plays left open as `core_restart`.
-- Play log API: `GET /api/v1/now`, `/api/v1/plays` (range, search, kind),
-  `/api/v1/plays/at` (what was on air at a moment). `TIMEZONE` in `.env`.
-- `RADIO_API_TOKEN` (`X-Radio-Token`) to restrict who may post events.
-- Remote syslog (`SYSLOG_*` in `.env`): UDP or TCP, RFC 3164 or 5424, full
-  header with app name `QSYSRadio`; plays, ends, warnings and errors.
-- `scenario_server.lua`: server outage, outbox persistence and replay checks;
-  MockCore gains a fake `HttpClient` and a simulated wall clock.
+- **App server** set up like the other apps on the shared PostgreSQL server:
+  own `qsysradio` schema (`PG_APP_SCHEMA`) with the cross-app `shared` schema
+  second on the search path; config in `.env`; `install.sh` (venv,
+  dependencies, `SECRET_KEY`, `RADIO_API_TOKEN`, schema + migrations, systemd
+  unit running as the sudo user from the home-folder clone); `start.sh`
+  (dependency sync when `requirements.txt` changes, migrations, gunicorn 4 × 8)
+  so updates are `git pull && sudo systemctl restart qsysradio`. Numbered SQL
+  migrations, one transaction each, advisory-locked.
+- **Play log**: every event once in `core_events`, one row per airing in
+  `play_log` (start/end, played, end reason); per-station queries; API
+  (`/api/v1/now`, `/api/v1/plays`, `/api/v1/plays/at`); CSV download.
+- **Web control panel** in the WebRetriever2 style (bundled fonts, no CDN):
+  dashboard (on-air countdown, decks, up next, queue with reorder/remove,
+  bumper countdown, activity with every command's result, recent plays),
+  transport (Skip, Bumper now, Stop after current, Stop now / Start), library
+  (search, sort, Play next, Queue, Play now, Bumper now, Rescan), play log,
+  settings. Phone layout.
+- **Shared sign-in** with 321Theater and the sister apps (SHARED_AUTH.md):
+  sessions in `shared.app_sessions`, users read from `shared.users`; watch /
+  operate / admin from `is_app_user`, `is_readonly`, `is_app_admin`, role.
+- **Station settings on the server** (`server/core_settings.py`): every
+  setting labelled, range-checked and documented, edited on the web page and
+  pushed to the Core within a second; new **Bumpers & ads** settings
+  (bumper/ad level, song fade under a bumper) and **Stop fade**.
+- **Remote syslog** (`SYSLOG_*`): UDP or TCP, RFC 3164 or 5424, full header,
+  sent from a background thread.
+- `radio.lua`: one `/api/v1/core/sync` request a second carries queued
+  events (boot id + seq, outbox persisted on the Core), state only when it
+  changed (or every 10 s), and brings back commands and settings; library
+  upload after every scan; operator queue, stop after current, play now,
+  chosen bumper, queue move/remove by song.
+- Tests: MockCore scenarios `scenario_server`, `scenario_control`,
+  `scenario_regressions` (one case per review finding); `qsys/test/live_core.py`
+  (radio.lua in real time against a real server); `tests/test_server.py`
+  (pytest against real PostgreSQL: Core API, commands, sign-in, permissions,
+  settings, play log, failure handling).
 
 ### Changed
-- gunicorn defaults to 4 workers x 8 threads (`WEB_WORKERS` / `WEB_THREADS`)
-  so many viewers and the Core are served at once.
-- `VERSION` and `radio.lua` are `0.3.0-dev`.
+- `radio.lua` made light: 250 ms station timer plus a 50 ms timer only while a
+  deck fades or loads (crossfade armed with `Timer.CallAfter`); control objects
+  looked up once; panel outputs once a second and only on change; learned.json
+  saved at most every 5 min and on stop, the outbox at most every 30 s;
+  RapidJSON preferred (Q-SYS guidance for large data). About 400 fast-timer
+  runs per 5 min of play instead of 6000; garbage ~6 KB/s instead of ~34 KB/s.
+- `radio.lua` header and settings slimmed: settings are fallbacks only (the
+  server owns them), internals are constants, docs moved to the README.
+- Meter reads only during clean playback (no fade), so learned lead-in, tail
+  and peak are not skewed by moving gain. The dashboard no longer shows a
+  live level (it cost a state report every second).
+- Server: one pooled connection per request (shared by the session layer;
+  up to `WEB_THREADS + 2` open and `PG_POOL_MAX_IDLE`, default 4, kept per worker);
+  log lines written after commit; Core endpoints require `RADIO_API_TOKEN`
+  (`RADIO_ALLOW_NO_TOKEN=1` for a lab).
 
 ### Fixed
-- A bumper that the next track started under never logged `bumper_end`.
-- MockCore now keeps the scenario seed (radio.lua reseeded from the clock,
-  so runs differed); `scenario_basic` uses seed 1 and checks it actually
-  covers the silent-tail track.
+- radio.lua: a fade left on a deck could dip or stop the next track loaded on
+  it (dead air) and record a bogus trail; `track_end` was lost when a track
+  ended during a fade; skip / bumper requests could stick and cut a later
+  track (also across a stop and start); the panel Automation toggle was out of
+  sync at boot; a corrupt learned.json was overwritten (now kept as `.bad`);
+  an empty music folder logged ~52,000 events a day (now once, with back-off,
+  and music plays as soon as it is back); `uptime` was the Core clock's epoch;
+  transient load failures blacklisted files forever; a bumper whose tail the
+  next song started under never logged its end.
+- Server: a session made by a sister app skipped QSYSRadio's access check (and
+  a failed re-check signed the user out of every app); Core-supplied text
+  could be stored and shown unescaped; two commands could commit out of order
+  and one be skipped; a session cookie turned a database outage into 500s;
+  one malformed event blocked the Core's queue forever; malformed Core state
+  broke pages for everyone; a dead TCP syslog server could stall workers;
+  large library uploads were slow (now bulk); library paging repeated/skipped
+  rows; root-folder files showed no plays; "on air at" missed tracks with no
+  known length; plays from other stations mixed in; session `last_seen` was
+  local time; commands with no result stayed "sent" forever; several 500s
+  that should be 400s; settings accepted `true` and non-string folders.
+- Event identity is per station (`0004_events_unique_per_station`).
+- MockCore keeps the scenario seed and follows simulated time in `os.date`.
 
 ## [0.2.0] - 2026-10-12
 

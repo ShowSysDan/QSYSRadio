@@ -9,19 +9,21 @@ SYSLOG_HOST is set in .env.
     SYSLOG_LEVEL=INFO
     SYSLOG_APP_NAME=QSYSRadio
 
-The remote handler writes the full header itself (timestamp, hostname, app
-name), so the collector can split out the APP column: rfc3164
+Messages carry the full header (timestamp, hostname, app name) so the
+collector can split out the APP column: rfc3164
 `<PRI>Mmm dd hh:mm:ss host QSYSRadio[pid]: msg`, rfc5424
-`<PRI>1 <ISO ts> host QSYSRadio pid - - msg`. TCP uses newline framing.
-A syslog server that is down never breaks the app: sends are dropped and
-the connection is retried every 30 s.
+`<PRI>1 <ISO ts> host QSYSRadio pid - - msg`; TCP uses newline framing.
+
+Sending happens on a background thread fed by a bounded queue, so a slow or
+dead syslog server never blocks a request: when the queue is full messages
+are dropped, and a failed TCP connection is retried every 30 s.
 """
 import logging
 import logging.handlers
 import os
+import queue
 import socket
 import sys
-import threading
 import time
 from datetime import datetime, timezone
 
@@ -31,117 +33,107 @@ LOGGER_NAME = 'qsysradio'
 log = logging.getLogger(LOGGER_NAME)
 
 # English month names: %b is locale-bound and RFC 3164 needs these exactly.
-_MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
-_RETRY_S = 30
+_MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+_SEVERITY = {logging.DEBUG: 7, logging.INFO: 6, logging.WARNING: 4, logging.ERROR: 3, logging.CRITICAL: 2}
+_FACILITIES = logging.handlers.SysLogHandler.facility_names
+_RETRY_S, _CONNECT_TIMEOUT_S, _QUEUE_MAX = 30, 2, 10000
 
 
 class _WireFormatter(logging.Formatter):
-    def __init__(self, rfc, app, tcp):
+    def __init__(self, rfc, app, facility):
         super().__init__()
-        self.rfc, self.app, self.tcp = rfc, app, tcp
+        self.rfc, self.app, self.facility = rfc, app, facility
         self.host = socket.gethostname().split('.')[0] or '-'
 
     def format(self, record):
         msg = record.getMessage()
         if record.exc_info:
             msg += ' | ' + self.formatException(record.exc_info).replace('\n', ' | ')
+        pri = self.facility * 8 + _SEVERITY.get(record.levelno, 6)
         msg = msg.replace('\n', ' ')
         if self.rfc == 'rfc5424':
             ts = datetime.fromtimestamp(record.created, timezone.utc).astimezone()
-            line = f'1 {ts.isoformat(timespec="milliseconds")} {self.host} {self.app} {os.getpid()} - - {msg}'
-        else:
-            lt = time.localtime(record.created)
-            line = (f'{_MONTHS[lt.tm_mon - 1]} {lt.tm_mday:2d} {time.strftime("%H:%M:%S", lt)} '
-                    f'{self.host} {self.app}[{os.getpid()}]: {msg}')
-        return line + '\n' if self.tcp else line
+            return f'<{pri}>1 {ts.isoformat(timespec="milliseconds")} {self.host} {self.app} {os.getpid()} - - {msg}'
+        lt = time.localtime(record.created)
+        return (f'<{pri}>{_MONTHS[lt.tm_mon - 1]} {lt.tm_mday:2d} {time.strftime("%H:%M:%S", lt)} '
+                f'{self.host} {self.app}[{os.getpid()}]: {msg}')
 
 
-class _SysLogHandler(logging.handlers.SysLogHandler):
-    broken = False
+class _Sender(logging.Handler):
+    """Writes formatted lines to the syslog server. Runs on the listener thread only."""
 
-    def handleError(self, record):   # no traceback spam; the wrapper reconnects
-        self.broken = True
-
-
-class RemoteSyslog(logging.Handler):
-    """Builds the SysLogHandler lazily and rebuilds it after a failure."""
-
-    def __init__(self, host, port, tcp, facility, formatter):
+    def __init__(self, host, port, tcp):
         super().__init__()
-        self.host, self.port, self.tcp, self.facility = host, port, tcp, facility
-        self.wire = formatter
-        self._inner = None
-        self._retry_at = 0.0
-        self._warned = False
-        self._build_lock = threading.Lock()
+        self.host, self.port, self.tcp = host, port, tcp
+        self.sock, self.addr, self.retry_at, self.warned = None, None, 0.0, False
 
-    def _connect(self):
-        h = _SysLogHandler(address=(self.host, self.port), facility=self.facility,
-                           socktype=socket.SOCK_STREAM if self.tcp else socket.SOCK_DGRAM)
-        h.append_nul = False
-        h.setFormatter(self.wire)
-        return h
+    def _open(self):
+        if self.tcp:
+            self.sock = socket.create_connection((self.host, self.port), timeout=_CONNECT_TIMEOUT_S)
+        else:
+            info = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_DGRAM)[0]
+            self.sock = socket.socket(info[0], socket.SOCK_DGRAM)
+            self.addr = info[4]
+        self.sock.settimeout(_CONNECT_TIMEOUT_S)
+
+    def _fail(self, exc):
+        if self.sock:
+            self.sock.close()
+        self.sock, self.retry_at = None, time.monotonic() + _RETRY_S
+        if not self.warned:
+            sys.stderr.write(f'qsysradio: syslog {self.host}:{self.port} unreachable ({exc}); '
+                             f'retrying every {_RETRY_S}s\n')
+            self.warned = True
 
     def emit(self, record):
-        with self._build_lock:
-            if self._inner is None:
-                if time.monotonic() < self._retry_at:
-                    return
-                try:
-                    self._inner = self._connect()
-                    if self._warned:
-                        sys.stderr.write(f'qsysradio: syslog {self.host}:{self.port} reachable again\n')
-                    self._warned = False
-                except OSError as exc:
-                    self._retry_at = time.monotonic() + _RETRY_S
-                    if not self._warned:
-                        sys.stderr.write(f'qsysradio: syslog {self.host}:{self.port} unreachable ({exc}); '
-                                         f'retrying every {_RETRY_S}s\n')
-                        self._warned = True
-                    return
-            inner = self._inner
-        inner.emit(record)
-        if inner.broken:
-            with self._build_lock:
-                inner.close()
-                if self._inner is inner:
-                    self._inner = None
-                    self._retry_at = time.monotonic() + _RETRY_S
+        if self.sock is None and time.monotonic() < self.retry_at:
+            return
+        data = self.format(record).encode('utf-8', 'replace')
+        try:
+            if self.sock is None:
+                self._open()
+                if self.warned:
+                    sys.stderr.write(f'qsysradio: syslog {self.host}:{self.port} reachable again\n')
+                    self.warned = False
+            if self.tcp:
+                self.sock.sendall(data + b'\n')
+            else:
+                self.sock.sendto(data, self.addr)
+        except OSError as exc:
+            self._fail(exc)
 
-    def close(self):
-        with self._build_lock:
-            if self._inner is not None:
-                self._inner.close()
-                self._inner = None
-        super().close()
+
+class _DroppingQueueHandler(logging.handlers.QueueHandler):
+    def enqueue(self, record):
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            pass
 
 
 def syslog_settings():
-    host = config.get('SYSLOG_HOST', '')
     proto = (config.get('SYSLOG_PROTOCOL', 'udp') or 'udp').lower()
     rfc = (config.get('SYSLOG_FORMAT', 'rfc3164') or 'rfc3164').lower()
     facility = (config.get('SYSLOG_FACILITY', 'local0') or 'local0').lower()
     return {
-        'host': host,
+        'host': config.get('SYSLOG_HOST', ''),
         'port': config.get_int('SYSLOG_PORT', 514),
         'protocol': proto if proto in ('udp', 'tcp') else 'udp',
         'format': rfc if rfc in ('rfc3164', 'rfc5424') else 'rfc3164',
-        'facility': facility if facility in logging.handlers.SysLogHandler.facility_names else 'local0',
+        'facility': facility if facility in _FACILITIES else 'local0',
         'level': (config.get('SYSLOG_LEVEL', 'INFO') or 'INFO').upper(),
         'app': config.get('SYSLOG_APP_NAME', 'QSYSRadio'),
     }
 
 
-_configured = False
+_listener = None
 
 
 def setup():
     """Configure the 'qsysradio' logger once per process."""
-    global _configured
-    if _configured:
+    global _listener
+    if log.handlers:
         return log
-    _configured = True
     log.setLevel(logging.DEBUG)
     log.propagate = False
     err = logging.StreamHandler(sys.stderr)
@@ -150,12 +142,14 @@ def setup():
     log.addHandler(err)
     s = syslog_settings()
     if s['host']:
-        tcp = s['protocol'] == 'tcp'
-        remote = RemoteSyslog(s['host'], s['port'], tcp,
-                              logging.handlers.SysLogHandler.facility_names[s['facility']],
-                              _WireFormatter(s['format'], s['app'], tcp))
-        remote.setLevel(getattr(logging, s['level'], logging.INFO))
-        log.addHandler(remote)
+        sender = _Sender(s['host'], s['port'], s['protocol'] == 'tcp')
+        sender.setFormatter(_WireFormatter(s['format'], s['app'], _FACILITIES[s['facility']]))
+        q = queue.Queue(_QUEUE_MAX)
+        handler = _DroppingQueueHandler(q)
+        handler.setLevel(getattr(logging, s['level'], logging.INFO))
+        log.addHandler(handler)
+        _listener = logging.handlers.QueueListener(q, sender)
+        _listener.start()
         log.info('syslog -> %s:%s/%s %s facility=%s level=%s', s['host'], s['port'],
                  s['protocol'], s['format'], s['facility'], s['level'])
     return log
