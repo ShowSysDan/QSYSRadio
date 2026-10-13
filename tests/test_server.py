@@ -364,6 +364,30 @@ def test_every_song_gets_played_end_to_end(app, tmp_path, monkeypatch):
     assert len(played) == 24, f'{24 - len(played)} of 24 songs never played in {starts} plays'
 
 
+def test_coming_up_forecast(app):
+    songs = [{'key': f'M/{c}.mp3', 'dir': 'M/', 'file': f'{c}.mp3', 'kind': 'music', 'artist': c.upper()} for c in 'abcdefghij']
+    spots = [{'key': 'Ads/h.wav', 'dir': 'Ads/', 'file': 'h.wav', 'kind': 'ad'}, {'key': 'I/b.wav', 'dir': 'I/', 'file': 'b.wav', 'kind': 'imaging'}]
+    library_post(app, 'FC', songs + spots, ads_dir='Ads/')
+    op = signed_in(app, 'operator')
+    assert op.post('/api/v1/ads', json={'station': 'FC', 'key': 'Ads/h.wav', 'mode': 'hourly', 'per_hour': 4}, headers=WEB).status_code == 200
+    now_m = float(sql("SELECT EXTRACT(EPOCH FROM NOW() - date_trunc('hour', NOW())) / 60", fetch=True)[0][0])
+    slot = next(m for m in [7.5, 22.5, 37.5, 52.5, 67.5] if m > now_m + 1)       # the ad's next slot (one hourly ad: phase 0.5)
+    remaining = (slot - now_m) * 60 + 30 + 4                                      # this song changes 30 s after it opens
+    state = dict(STATE, queue=[{'key': 'M/c.mp3', 'file': 'c.mp3'}], tracks_since_bumper=2, tracks_since_ad=0,
+                 decks={'A': {'state': 'playing', 'live': True, 'kind': 'music', 'key': 'M/a.mp3', 'file': 'a.mp3', 'artist': 'A',
+                              'elapsed': 10, 'remaining': remaining, 'duration': 300}},
+                 settings={'bumper_every_n_tracks': 3, 'ad_every_n_tracks': 0, 'ads_per_break': 2, 'crossfade_s': 4})
+    sync(app, station='FC', state=state)
+    a = op.get('/api/v1/now?station=FC&ahead=10').json['station']['ahead']
+    kinds = [(x['kind'], x['why']) for x in a]
+    assert kinds[0] == ('ad', 'hourly') and a[0]['key'] == 'Ads/h.wav'           # the slot opens before this song ends
+    assert kinds[1] == ('music', 'queue') and a[1]['key'] == 'M/c.mp3'            # then the operator queue
+    assert ('imaging', 'bumper') in kinds[2:4]                                     # bumper every 3: due after the next song
+    assert len(a) == 10 and [x['at'] for x in a] == sorted(x['at'] for x in a)
+    assert len({x['key'] for x in a if x['kind'] == 'music'}) == sum(1 for x in a if x['kind'] == 'music')   # no repeats
+    assert 'ahead' not in op.get('/api/v1/now?station=FC').json['station']             # only when asked for
+
+
 def test_ads_plan_rules_and_play_log(app):
     items = [{'key': f'Ads/{n}.wav', 'dir': 'Ads/', 'file': f'{n}.wav', 'kind': 'ad'} for n in ('m1', 'm2', 'h', 'off')]
     assert library_post(app, 'A1', items, ads_dir='Ads/').status_code == 200

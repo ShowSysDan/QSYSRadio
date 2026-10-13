@@ -57,7 +57,7 @@
   function row(it) {
     const name = esc(R.whoLine(it)) + (it.unsupported ? ' <span class="tag bad" title="The player cannot load this file">unsupported</span>' : '') +
       '<span class="file">' + esc(it.directory + it.file) + '</span>';
-    const last = '<td class="num" title="' + esc(it.last_played ? new Date(it.last_played).toLocaleString() : '') + '">' + esc(R.ago(it.last_played)) + '</td>';
+    const last = '<td class="num" title="' + esc(R.timeOf(it.last_played, true)) + '">' + esc(R.ago(it.last_played)) + '</td>';
     const len = '<td class="num">' + (R.num(it.duration_s) ? R.clock(it.duration_s) : '–') + '</td>';
     const cells = it.kind === 'ad'
       ? len + '<td>' + schedule(it) + slots(it) + '</td><td class="num">' + (R.num(it.plays_hour) || 0) + (it.mode === 'hourly' ? ' / ' + esc(it.per_hour) : '') +

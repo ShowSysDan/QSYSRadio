@@ -84,9 +84,22 @@
              sub: (left ? '' : 'after this song · ') + 'every ' + plural(every, 'song'), pct: Math.min(100, since / every * 100) + '%' };
   }
 
-  const srcTag = (n) => n && n.queued ? '<span class="src queue">QUEUE</span>'
-    : (n && n.pick === 'ad' ? '<span class="src fill" title="Picked by length so the next ad break lands on time">FOR AD</span>'
-      : '<span class="src rotation" title="' + (n && n.pick ? 'One of the least recently played songs' : 'The Core\'s own shuffle') + '">ROTATION</span>');
+  // what is next: the server's forecast (a break when one is due at the song change), else the Core's next song
+  const TAGS = {
+    queue: ['queue', 'QUEUE', 'From the operator queue'], for_ad: ['fill', 'FOR AD', 'Picked by length so the next ad break lands on time'],
+    rotation: ['rotation', 'ROTATION', 'One of the least recently played songs'], hourly: ['ad', 'AD', 'Owed by its per-hour schedule'],
+    mix: ['ad', 'AD', 'A mix-in ad (the Core picks which)'], requested: ['ad', 'AD', 'Ad break now'],
+    bumper: ['bumper', 'BUMPER', 'Bumper (the Core picks which unless one was chosen)'], stop: ['stop', 'STOP', 'Stop after current'],
+  };
+  const tag = (why) => { const t = TAGS[why] || TAGS.rotation; return '<span class="src ' + t[0] + '" title="' + t[2] + '">' + t[1] + '</span>'; };
+  const ahead = () => (last && last.station && last.station.ahead) || [];
+  function nextItem(st) {
+    const a = ahead()[0];
+    if (a) return a;
+    const n = st && st.next_up;
+    return n && Object.assign({}, n, { why: n.queued ? 'queue' : (n.pick === 'ad' ? 'for_ad' : 'rotation') });
+  }
+  const srcTag = (n) => tag(n && n.why);
 
   function renderKpis() {
     const s = last && last.station, st = core(), lv = liveDeck(st);
@@ -102,19 +115,21 @@
       $('air-sub').textContent = !s ? 'No Core has connected yet' : (!s.online ? 'Core offline · last seen ' + R.ago(s.last_seen)
         : (st && !st.automation ? 'Automation stopped' : 'Between tracks'));
     }
-    const n = st && st.next_up, stopping = st && st.stop_after;
+    const n = nextItem(st), stopping = st && st.stop_after;
     $('next-title').textContent = stopping ? 'Nothing (stopping)' : (n ? R.who(n).title : '–');
     $('next-sub').textContent = stopping ? 'Stop after current is armed' : (n ? (n.artist || '') + (num(n.duration) ? '  ·  ' + R.clock(n.duration) : '') : ' ');
     R.setHTML($('next-src'), !st ? '' : (stopping ? '<span class="src stop">STOP</span>' : srcTag(n)));
     $('next-meter').style.width = st ? Math.min(100, st.queue.length * 10) + '%' : '0';
     if (st) {
       const lib = st.library, imaging = num(lib.imaging) || 0, adCount = num(lib.ad) || 0;
-      const bumper = countdown(st.bumper_every, st.tracks_since_bumper, st.bumper_requested || st.next_bumper, imaging);
+      const bumper = countdown(st.bumper_every, st.tracks_since_bumper, st.bumper_requested || st.next_bumper ||
+        ahead().slice(0, 1 + ahead().findIndex((x) => x.kind === 'music')).some((x) => x.kind === 'imaging'), imaging);
       R.setHTML($('bump-big'), bumper.big);
       $('bump-sub').textContent = (st.next_bumper ? R.who(st.next_bumper).title + ' · ' : '') + bumper.sub + ' · ' + plural(imaging, 'bumper') + ' in the pool';
       $('bump-meter').style.width = bumper.pct;
       const na = s.next_ad || {}, due = Math.max(num(st.ads_due) || 0, num(na.owed) || 0);
-      const ad = countdown(st.ad_every, st.tracks_since_ad, st.ad_requested || st.next_ad || due > 0, adCount);
+      const adNext = ahead()[0] && ahead()[0].kind === 'ad';    // a slot opens before this song ends
+      const ad = countdown(st.ad_every, st.tracks_since_ad, st.ad_requested || st.next_ad || due > 0 || adNext, adCount);
       const mins = na.at ? Math.max(0, Math.round((new Date(na.at) - Date.now()) / 60000)) : null;
       if (adCount && ad.big === 'OFF' && na.at) {            // only hourly ads: the next one by the clock
         R.setHTML($('ad-big'), ':' + String(new Date(na.at).getMinutes()).padStart(2, '0') + ' <small>in ' + mins + ' min</small>');
@@ -156,7 +171,7 @@
   }
 
   function renderNext() {
-    const st = core(), n = st && st.next_up;
+    const st = core(), n = nextItem(st);
     R.setHTML($('next'), !st ? '<div class="a">Core offline</div>' :
       '<div class="lbl">' + (st.stop_after ? '<span class="src stop">STOP</span> after the current track' :
         srcTag(n)) + '</div>' +
@@ -169,7 +184,12 @@
     R.setHTML($('queue'), q.length ? q.map((t, i) => '<li><span class="n">' + (i + 1) + '</span><span class="nm" title="' + esc((t.dir || '') + t.file) + '">' +
       esc(R.whoLine(t)) + '</span>' + (op ? '<span class="acts">' + btn('up', i, t, 'Move up', i === 0) + btn('down', i, t, 'Move down', i === q.length - 1) +
       btn('rm', i, t, 'Remove') + '</span>' : '<span></span>') + '</li>').join('')
-      : '<li class="empty-q">Queue empty: rotation picks the next song.<br>Add songs from the <a href="/library">Library</a>.</li>');
+      : '<li class="empty-q">Empty: the rotation picks (see Coming up).<br>Add songs from the <a href="/library">Library</a>.</li>');
+    const a = ahead();
+    R.setHTML($('ahead'), a.length ? a.map((x) => '<li class="k-' + esc(x.kind) + '"><span class="n">' + esc(R.serverHM(x.at)) + '</span>' +
+      '<span class="nm" title="' + esc(x.file || '') + '">' + tag(x.why) + ' ' + esc(x.kind === 'music' ? R.whoLine(x) : (x.title || x.file || '')) + '</span>' +
+      '<span class="dim">' + (num(x.duration) ? R.clock(x.duration) : '') + '</span></li>').join('')
+      : '<li class="empty-q">' + (st && st.automation ? 'Nothing to forecast yet.' : 'Automation is off.') + '</li>');
   }
 
   function renderActivity() {
@@ -209,5 +229,5 @@
   });
 
   setInterval(tick, 250);
-  R.status(1000, 12, render);
+  R.status(1000, 12, render, 10);
 })();

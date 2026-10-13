@@ -7,6 +7,16 @@ versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Up next knows about breaks, and Coming up.** The server forecasts the
+  next 10 items (songs, ads, bumpers) with estimated start times from the
+  Core's state, the ad schedule and the library, by the Core's rules (queue,
+  server pick, per-hour slots and windows, ad / bumper counters, quiet-start
+  skip, crossfade). Up next shows a break when an ad slot opens or a bumper
+  is due before the current song ends (the ad card then says NEXT); the
+  dashboard lists the forecast under the queue. `GET /api/v1/now?ahead=N`.
+- **All panel times are server time, 24-hour**: recent plays, activity, the
+  play log (its day is the server's day; "what was on air at" is read as
+  server time) and the library's last-played tooltip.
 - **Header clock is the server's time**, 24-hour and larger (it was the
   browser's local time): every status poll carries the server time and zone,
   the browser ticks between polls. Optional **NTP check** (Settings → Server
