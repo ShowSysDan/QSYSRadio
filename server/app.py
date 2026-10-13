@@ -60,6 +60,11 @@ def _db_unavailable(exc):
     return _error(503, 'Database unavailable', 'The radio server cannot reach its database. Reload in a moment.')
 
 
+@app.errorhandler(auth.SignInUnavailable)
+def _signin_unavailable(exc):
+    return _error(503, 'Sign-in unavailable', str(exc))
+
+
 @app.errorhandler(BadRequest)
 def _bad_request(exc):
     return jsonify(ok=False, error=str(exc)), 400
@@ -74,13 +79,15 @@ def _forbidden(_exc):
 def _session_unavailable():
     if getattr(session, 'unavailable', False):
         raise db.DatabaseUnavailable('could not load the session')
+    if getattr(session, 'broken', None):
+        raise auth.SignInUnavailable(session.broken)
 
 
 @app.context_processor
 def _inject():
     try:
         user = auth.current_user()
-    except db.DatabaseUnavailable:      # the error page itself must still render
+    except (db.DatabaseUnavailable, auth.SignInUnavailable):   # the error page itself must still render
         user = None
     return {'version': VERSION, 'user': user}
 

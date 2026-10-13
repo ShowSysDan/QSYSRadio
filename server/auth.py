@@ -6,6 +6,11 @@ shared.users (321Theater owns writes), passwords are checked with Werkzeug.
 Signing in here signs you in to the sister apps on the same host; signing out
 signs you out of all of them.
 
+QSYSRadio only reads shared.users and reads/writes shared.app_sessions rows;
+it never creates or alters anything in the shared schema (321Theater owns it).
+If those tables are missing or not granted, sign-in answers 503 with a clear
+message and migrate.py logs the exact GRANT that is missing.
+
 A session may have been created by a sister app, so QSYSRadio never trusts
 the shared keys for its own permissions: it re-reads the user and keeps its
 verdict under its own session key ('qsysradio'), refreshed every 5 minutes.
@@ -41,6 +46,20 @@ _USER_COLS = ('id, username, password_hash, display_name, role, must_change_pass
               'is_readonly, is_app_user, is_app_admin')
 
 _conn = None                                          # the request's DB connection (set by configure)
+# the shared tables are missing or not granted to this app's role
+_SHARED_ERRORS = (db.psycopg2.errors.UndefinedTable, db.psycopg2.errors.InsufficientPrivilege)
+
+
+class SignInUnavailable(RuntimeError):
+    pass
+
+
+def _shared_failed(exc):
+    _conn().rollback()
+    log.error('sign-in unavailable: %s (see the "sign-in will not work" lines from migrate at startup)',
+              str(exc).strip().splitlines()[0])
+    return SignInUnavailable('Sign-in is not available: QSYSRadio cannot use the shared user tables. '
+                             'An administrator should check the server log.')
 
 
 def utcnow():
@@ -61,12 +80,12 @@ def configure(app, get_conn):
 # ── Server-side sessions in shared.app_sessions ──────────────────────────────
 
 class _DBSession(CallbackDict, SessionMixin):
-    def __init__(self, initial=None, sid=None, new=False, skip=False, unavailable=False):
+    def __init__(self, initial=None, sid=None, new=False, skip=False, unavailable=False, broken=None):
         def _on_update(s):
             s.modified = True
         CallbackDict.__init__(self, initial, _on_update)
         self.sid, self.new, self.modified = sid, new, False
-        self.skip, self.unavailable = skip, unavailable
+        self.skip, self.unavailable, self.broken = skip, unavailable, broken
 
 
 class DBSessionInterface(SessionInterface):
@@ -86,6 +105,8 @@ class DBSessionInterface(SessionInterface):
                     row = None
         except db.DatabaseUnavailable:
             return _DBSession(skip=True, unavailable=True)    # app.py answers 503
+        except _SHARED_ERRORS as exc:
+            return _DBSession(skip=True, broken=str(_shared_failed(exc)))
         if not row:   # never adopt an unknown client-supplied sid (session fixation)
             return _DBSession(sid=secrets.token_urlsafe(32), new=True)
         try:
@@ -121,6 +142,9 @@ class DBSessionInterface(SessionInterface):
         except db.DatabaseUnavailable:
             log.error('session not saved: database unavailable')
             return
+        except _SHARED_ERRORS as exc:
+            _shared_failed(exc)
+            return
         response.set_cookie(name, session.sid, expires=expires, httponly=self.get_cookie_httponly(app),
                             domain=domain, path=path, secure=self.get_cookie_secure(app),
                             samesite=self.get_cookie_samesite(app))
@@ -129,9 +153,12 @@ class DBSessionInterface(SessionInterface):
 # ── Users and QSYSRadio's own permission check ───────────────────────────────
 
 def _get_user(where, value):
-    with _conn().cursor() as cur:
-        cur.execute(f'SELECT {_USER_COLS} FROM users WHERE {where} = %s LIMIT 1', (value,))
-        row = cur.fetchone()
+    try:
+        with _conn().cursor() as cur:
+            cur.execute(f'SELECT {_USER_COLS} FROM users WHERE {where} = %s LIMIT 1', (value,))
+            row = cur.fetchone()
+    except _SHARED_ERRORS as exc:
+        raise _shared_failed(exc)
     return dict(row) if row else None
 
 
@@ -186,9 +213,8 @@ def attempt_login(username, password):
         return False, 'Too many sign-in attempts. Wait a minute and try again.'
     try:
         user = _get_user('username', username)
-    except db.psycopg2.errors.UndefinedTable:
-        log.error('login: shared users table not found (is PG_SHARED_SCHEMA right?)')
-        return False, 'The shared user directory is not available. Ask an administrator.'
+    except SignInUnavailable as exc:
+        return False, str(exc)
     ok = check_password_hash(user['password_hash'] if user else _DUMMY_HASH, password) and user is not None
     if not ok:
         log.warning('login failed user=%s ip=%s', username[:100], request.remote_addr)

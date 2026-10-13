@@ -37,8 +37,10 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 
 ## PostgreSQL: its own schema, PostgreSQL only
 - Every QSYSRadio table lives in `PG_APP_SCHEMA` (default `qsysradio`).
-  `PG_SHARED_SCHEMA` (default `shared`) is second on the search_path: read
-  `users`, read/write `app_sessions` rows, never create or alter anything else.
+  `PG_SHARED_SCHEMA` (default `shared`) is 321Theater's and second on the
+  search_path: SELECT `users`, SELECT/INSERT/UPDATE/DELETE `app_sessions` rows,
+  and nothing else. Never create, alter or own anything there (no DDL, not even
+  "if missing"); `migrate.shared_problems()` only reports what is missing.
 - Web requests use ONE pooled connection each: `dbconn()` in app.py (also
   used by the session layer); it goes back to the pool, rolled back, at
   teardown. Never borrow a second connection in a request. CLI/migrations use

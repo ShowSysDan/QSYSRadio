@@ -82,30 +82,34 @@ def status():
         print(f'  {version:04d}_{name}: {state}')
 
 
-def _ensure_shared_sessions(cur, log):
-    """Sign-in shares shared.app_sessions with the sister apps (SHARED_AUTH.md).
-    Create it if shared.users exists and it does not; never fail startup over it."""
+# What sign-in needs from the shared schema, which 321Theater owns.
+SHARED_NEEDS = {'users': ('SELECT',), 'app_sessions': ('SELECT', 'INSERT', 'UPDATE', 'DELETE')}
+
+
+def shared_problems(cur):
+    """What is missing for sign-in in the shared schema, as readable lines.
+    QSYSRadio never creates or alters anything there: 321Theater owns it."""
     _, shared = db.schemas()
-    if not _table_exists(cur, shared, 'users'):
-        log(f'migrate: WARNING "{shared}".users not found; sign-in will not work until the '
-            f'shared user directory (321Theater) exists in this database')
-        return
-    if _table_exists(cur, shared, 'app_sessions'):
-        return
-    try:
-        cur.execute(f'''CREATE TABLE IF NOT EXISTS "{shared}".app_sessions (
-            sid TEXT PRIMARY KEY,
-            user_id INTEGER REFERENCES "{shared}".users(id) ON DELETE CASCADE,
-            data TEXT NOT NULL DEFAULT '{{}}',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP NOT NULL)''')
-        cur.execute(f'CREATE INDEX IF NOT EXISTS idx_app_sessions_expires ON "{shared}".app_sessions(expires_at)')
-        cur.execute(f'CREATE INDEX IF NOT EXISTS idx_app_sessions_user ON "{shared}".app_sessions(user_id)')
-        log(f'migrate: created "{shared}".app_sessions')
-    except Exception as exc:   # no CREATE on the shared schema: another app will make it
-        log(f'migrate: WARNING could not create "{shared}".app_sessions ({exc}); '
-            f'sign-in needs it (321Theater creates it on start)')
+    cur.execute('SELECT current_user')
+    role = cur.fetchone()[0]
+    problems = []
+    if not _schema_exists(cur, shared):
+        return [f'schema "{shared}" does not exist (321Theater creates it; check PG_SHARED_SCHEMA)']
+    cur.execute('SELECT has_schema_privilege(%s, %s, %s)', (role, shared, 'USAGE'))
+    if not cur.fetchone()[0]:
+        return [f'no USAGE on schema "{shared}": GRANT USAGE ON SCHEMA "{shared}" TO "{role}";']
+    for table, privileges in SHARED_NEEDS.items():
+        if not _table_exists(cur, shared, table):
+            problems.append(f'"{shared}".{table} does not exist (321Theater creates it on start)')
+            continue
+        missing = []
+        for priv in privileges:
+            cur.execute('SELECT has_table_privilege(%s, %s, %s)', (role, f'"{shared}".{table}', priv))
+            if not cur.fetchone()[0]:
+                missing.append(priv)
+        if missing:
+            problems.append(f'GRANT {", ".join(missing)} ON "{shared}".{table} TO "{role}";')
+    return problems
 
 
 def run(log=print):
@@ -153,7 +157,8 @@ def run(log=print):
                         raise
                     log(f'migrate: applied {path.name}')
                     count += 1
-                _ensure_shared_sessions(cur, log)
+                for problem in shared_problems(cur):
+                    log(f'migrate: WARNING sign-in will not work: {problem}')
                 latest = migrations[-1][0] if migrations else 0
                 log(f'migrate: schema "{app_schema}" at version {latest:04d}'
                     + ('' if count else ' (nothing to do)'))

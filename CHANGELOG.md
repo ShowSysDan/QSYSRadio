@@ -52,6 +52,11 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- QSYSRadio never creates or alters anything in the `shared` schema
+  (321Theater owns it). It only SELECTs `users` and reads/writes
+  `app_sessions` rows. At startup `migrate` checks those tables and grants and
+  logs the exact `GRANT` that is missing (`sign-in will not work: …`); sign-in
+  then answers 503 "Sign-in unavailable" instead of failing.
 - `radio.lua` made light: 250 ms station timer plus a 50 ms timer only while a
   deck fades or loads (crossfade armed with `Timer.CallAfter`); control objects
   looked up once; panel outputs once a second and only on change; learned.json

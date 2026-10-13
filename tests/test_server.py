@@ -55,7 +55,10 @@ def schemas():
         sql('INSERT INTO qsr_test_shared.users (username, password_hash, display_name, role, is_readonly, is_app_user, '
             'is_app_admin, must_change_password) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
             (name, generate_password_hash('pw'), name.title(), role, ro, au, aa, mc))
-    migrate.run(log=lambda *_: None)      # also creates qsr_test_shared.app_sessions
+    sql("""CREATE TABLE qsr_test_shared.app_sessions (sid TEXT PRIMARY KEY, user_id INTEGER REFERENCES
+           qsr_test_shared.users(id) ON DELETE CASCADE, data TEXT NOT NULL DEFAULT '{}', created_at TIMESTAMP DEFAULT
+           CURRENT_TIMESTAMP, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMP NOT NULL)""")  # as 321Theater does
+    migrate.run(log=lambda *_: None)
     yield
     sql('DROP SCHEMA IF EXISTS qsr_test CASCADE; DROP SCHEMA IF EXISTS qsr_test_shared CASCADE')
 
@@ -260,6 +263,32 @@ def test_logout_is_global(app):
     c.get('/logout')
     assert len(sql('SELECT sid FROM qsr_test_shared.app_sessions', fetch=True)) == n - 1
     assert c.get('/api/v1/now').status_code == 401
+
+
+def test_app_never_creates_anything_in_shared(monkeypatch):
+    """Startup only checks the shared schema (321Theater owns it) and says what is missing."""
+    sql('DROP SCHEMA IF EXISTS qsr_test_bare CASCADE; CREATE SCHEMA qsr_test_bare; '
+        'CREATE TABLE qsr_test_bare.users (id SERIAL PRIMARY KEY, username TEXT)')
+    monkeypatch.setenv('PG_SHARED_SCHEMA', 'qsr_test_bare')
+    lines = []
+    migrate.run(log=lines.append)
+    tables = sql("SELECT tablename FROM pg_tables WHERE schemaname = 'qsr_test_bare'", fetch=True)
+    sql('DROP SCHEMA qsr_test_bare CASCADE')
+    assert [t[0] for t in tables] == ['users']
+    assert any('app_sessions does not exist' in line for line in lines)
+
+
+def test_signin_without_shared_tables_says_so(app, monkeypatch):
+    c = signed_in(app, 'operator')
+    sql('ALTER TABLE qsr_test_shared.app_sessions RENAME TO app_sessions_hidden')
+    try:
+        r = c.get('/')
+        assert r.status_code == 503 and b'Sign-in is not available' in r.data
+        assert c.get('/api/v1/now').status_code == 503
+        login = app.test_client().post('/login', data={'username': 'operator', 'password': 'pw'})
+        assert login.status_code in (302, 401, 503)          # never a 500
+    finally:
+        sql('ALTER TABLE qsr_test_shared.app_sessions_hidden RENAME TO app_sessions')
 
 
 def test_database_down_gives_503_not_500(app, monkeypatch):
