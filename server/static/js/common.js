@@ -18,11 +18,20 @@
     const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
     return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
   };
+  // every time on the panel is the server's (its zone, 24 h); the browser's zone only until the first poll
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const zoneMs = () => (clock ? clock.zoneMin : -new Date().getTimezoneOffset()) * 60000;
   R.timeOf = (iso, withDate) => {
     if (!iso) return '';
-    const d = new Date(iso);
-    const t = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
-    return withDate ? d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + t : t;
+    const d = new Date(new Date(iso).getTime() + zoneMs());       // read with UTC getters = server wall time
+    return (withDate ? MONTHS[d.getUTCMonth()] + ' ' + d.getUTCDate() + ' ' : '') + d.toISOString().slice(11, 19);
+  };
+  R.serverHM = (iso) => R.timeOf(iso).slice(0, 5);
+  R.serverDay = () => new Date(Date.now() + (clock ? clock.offset : 0) + zoneMs()).toISOString().slice(0, 10);
+  // 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM[:SS]' read as server wall time -> a Date (plus `days`)
+  R.fromServer = (s, days) => {
+    const [y, m, d, hh, mm, ss] = s.split(/[-T:]/).map(Number);
+    return new Date(Date.UTC(y, m - 1, d + (days || 0), hh || 0, mm || 0, ss || 0) - zoneMs());
   };
   R.ago = (iso) => {
     if (!iso) return 'never';
@@ -32,7 +41,6 @@
     if (s < 86400) return Math.round(s / 3600) + ' h ago';
     return Math.round(s / 86400) + ' d ago';
   };
-  R.isoDay = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
   R.who = (p) => ({ title: String(p.title || p.file || '?'), artist: p.artist ? String(p.artist) : '' });
   R.whoLine = (p) => { const w = R.who(p); return (w.artist ? w.artist + ' – ' : '') + w.title; };
   // write innerHTML only when it changed (keeps buttons alive under the cursor)
@@ -127,7 +135,7 @@
     loop.busy = true;
     try {
       const sent = Date.now();
-      const d = await R.api(R.withStation('/api/v1/now?plays=' + loop.plays));
+      const d = await R.api(R.withStation('/api/v1/now?plays=' + loop.plays + (loop.ahead ? '&ahead=' + loop.ahead : '')));
       d.receivedAt = Date.now();
       setClock(d.clock, sent, d.receivedAt);
       fillStations(d.stations || []);
@@ -142,7 +150,7 @@
       loop.timer = setTimeout(tick, document.hidden ? Math.max(loop.ms, 5000) : loop.ms);
     }
   }
-  R.status = (ms, plays, onData) => { loop = Object.assign(loop, { ms, plays, onData }); tick(); };
+  R.status = (ms, plays, onData, ahead) => { loop = Object.assign(loop, { ms, plays, onData, ahead }); tick(); };
   R.refresh = () => { if (!loop.busy) tick(); };
 
   R.playRow = (p, withDate) => {

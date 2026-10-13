@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, g, jsonify, redirect, render_template, request, session, url_for
 
-from . import ads, auth, clock, config, control, db, logs, plays
+from . import ads, auth, clock, config, control, db, forecast, logs, plays
 from .events import BadRequest
 from .migrate import discover
 
@@ -256,12 +256,18 @@ def core_library():
 @auth.login_required
 def get_now():
     """Status poll for every page: the station's live state + recent commands,
-    the station list, and (plays=N) on-air / recent plays."""
+    the station list, (plays=N) on-air / recent plays and (ahead=N) what is
+    coming up next."""
     conn, station = dbconn(), _station()
     out = {'ok': True, 'stations': control.stations(conn), 'station': None, 'on_air': [], 'recent': [],
            'clock': clock.status()}
     if station:
         out['station'] = control.status(conn, station)
+        ahead = _int_arg('ahead', 0, 0, 30)
+        if ahead and out['station']['online']:
+            with conn.cursor() as cur:
+                out['station']['ahead'] = forecast.forecast(cur, station, out['station']['state'],
+                                                            out['station']['state_age_s'] or 0, ahead)
         n = _int_arg('plays', 0, 0, 200)
         if n:
             out['on_air'], out['recent'] = plays.recent(conn, station, n)

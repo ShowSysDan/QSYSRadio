@@ -181,6 +181,7 @@ server/
   db.py               pooled PostgreSQL access + small helpers
   logs.py             journald + remote syslog (background thread)
   clock.py            header clock (server time) and the optional NTP check
+  forecast.py         "Coming up" on the dashboard: the next items with estimated times
   migrate.py          applies server/migrations/NNNN_*.sql on every start
   templates/, static/ web control panel (bundled fonts, no CDN)
 tests/                pytest suite (real PostgreSQL)
@@ -911,7 +912,11 @@ MockCore scenarios and `live_core.py`.
 
 ## Web control panel
 
-- **Dashboard:** on-air countdown, up next (queue or rotation), songs until
+- **Dashboard:** on-air countdown, up next (a break when an ad slot opens or a
+  bumper is due before the song ends; else the queue or the server's pick),
+  **Coming up**: the next 10 songs / ads / bumpers with estimated start times
+  (server time; rebuilt every poll, the Core still decides at each song
+  change; mix-in ads and bumpers it picks itself show without a name), songs until
   the next bumper and the next ad break (and hourly ads owed), library size;
   transport (Skip, Bumper now, Ad break now, Stop after current, Stop now /
   Start); both decks live; the queue (reorder, remove, clear);
@@ -1025,7 +1030,9 @@ when the server is unreachable.
 
 ## Clock
 
-The clock in the header is the **server's** time in its time zone
+Every time on the panel (header clock, plays, activity, Coming up, the play
+log's day and "what was on air at") is the **server's** time in its zone,
+24-hour. The clock in the header is the **server's** time in its time zone
 (`TIMEZONE` in `.env`, else the system zone), 24-hour. Every status poll
 carries it and the browser only counts the seconds in between, so a PC with
 a wrong clock still shows the station's time. To check the server itself,

@@ -15,15 +15,14 @@
     if (e) e.preventDefault();
     const day = $('log-day').value;
     if (!day) return;
-    const [y, m, dd] = day.split('-').map(Number);
-    const from = new Date(y, m - 1, dd), to = new Date(y, m - 1, dd + 1);
+    const from = R.fromServer(day), to = R.fromServer(day, 1);          // the server's day
     const qs = new URLSearchParams({ from: from.toISOString(), to: to.toISOString(), limit: '5000' });
     if ($('log-q').value.trim()) qs.set('q', $('log-q').value.trim());
     if ($('log-kind').value) qs.set('kind', $('log-kind').value);
     try {
       const d = await R.api(R.withStation('/api/v1/plays?' + qs));
       const n = (k) => d.plays.filter((p) => p.kind === k).length;
-      show(d.plays, d.plays.length + ' plays on ' + from.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' }) +
+      show(d.plays, d.plays.length + ' plays on ' + new Date(day + 'T12:00:00Z').toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' }) +
         ' (' + n('music') + ' music, ' + n('imaging') + ' imaging, ' + n('ad') + ' ads)', false, 'playlog-' + day);
     } catch (err) { $('log-summary').textContent = 'Error: ' + err.message; }
   }
@@ -33,8 +32,9 @@
     const v = $('at-time').value;
     if (!v) return;
     try {
-      const d = await R.api(R.withStation('/api/v1/plays/at?' + new URLSearchParams({ t: new Date(v).toISOString() })));
-      const when = new Date(v).toLocaleString();
+      const at = R.fromServer(v);                                           // typed as server time
+      const d = await R.api(R.withStation('/api/v1/plays/at?' + new URLSearchParams({ t: at.toISOString() })));
+      const when = R.timeOf(at.toISOString(), true);
       show(d.plays, d.plays.length ? 'On air at ' + when + (d.plays.length > 1 ? ' (crossfade: ' + d.plays.length + ' items)' : '')
         : 'Nothing was on air at ' + when, true, 'on-air-' + v.replace(/[:T]/g, '-'));
     } catch (err) { $('log-summary').textContent = 'Error: ' + err.message; }
@@ -56,10 +56,14 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
 
-  $('log-day').value = R.isoDay(new Date());
   $('log-form').addEventListener('submit', showDay);
   $('at-form').addEventListener('submit', showAt);
   $('btn-csv').addEventListener('click', csv);
-  showDay();
-  R.status(5000, 0);
+  let started = false;                   // the first poll brings the server's clock: today is the server's day
+  R.status(5000, 0, () => {
+    if (started) return;
+    started = true;
+    $('log-day').value = R.serverDay();
+    showDay();
+  });
 })();
