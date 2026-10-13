@@ -306,6 +306,18 @@ def test_database_newer_than_code_warns():
         sql('DELETE FROM qsr_test.schema_migrations WHERE version = 9999')
 
 
+def test_premade_schema_without_create_says_how_to_fix(monkeypatch):
+    """A DBA-made schema the role cannot write gets the fix, not a traceback."""
+    sql('DROP SCHEMA IF EXISTS qsr_test_locked CASCADE; CREATE SCHEMA qsr_test_locked; '
+        'REVOKE CREATE ON SCHEMA qsr_test_locked FROM CURRENT_USER')
+    monkeypatch.setenv('PG_APP_SCHEMA', 'qsr_test_locked')
+    try:
+        with pytest.raises(SystemExit, match='ALTER SCHEMA "qsr_test_locked" OWNER TO'):
+            migrate.run(log=lambda *_: None)
+    finally:
+        sql('DROP SCHEMA qsr_test_locked CASCADE')
+
+
 def test_database_down_gives_503_not_500(app, monkeypatch):
     c = signed_in(app, 'operator')
 
