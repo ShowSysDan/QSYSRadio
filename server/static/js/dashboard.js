@@ -116,8 +116,8 @@
         : (st && !st.automation ? 'Automation stopped' : 'Between tracks'));
     }
     const n = nextItem(st), stopping = st && st.stop_after;
-    $('next-title').textContent = stopping ? 'Nothing (stopping)' : (n ? R.who(n).title : '–');
-    $('next-sub').textContent = stopping ? 'Stop after current is armed' : (n ? (n.artist || '') + (num(n.duration) ? '  ·  ' + R.clock(n.duration) : '') : ' ');
+    R.marquee($('next-title'), stopping ? 'Nothing (stopping)' : (n ? R.who(n).title : '–'));
+    R.marquee($('next-sub'), stopping ? 'Stop after current is armed' : (n ? (n.artist || '') + (num(n.duration) ? '  ·  ' + R.clock(n.duration) : '') : ' '));
     R.setHTML($('next-src'), !st ? '' : (stopping ? '<span class="src stop">STOP</span>' : srcTag(n)));
     $('next-meter').style.width = st ? Math.min(100, st.queue.length * 10) + '%' : '0';
     if (st) {
@@ -132,14 +132,14 @@
       const ad = countdown(st.ad_every, st.tracks_since_ad, st.ad_requested || st.next_ad || due > 0 || adNext, adCount);
       const mins = na.at ? Math.max(0, Math.round((new Date(na.at) - Date.now()) / 60000)) : null;
       if (adCount && ad.big === 'OFF' && na.at) {            // only hourly ads: the next one by the clock
-        R.setHTML($('ad-big'), ':' + String(new Date(na.at).getMinutes()).padStart(2, '0') + ' <small>in ' + mins + ' min</small>');
+        R.setHTML($('ad-big'), esc(R.serverHM(na.at)) + ' <small>in ' + mins + ' min</small>');
         $('ad-sub').textContent = na.title + ' · at the first song change after';
         $('ad-meter').style.width = Math.max(0, 100 - mins / 60 * 100) + '%';
       } else {
         R.setHTML($('ad-big'), adCount ? ad.big : 'NONE');
         $('ad-sub').textContent = !adCount ? 'No ads (set the Ads folder in Settings)' : [
           st.next_ad ? R.who(st.next_ad).title : '', due ? plural(due, 'hourly ad') + ' owed' : '', ad.big === 'OFF' ? 'no ad schedule' : ad.sub,
-          !due && na.at ? 'hourly: ' + na.title + ' at :' + String(new Date(na.at).getMinutes()).padStart(2, '0') : '',
+          !due && na.at ? 'hourly: ' + na.title + ' at ' + R.serverHM(na.at) : '',
         ].filter(Boolean).join(' · ');
         $('ad-meter').style.width = ad.pct;
       }
@@ -175,7 +175,8 @@
     R.setHTML($('next'), !st ? '<div class="a">Core offline</div>' :
       '<div class="lbl">' + (st.stop_after ? '<span class="src stop">STOP</span> after the current track' :
         srcTag(n)) + '</div>' +
-      (n && !st.stop_after ? '<div class="t">' + esc(R.who(n).title) + '</div>' + (n.artist ? '<div class="a">' + esc(n.artist) + '</div>' : '') : ''));
+      (n && !st.stop_after ? '<div class="t" id="next-t"></div>' + (n.artist ? '<div class="a">' + esc(n.artist) + '</div>' : '') : ''));
+    if (n && !st.stop_after) R.marquee($('next-t'), R.who(n).title);
     const q = st ? st.queue : [], op = R.canOperate;
     $('qcount').textContent = q.length ? '(' + q.length + ')' : '';
     $('btn-clear').hidden = !(q.length && op);

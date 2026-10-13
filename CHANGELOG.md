@@ -131,6 +131,10 @@ versions follow [Semantic Versioning](https://semver.org/).
   `SESSION_COOKIE_DOMAIN` and what the shared schema needs.
 
 ### Changed
+- Dashboard: long titles in Up next slide back and forth instead of being
+  cut off (still when the system asks for reduced motion); the Next ad
+  break card shows the full time (17:32, not :32); the on-air row in Recent
+  plays has one even red tint with a red edge (a fade per cell made stripes).
 - radio.lua is ~1100 lines (was ~1220): the optional Q-SYS panel controls
   are gone (inputs `Skip`, `BumperNow`, `Automation`; outputs `Status`,
   `NowPlaying`, `NextUp`, `DeckA`, `DeckB`, `LastEvent`): the station is
