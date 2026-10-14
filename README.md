@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **1.2.0** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.2.1** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **1.2.0** — stable; standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **1.2.0** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **1.2.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.2.1** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.2.1** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.2.1** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -29,10 +29,10 @@ station settings, the library, syslog.
  │   • once a second: POST /api/v1/core/sync                      │
  │       → queued events, state (only when it changed)            │
  │       ← operator commands, settings, ad plan, files to analyze │
- │  Audio_Player_01 ─┬─► PlayerOutput01 meter.1                   │
- │                   └─► PlayerSum input 1 ───────┐               │
- │  Audio_Player_02 ─┬─► PlayerOutput01 meter.2   │               │
- │                   └─► PlayerSum input 2 ───────┴─► air chain   │
+ │  Audio_Player23 ─┬─► PlayerMeter meter.1                       │
+ │                  └─► RadioOut input 1 ─────┐                   │
+ │  Audio_Player24 ─┬─► PlayerMeter meter.2   │                   │
+ │                  └─► RadioOut input 2 ─────┴─► air chain       │
  └──────────────────────────────┬─────────────────────────────────┘
                                 │ HTTP (the Core pulls)
  ┌──────────────────────── App server ────────────────────────────┐
@@ -286,7 +286,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `1.2.0`.
+Expect the version, e.g. `1.2.1`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -419,12 +419,12 @@ Expect:
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
 - In the journal: `migrate: schema "qsysradio" at version 0012 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 1.2.0 starting on port
+  (install.sh already applied them), `[qsysradio] 1.2.1 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":12,"schema_version":12,"version":"1.2.0"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":12,"schema_version":12,"version":"1.2.1"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -554,8 +554,8 @@ In Q-SYS Designer, with the station's design open:
    Player 1 to meter input 1 and mixer input 1, Player 2 to meter input 2
    and mixer input 2. The meter must take the player's output directly, not
    the mixer's: file analysis mutes a player's mixer input and still reads
-   its meter. Code Names must match `CFG`: `Audio_Player_01`,
-   `Audio_Player_02`, `PlayerOutput01`, `PlayerSum` (or change `CFG`;
+   its meter. Code Names must match `CFG`: `Audio_Player23`,
+   `Audio_Player24`, `PlayerMeter`, `RadioOut` (or change `CFG`;
    `MIXER = ""` turns file analysis off).
 2. **Script Access.** Select each of the four, then set **Properties** →
    **Script Access** to `Script` (or `All`). With the default `None`, the
@@ -577,10 +577,10 @@ In Q-SYS Designer, with the station's design open:
    editor, paste all of `qsys/radio/radio.lua`, and change only `CFG`:
    ```lua
    CFG = {
-     PLAYER_A = "Audio_Player_01", METER_A = 1,
-     PLAYER_B = "Audio_Player_02", METER_B = 2,
-     METER = "PlayerOutput01",
-     MIXER = "PlayerSum", MIX_A = 1, MIX_B = 2, -- mixer inputs muted while a deck analyzes
+     PLAYER_A = "Audio_Player23", METER_A = 1,
+     PLAYER_B = "Audio_Player24", METER_B = 2,
+     METER = "PlayerMeter",
+     MIXER = "RadioOut", MIX_A = 1, MIX_B = 2, -- mixer inputs muted while a deck analyzes
      SERVER_URL = "http://<server-ip>:5410",   -- from install.sh
      SERVER_TOKEN = "<token>",                 -- RADIO_API_TOKEN from .env
      STATION_ID = "Main",                      -- unique per Core; "" = the design name
@@ -592,14 +592,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 1.2.0 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.2.1 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 1.2.0`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.2.1`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -630,7 +630,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (8 in 1.2.0).
+The last line prints the number of tables (8 in 1.2.1).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -672,7 +672,7 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 1.1.0, server is 1.2.0`.
+  `station=Main runs radio.lua 1.2.0, server is 1.2.1`.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -787,10 +787,10 @@ sudo journalctl -u qsysradio --since "1 hour ago" --no-pager | tail -n 50
 
 | You see | Fix |
 |---|---|
-| `meter component 'PlayerOutput01' not found`, `Deck A: component 'Audio_Player_01' not found` | The Code Name differs from `CFG` (step 10) |
-| `Deck A: 'Audio_Player_01' has no control 'gain' (Script Access on?)` | Script Access is `None`, or the Code Name differs from `CFG` (step 10) |
-| `meter 'PlayerOutput01' has no control peak.1` (or `peak.2`) | The meter's Script Access is `None`, or it has fewer than 2 channels (step 10) |
-| `! mixer 'PlayerSum' with input.1/2.mute.1 not found: file analysis is off` | The mixer's Code Name differs from `CFG.MIXER`, its Script Access is `None`, or the players are on other inputs (`MIX_A` / `MIX_B`). The station plays on; only file analysis is off |
+| `meter component 'PlayerMeter' not found`, `Deck A: component 'Audio_Player23' not found` | The Code Name differs from `CFG` (step 10) |
+| `Deck A: 'Audio_Player23' has no control 'gain' (Script Access on?)` | Script Access is `None`, or the Code Name differs from `CFG` (step 10) |
+| `meter 'PlayerMeter' has no control peak.1` (or `peak.2`) | The meter's Script Access is `None`, or it has fewer than 2 channels (step 10) |
+| `! mixer 'RadioOut' with input.1/2.mute.1 not found: file analysis is off` | The mixer's Code Name differs from `CFG.MIXER`, its Script Access is `None`, or the players are on other inputs (`MIX_A` / `MIX_B`). The station plays on; only file analysis is off |
 | `library: cannot list media/Audio/Test/Tuning/` | That folder is not on the Core: upload it, or change Music folder on the Settings page |
 | `! server: sync failed (403 ); N events queued`; journal: `/api/v1/core/sync: rejected request from <core-ip> (bad or missing X-Radio-Token)` | `CFG.SERVER_TOKEN` differs from `RADIO_API_TOKEN` (`grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`): paste it and run again |
 | Journal: `/api/v1/core/sync: refused, RADIO_API_TOKEN is not set in .env` | Re-run `sudo ./install.sh` (it generates one), then put it in `CFG.SERVER_TOKEN` |
@@ -1090,7 +1090,7 @@ when the server is unreachable.
 The Core measures each file's quiet start and end on the deck that is off
 air, instead of (or before) learning them from plays:
 
-- **Off air.** The deck's PlayerSum input (`input.N.mute.1`) is muted before
+- **Off air.** The deck's RadioOut input (`input.N.mute.1`) is muted before
   the file loads, and the player plays at full level into its meter (the
   meter is before the mixer). Every on-air play unmutes its deck first; a
   restart of the script unmutes both.

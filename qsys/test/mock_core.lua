@@ -315,11 +315,11 @@ function MockCore.setup(spec)
   meter["response.time"] = mkctl{ v = 0.3 }
   meter["select"] = mkctl{ s = "Peak" }
   MockCore.players = {
-    ["Audio_Player_01"] = mkPlayer("A", meterSet(1)),
-    ["Audio_Player_02"] = mkPlayer("B", meterSet(2)),
+    ["Audio_Player23"] = mkPlayer("A", meterSet(1)),
+    ["Audio_Player24"] = mkPlayer("B", meterSet(2)),
   }
   MockCore.meter = meter
-  -- the players' mixer (PlayerSum): input.N.mute.1 / gain.1 / delay.1; spec.noMixer = a design without one
+  -- the players' mixer (RadioOut): input.N.mute.1 / gain.1 / delay.1; spec.noMixer = a design without one
   local mixer = {}
   for i = 1, 2 do
     mixer["input." .. i .. ".mute.1"], mixer["input." .. i .. ".gain.1"], mixer["input." .. i .. ".delay.1"] = mkctl{ b = false }, mkctl{}, mkctl{}
@@ -329,13 +329,13 @@ function MockCore.setup(spec)
   Component = {
     New = function(n)
       if MockCore.players[n] then return MockCore.players[n].comp end
-      if n == "PlayerOutput01" then return meter end
-      if n == "PlayerSum" and MockCore.mixer then return MockCore.mixer end
+      if n == "PlayerMeter" then return meter end
+      if n == "RadioOut" and MockCore.mixer then return MockCore.mixer end
       error("component '" .. tostring(n) .. "' not found")
     end,
     GetComponents = function()
-      return { { Name = "Audio_Player_01", Type = "audio_file_player" }, { Name = "Audio_Player_02", Type = "audio_file_player" },
-               { Name = "PlayerOutput01", Type = "meter2" } }
+      return { { Name = "Audio_Player23", Type = "audio_file_player" }, { Name = "Audio_Player24", Type = "audio_file_player" },
+               { Name = "PlayerMeter", Type = "meter2" } }
     end,
     GetControls = function() return {} end,
   }

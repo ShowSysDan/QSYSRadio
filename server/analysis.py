@@ -1,5 +1,5 @@
 """File analysis: the Core measures each file's quiet start and end on the
-deck that is off air (its PlayerSum input muted; the meter is before the
+deck that is off air (its RadioOut input muted; the meter is before the
 mixer): the first seconds, then the last 15. The server keeps the job: which
 files are owed, the daily run (setting analyze_at), progress. Every sync
 reply carries the next few owed files when that list changes (`analyze`,
