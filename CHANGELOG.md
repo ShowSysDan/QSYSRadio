@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.3.1] - 2026-10-14
+
+### Changed
+- **Deck meters are vertical.** Each deck card on the dashboard has a meter
+  column on its left: the rms now at the top, a vertical meter after the
+  deck's gain (bar = rms, white line = peak, cyan tick = the Average level;
+  the scale is widest around 0 dB, where songs sit), and the player gain at
+  the bottom with its level-match part in cyan. It replaces the horizontal
+  bar under the title. Deck cards are a little taller.
+
+Redeploy the server: `git pull && sudo systemctl restart qsysradio` (reload
+the dashboard). The Core only changed its version number: paste radio.lua
+when convenient (until then the server logs a version mismatch).
+
 ## [1.3.0] - 2026-10-14
 
 ### Added

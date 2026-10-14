@@ -1,7 +1,7 @@
 -- QSYSRadio deck controller (Q-SYS Lua 5.3). Docs: README.md. Station settings are
 -- edited on the server's web page and pushed here; SETTINGS below are only the
 -- fallback until the server has been reached once.
-RADIO_VERSION = "1.3.0"
+RADIO_VERSION = "1.3.1"
 
 CFG = {
   PLAYER_A = "Audio_Player23", METER_A = 1,
