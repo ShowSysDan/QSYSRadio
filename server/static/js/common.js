@@ -62,7 +62,7 @@
     el.classList.toggle('scroll', over > 2);
     if (over > 2) {
       el.style.setProperty('--dist', over + 'px');
-      el.style.setProperty('--dur', Math.max(6, over / 25 + 4) + 's');   // ~25 px/s, with pauses at each end
+      el.style.setProperty('--dur', Math.max(5, over / 35 + 3) + 's');   // ~35 px/s, with pauses at each end
     }
   };
   // write innerHTML only when it changed (keeps buttons alive under the cursor)
@@ -128,26 +128,77 @@
   }
 
   // ── commands ───────────────────────────────────────────────────────────
+  // btn (optional): the button that sent it; it shows "busy" until the Core answers, then flashes ok / bad
   const watching = new Map();
-  R.command = async (cmd, args, label) => {
+  const answered = (btn, cls) => {
+    if (!btn) return;
+    btn.classList.remove('busy');
+    btn.classList.add(cls);
+    setTimeout(() => btn.classList.remove(cls), 900);
+  };
+  R.command = async (cmd, args, label, btn) => {
     if (!R.canOperate) { R.toast('Your account is read-only.', 'bad'); return null; }
+    btn?.classList.add('busy');
     try {
       const r = await R.post('/api/v1/control', { station: R.station || undefined, cmd, args: args || {} });
-      watching.set(r.id, { label: label || cmd, t: Date.now() });
+      watching.set(r.id, { label: label || cmd, t: Date.now(), btn });
       R.toast((label || cmd) + ': sent');
       R.refresh();
       return r.id;
-    } catch (e) { R.toast((label || cmd) + ': ' + e.message, 'bad'); return null; }
+    } catch (e) { answered(btn, 'sent-bad'); R.toast((label || cmd) + ': ' + e.message, 'bad'); return null; }
   };
   function noteCommands(cmds) {
     for (const c of cmds || []) {
       const w = watching.get(c.id);
       if (!w || c.state === 'pending' || c.state === 'sent') continue;
       watching.delete(c.id);
+      answered(w.btn, c.state === 'done' ? 'sent-ok' : 'sent-bad');
       R.toast(w.label + (c.state === 'done' ? ': done' : ': failed') + (c.note ? ' (' + c.note + ')' : ''), c.state === 'done' ? 'ok' : 'bad');
     }
-    for (const [id, w] of watching) if (Date.now() - w.t > 70000) watching.delete(id);
+    for (const [id, w] of watching) if (Date.now() - w.t > 70000) { w.btn?.classList.remove('busy'); watching.delete(id); }
   }
+
+  // ── what is on air (the dashboard and the nav rail) ──────────────────────
+  R.playing = (d) => d && !d.analyzing && (d.state === 'playing' || d.state === 'fading');
+  R.liveDeck = (st) => {
+    if (!st || !st.decks) return null;
+    const ds = ['A', 'B'].map((id) => st.decks[id]).filter(R.playing);
+    return ds.find((d) => d.live && d.state === 'playing') || ds.find((d) => d.state === 'playing') || null;
+  };
+  R.core = () => (R.last && R.last.station && R.last.station.online ? R.last.station.state : null);
+  // seconds since the Core measured elapsed/remaining (server-side age + time since we fetched)
+  R.age = () => (R.num(R.last && R.last.station && R.last.station.state_age_s) || 0) + (Date.now() - (R.last ? R.last.receivedAt : Date.now())) / 1000;
+
+  // the nav rail: the song on air with its countdown, its progress as a line under the rail; library counts on
+  // the tabs; file analysis in the header
+  const nowEl = R.$('nav-now'), prog = R.$('nav-progress');
+  function navNow() {
+    const st = R.core(), lv = st && st.automation ? R.liveDeck(st) : null, dt = R.age();
+    const rem = lv && R.num(lv.remaining), dur = lv && R.num(lv.duration);
+    if (prog) prog.style.width = rem != null && dur ? Math.min(100, Math.max(0, (lv.elapsed + dt) / dur * 100)).toFixed(2) + '%' : '0';
+    if (!nowEl) return;
+    nowEl.hidden = !R.last;
+    const lamp = nowEl.firstElementChild, on = !!lv;
+    lamp.className = on ? 'onair-lamp' : 'lamp-off';
+    lamp.textContent = on ? 'ON AIR' : (R.last && R.last.station && !R.last.station.online ? 'NO CORE' : 'OFF');
+    R.marquee(nowEl.querySelector('.now-t'), on ? R.whoLine(lv) : (st && !st.automation ? 'Automation stopped' : st ? 'Between tracks' : 'Core offline'));
+    nowEl.querySelector('.now-rem').textContent = rem != null ? '-' + R.clock(rem - dt) : '';
+  }
+  function header(d) {
+    const s = d && d.station, st = R.core(), lib = (st && st.library) || {};
+    document.querySelectorAll('.tab-n[data-count]').forEach((el) => {
+      const n = R.num(lib[el.dataset.count]);
+      if (el.textContent !== (n == null ? '' : String(n))) el.textContent = n == null ? '' : n;
+    });
+    const a = s && s.analysis, chip = R.$('hdr-analysis');
+    if (chip) {
+      chip.hidden = !(a && a.active && a.left);
+      if (!chip.hidden) chip.querySelector('span').textContent = 'Analyzing · ' + a.left + ' left';
+    }
+    navNow();
+  }
+  const um = R.$('usermenu');
+  if (um) document.addEventListener('click', (e) => { if (um.open && !um.contains(e.target)) um.open = false; });
 
   // ── the status loop (one per page) ─────────────────────────────────────
   let loop = { ms: 5000, plays: 0, onData: null, timer: null, busy: false };
@@ -159,10 +210,12 @@
       const sent = Date.now();
       const d = await R.api(R.withStation('/api/v1/now?plays=' + loop.plays + (loop.ahead ? '&ahead=' + loop.ahead : '')));
       d.receivedAt = Date.now();
+      R.last = d;
       setClock(d.clock, sent, d.receivedAt);
       fillStations(d.stations || []);
       pillFor(d.station);
       noteCommands(d.station && d.station.commands);
+      header(d);
       if (loop.onData) loop.onData(d);
     } catch (e) {
       setPill('stopped', 'server offline');
@@ -206,6 +259,7 @@
     tickClock();
   }
   function tickClock() {
+    navNow();
     if (!clk || !clock) return;
     clk.textContent = new Date(Date.now() + clock.offset + clock.zoneMin * 60000).toISOString().slice(11, 19);
   }

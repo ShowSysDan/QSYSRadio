@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **1.3.1** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.4.0** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **1.3.1** — stable; standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **1.3.1** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **1.3.1** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.4.0** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.4.0** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.4.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -297,7 +297,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `1.3.1`.
+Expect the version, e.g. `1.4.0`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -430,12 +430,12 @@ Expect:
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
 - In the journal: `migrate: schema "qsysradio" at version 0012 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 1.3.1 starting on port
+  (install.sh already applied them), `[qsysradio] 1.4.0 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":13,"schema_version":13,"version":"1.3.1"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":13,"schema_version":13,"version":"1.4.0"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -603,14 +603,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 1.3.1 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.4.0 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 1.3.1`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.4.0`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -641,7 +641,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (8 in 1.3.1).
+The last line prints the number of tables (8 in 1.4.0).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -683,7 +683,7 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 1.3.0, server is 1.3.1`.
+  `station=Main runs radio.lua 1.3.1, server is 1.4.0`.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -949,6 +949,12 @@ MockCore scenarios and `live_core.py`.
 
 ## Web control panel
 
+- **Header and nav rail (every page):** the station's state, file analysis
+  progress while a run is on (click: the Music page), the server clock and
+  your account menu (role, Sign out). The tabs carry each library's count;
+  the rail stays at the top while the page scrolls and shows what is on air
+  with its countdown (not on the Dashboard, which shows it larger), with the
+  song's progress as a red line along its bottom edge.
 - **Dashboard:** on-air countdown, up next (a break when an ad slot opens or a
   bumper is due before the song ends; else the queue or the server's pick),
   **Coming up**: the next 10 songs / ads / bumpers with estimated start times
@@ -956,13 +962,19 @@ MockCore scenarios and `live_core.py`.
   change; mix-in ads and bumpers it picks itself show without a name), songs until
   the next bumper and the next ad break (and hourly ads owed), library size;
   transport (Skip, Bumper now, Ad break now, Stop after current, Stop now /
-  Start); both decks live, each with a meter column on its left, once a
-  second: the rms now, a vertical meter after the deck's gain (bar = rms,
-  white line = peak, cyan tick = the Average level; the scale is widest
-  around 0 dB) and the player gain, with the level-match part it plays with
-  in cyan; the queue (reorder, remove, clear);
+  Start): a key goes down when pressed, shows a sweep along its bottom edge
+  until the Core answers, then flashes green (done) or red (failed); the
+  same for Play next / Queue / Play now / Bumper now / Rescan on the library
+  pages. Both decks live, each with a meter column on its left: the rms now,
+  a vertical meter after the deck's gain (bar = rms, white line = peak, cyan
+  tick = the Average level; the scale is widest around 0 dB) and the player
+  gain, with the level-match part it plays with in cyan. The Core reports
+  the meter once a second; in between the bar glides to each reading and
+  sways gently around it while there is sound (smoothed for the eye, not
+  measured: the numbers are the Core's), and the peak line holds a second
+  before it falls. The queue (reorder, remove, clear);
   activity (every command, who sent it, and the Core's answer); recent plays.
-  Titles too long for their card slide slowly back and forth, also when the
+  Titles too long for their card slide back and forth (about 35 px a second), also when the
   computer asks for reduced motion (Remote Desktop, Windows with animation
   effects off): everything else then stops moving.
 - **Music**, **Imaging & IDs** and **Advertisements** pages (one tab each): search
@@ -979,7 +991,10 @@ MockCore scenarios and `live_core.py`.
   **ID** toggle (marks a station ID). Advertisements: Play now, the schedule (Mix in /
   Per hour with the count / Off) with plays this hour and today, and a
   **This hour** line of every per-hour slot in time order. Rescan. Lists
-  reload by themselves after a new scan and whenever something plays.
+  reload by themselves after a new scan, whenever a play starts or ends,
+  as each file analysis result comes in, and once a minute (other
+  operators' changes, this hour's ad slots); never while you are editing a
+  row.
 - **Pause ads / bumpers** (the pause button on the Next bumper / Next ad
   break cards, operators): for 30 min, 1 hour, until a time of day (the next
   time it comes round, server time) or until resumed; the card shows PAUSED
@@ -987,9 +1002,14 @@ MockCore scenarios and `live_core.py`.
   meantime are skipped); held bumpers: no every-N-songs bumper. Bumper now /
   Ad break now still play. Station IDs are not paused.
 - **Play log:** a day (search, type), what was on air at a moment, CSV.
-- **Settings** (admins): every station setting in groups (Library, Bumpers &
-  ads, Fades, Levels, Silence detection, Rotation, Safety), with what the
-  Core is running next to each. Saved settings reach the Core within a second.
+  Today's list adds each play as it starts and ends.
+- **Settings** (admins): every station setting in a box per group (Library,
+  Bumpers & ads, Fades, Levels, Silence detection, Rotation, Safety), the
+  boxes in columns (three on a wide screen, one on a phone). Each setting
+  shows its unit, what it does, where its value comes from (a green dot and
+  "set here", or the default) and what the Core is running. Changes are
+  marked amber, and the save bar counts them and stays in view until you
+  save or discard. Saved settings reach the Core within a second.
 
 Commands go to the server, the Core picks them up on its next sync (≤ 1 s)
 and reports the result, which shows in Activity. Pages poll short requests,
@@ -1251,6 +1271,7 @@ complete record.
 | 1.1.0 | File analysis: quiet start / end measured on the off-air deck, daily |
 | 1.2.0 | Analyze one file from its row; failed analyses retried by the next run |
 | 1.3.0 | Level matching: each file's average level measured, every item played at the same average; deck gain and meters on the dashboard |
+| 1.4.0 | Panel refresh: nav rail with what is on air on every page, smoothed deck meters, pressed / sent / done transport keys, Settings in boxes, pages that reload themselves |
 | Next | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
 | Later | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
 

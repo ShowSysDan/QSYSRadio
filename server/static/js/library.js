@@ -193,6 +193,7 @@
           : 'No files yet. The Core uploads its library after each scan.') + '</td></tr>');
       }
       offset += d.items.length;
+      loadedAt = Date.now();
       $('lib-more').hidden = offset >= d.total;
       $('lib-info').textContent = d.total + ' ' + NOUN[kind] + (d.station ? ' on ' + d.station : '');
       const t = d.totals || {};
@@ -269,7 +270,7 @@
   $('lib-sort').addEventListener('change', () => load(false));
   $('lib-more').addEventListener('click', () => { if (!loading) load(true); });
   $('btn-rescan').hidden = !R.canOperate;
-  $('btn-rescan').addEventListener('click', () => R.command('rescan', {}, 'Rescan library'));
+  $('btn-rescan').addEventListener('click', (e) => R.command('rescan', {}, 'Rescan library', e.currentTarget));
   $('btn-forget').hidden = !R.canOperate;
   $('btn-forget').addEventListener('click', async () => {
     if (!confirm('Forget the measured quiet start, end and level of every one of the ' + NOUN[kind] + '? Each is measured again on its next play. Figures set by an operator stay.')) return;
@@ -294,10 +295,10 @@
     const b = e.target.closest('button[data-a]');
     if (!b) return;
     const tr = b.closest('tr'), key = tr.dataset.key, label = tr.dataset.label, a = b.dataset.a;
-    if (a === 'next') R.command('queue_add', { key, position: 'next' }, 'Play next: ' + label);
-    else if (a === 'queue') R.command('queue_add', { key, position: 'end' }, 'Queue: ' + label);
-    else if (a === 'now' && confirm('Fade to “' + label + '” now?')) R.command('play_now', { key }, 'Play now: ' + label);
-    else if (a === 'bumper') R.command('bumper_now', { key }, 'Bumper now: ' + label);
+    if (a === 'next') R.command('queue_add', { key, position: 'next' }, 'Play next: ' + label, b);
+    else if (a === 'queue') R.command('queue_add', { key, position: 'end' }, 'Queue: ' + label, b);
+    else if (a === 'now' && confirm('Fade to “' + label + '” now?')) R.command('play_now', { key }, 'Play now: ' + label, b);
+    else if (a === 'bumper') R.command('bumper_now', { key }, 'Bumper now: ' + label, b);
     else if (a === 'ident') setIdent(tr, !b.classList.contains('on'));
     else if (a === 'trim') trimRow(tr);
     else if (a === 'analyze') {
@@ -305,12 +306,14 @@
         .then(() => { R.toast(label + ': queued for analysis on the off-air deck', 'ok'); refresh(); })
         .catch((err) => R.toast(label + ': ' + err.message, 'bad'));
     }
-    else if (a === 'ad' && confirm('Fade to an ad break with “' + label + '” now?')) R.command('play_now', { key }, 'Play now: ' + label);
+    else if (a === 'ad' && confirm('Fade to an ad break with “' + label + '” now?')) R.command('play_now', { key }, 'Play now: ' + label, b);
   });
 
   // the first poll brings the server's clock (times are shown in its zone): load then; after that, a new
-  // scan from the Core (library_at) or a new play (counts, last played) reloads what is shown
-  let started = false;
+  // scan from the Core (library_at), a play starting or ending (counts, last played, measured figures) or a
+  // file analyzed (its figures, the queued / failed tags) reloads what is shown; and once a minute anyway
+  // (another operator's changes, this hour's ad slots)
+  let started = false, loadedAt = 0;
   // file analysis: progress and the buttons to start / stop it
   function analysisLine(a) {
     const el = $('lib-analysis');
@@ -344,8 +347,9 @@
     const s = d && d.station;
     analysisLine(s && s.analysis);
     if (!s) return;
-    const now = s.library_at + '|' + ((d.recent[0] && d.recent[0].id) || '');
-    if (seen !== null && now !== seen) refresh();
+    const p = d.recent[0] || {}, a = s.analysis || {};
+    const now = [s.library_at, p.id, p.ended_at, a.last, a.left].join('|');
+    if ((seen !== null && now !== seen) || (loadedAt && Date.now() - loadedAt > 60000)) refresh();
     seen = now;
   });
 })();

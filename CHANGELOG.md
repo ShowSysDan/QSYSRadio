@@ -5,6 +5,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.4.0] - 2026-10-14
+
+### Added
+- **Nav rail with what is on air.** The tabs are console keys with icons
+  and each library's count; the rail stays at the top while a page scrolls
+  and shows the song on air with its countdown on every page but the
+  Dashboard, its progress as a red line along the rail's bottom edge.
+- **Header.** A logo mark, the clock labelled as the server's, a chip with
+  file analysis progress while a run is on (click: the Music page), and an
+  account menu (your role, Sign out) instead of the name and link.
+- **Pressed, sent and done looks on command buttons.** Transport keys go
+  down when pressed; every button that sends a command (transport, Play
+  next, Queue, Play now, Bumper now, Rescan) shows a sweep along its bottom
+  edge until the Core answers, then flashes green (done) or red (failed).
+- **Pages reload themselves.** Library pages also reload as each file
+  analysis result comes in (`analysis.last` in the status poll: the latest
+  result), when a play ends, and once a minute (other operators' changes,
+  this hour's ad slots). The play log adds today's plays as they start and
+  end.
+
+### Changed
+- **Deck meters glide.** The Core still reports once a second; between
+  reports the bar follows like a damped spring (no stops or corners) and
+  sways gently around the reading while there is sound, and the peak line
+  holds a second, then falls. Smoothed for the eye; the numbers are the
+  Core's.
+- **Settings in boxes.** One box per group, in columns (three on a wide
+  screen); each setting shows its unit, a green dot when set here, and its
+  help under the field. The save bar counts unsaved changes and stays in
+  view until they are saved or discarded.
+- Sliding titles move about 40 % faster (35 px a second).
+- The queue's empty message no longer breaks the Music link onto its own
+  lines.
+
+Redeploy the server: `git pull && sudo systemctl restart qsysradio` (reload
+open panel pages). The Core only changed its version number: paste
+radio.lua when convenient (until then the server logs a version mismatch).
+
 ## [1.3.1] - 2026-10-14
 
 ### Changed

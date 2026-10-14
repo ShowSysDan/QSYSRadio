@@ -11,29 +11,47 @@
     const sec = { data: null, reset: new Set() };
 
     function field(s, eff) {
-      const attrs = ' name="' + esc(s.name) + '" data-orig="' + esc(eff) + '"';
+      const attrs = ' id="' + el.id + '-' + esc(s.name) + '" name="' + esc(s.name) + '" data-orig="' + esc(eff) + '"';
       if (s.type === 'choice') {
         return '<select' + attrs + '>' + s.choices.map((c) => '<option' + (String(c) === String(eff) ? ' selected' : '') + '>' + esc(c) + '</option>').join('') + '</select>';
       }
       const num = s.type === 'int' || s.type === 'float';
       return '<input' + attrs + (num ? ' type="number" required step="' + s.step + '" min="' + s.min + '" max="' + s.max + '"' : ' type="text"') + ' value="' + esc(eff) + '">';
     }
+    // the unit, from the setting's name (…_s, …_db, …_dbfs, …_min)
+    const unit = (name) => ({ s: 's', db: 'dB', dbfs: 'dBFS', min: 'min' }[(name.match(/_(s|db|dbfs|min)$/) || [])[1]] || '');
+    const TINTS = ['blue', 'amber', 'cyan', '', 'purple', 'pink', 'red'];
+
+    // unsaved changes: counted on the save bar, which stays in view while there are any
+    function dirty() {
+      const n = el.querySelectorAll('.changed').length, bar = form.querySelector('.form-actions');
+      bar.classList.toggle('dirty', n > 0);
+      bar.querySelector('.unsaved').textContent = n ? n + ' unsaved change' + (n === 1 ? '' : 's') : '';
+    }
 
     sec.render = () => {
       const d = sec.data, groups = {};
       d.settings.forEach((s) => { (groups[s.group] = groups[s.group] || []).push(s); });
-      el.innerHTML = Object.keys(groups).map((g) => '<div class="set-group"><div class="subhead" style="margin-top:0">' + esc(g) + '</div>' +
-        groups[g].map((s) => {
-          const eff = effective(s), num = s.type === 'int' || s.type === 'float';
-          // differs after the Core applied the latest settings = radio.lua's own fallback was edited
-          const run = s.running == null ? '–' : (String(s.running) === String(eff) ? esc(fmt(s.running))
-            : '<span class="diff">' + esc(fmt(s.running)) + (d.in_sync && s.override == null ? ' (radio.lua default; set it here to change)' : ' (updating)') + '</span>');
-          return '<div class="set-row"><div><div class="nm">' + esc(s.label) + '</div><div class="state">' +
-            (s.override != null ? '<span class="ovr">set here</span>' : 'default') + ' · ' + (s.server_only ? 'server' : where) + ': ' + run + '</div></div>' +
-            '<div>' + field(s, eff) +
-            (s.override != null ? '<button type="button" class="linkbtn" data-reset="' + esc(s.name) + '">reset to default (' + esc(fmt(s.default)) + ')</button>' : '') + '</div>' +
-            '<div class="help">' + esc(s.help) + (num ? ' Range ' + s.min + '–' + s.max + '.' : '') + '</div></div>';
-        }).join('') + '</div>').join('');
+      // one box per group, in columns; each setting: name and field, what it does, where it comes from
+      el.innerHTML = Object.keys(groups).map((g, i) => {
+        const set = groups[g].filter((s) => s.override != null).length;
+        return '<section class="tile set-card ' + TINTS[i % TINTS.length] + '"><div class="t-head"><div class="t-label">' + esc(g) + '</div>' +
+          (set ? '<span class="tag ok" title="Settings in this group set here (not the default)">' + set + ' set here</span>' : '') + '</div>' +
+          groups[g].map((s) => {
+            const eff = effective(s), num = s.type === 'int' || s.type === 'float', u = unit(s.name);
+            // differs after the Core applied the latest settings = radio.lua's own fallback was edited
+            const run = s.running == null ? '–' : (String(s.running) === String(eff) ? esc(fmt(s.running))
+              : '<span class="diff">' + esc(fmt(s.running)) + (d.in_sync && s.override == null ? ' (radio.lua default; set it here to change)' : ' (updating)') + '</span>');
+            return '<div class="set-row' + (s.override != null ? ' is-set' : '') + '"><label class="nm" for="' + el.id + '-' + esc(s.name) + '">' + esc(s.label) + '</label>' +
+              '<div class="field">' + field(s, eff) +
+              '<span class="unit">' + esc(u) + '</span></div>' +
+              '<div class="help">' + esc(s.help) + (num ? ' Range ' + s.min + '–' + s.max + (u ? ' ' + u : '') + '.' : '') + '</div>' +
+              '<div class="state">' + (s.override != null ? '<span class="ovr">set here</span>' : 'default') + ' · ' + (s.server_only ? 'server' : where) + ': ' + run +
+              (s.override != null ? ' <button type="button" class="linkbtn" data-reset="' + esc(s.name) + '">reset to default (' + esc(fmt(s.default)) + ')</button>' : '') +
+              '</div></div>';
+          }).join('') + '</section>';
+      }).join('');
+      dirty();
       if (after) after(d);
     };
 
@@ -57,7 +75,7 @@
 
     const mark = (e) => {
       const t = e.target;
-      if (t.matches('input, select')) { t.classList.toggle('changed', t.value !== t.dataset.orig); sec.reset.delete(t.name); }
+      if (t.matches('input, select')) { t.classList.toggle('changed', t.value !== t.dataset.orig); sec.reset.delete(t.name); dirty(); }
     };
     el.addEventListener('input', mark);
     el.addEventListener('change', mark);
@@ -69,6 +87,7 @@
       inp.value = s.default;
       inp.classList.add('changed');
       sec.reset.add(s.name);
+      dirty();
     });
     form.querySelector('[data-revert]').addEventListener('click', sec.load);
     form.addEventListener('submit', async (e) => {
