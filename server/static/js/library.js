@@ -23,9 +23,9 @@
       ['adjusted', 'Adjusted']],
   };
   const HEAD = {
-    music: ['Artist – Title', 'Length', 'Without silence', 'Plays', 'Last played', ''],
-    imaging: ['Artist – Title', 'Length', 'Without silence', 'Plays', 'Last played', ''],     // the ID toggle sits with the actions
-    ad: ['Artist – Title', 'Length', 'Without silence', 'Schedule', 'This hour', 'Today', 'Last played', ''],
+    music: ['Artist – Title', 'Length', 'Without silence', 'Level', 'Plays', 'Last played', ''],
+    imaging: ['Artist – Title', 'Length', 'Without silence', 'Level', 'Plays', 'Last played', ''],     // the ID toggle sits with the actions
+    ad: ['Artist – Title', 'Length', 'Without silence', 'Level', 'Schedule', 'This hour', 'Today', 'Last played', ''],
   };
   const button = (action, icon, text, title, primary) =>
     '<button class="sm' + (primary ? ' primary' : '') + '" data-a="' + action + '" title="' + title + '">' + ICON[icon] + '<span>' + text + '</span></button>';
@@ -33,7 +33,7 @@
   function actions(it) {
     if (!R.canOperate || it.unsupported) return '';
     return button('analyze', 'analyze', '', it.analyzed_at ? 'Analyze again on the off-air deck (analyzed ' + esc(R.timeOf(it.analyzed_at, true)) + ')'
-      : 'Analyze on the off-air deck (measures its quiet start and end)') + playActions(it);
+      : 'Analyze on the off-air deck (measures its quiet start, end and average level)') + playActions(it);
   }
 
   function playActions(it) {
@@ -78,6 +78,15 @@
       ? '<button type="button" class="linkbtn" data-a="trim" title="' + tip + ': view or adjust">' + inner + '</button>' : inner) + '</td>';
   }
 
+  // average level at unity gain (level matching brings it to Settings → Levels → Average level)
+  function level(it) {
+    const lv = R.num(it.level_db);
+    const tip = lv == null ? 'Average level not measured yet: measured on its plays and by file analysis'
+      : 'Average level ' + R.db(lv) + ' dB on the player meter at unity gain (rms of the sound, over ' + R.clock(it.level_s) + '), peak ' +
+        R.db(it.peak_dbfs) + ' dB. Level matching turns it up or down to the Average level in Settings → Levels.';
+    return '<td class="num" title="' + esc(tip) + '">' + (lv == null ? '–' : esc(R.db(lv))) + '</td>';
+  }
+
   // analysis state: queued in the run, failed (tried again by the next run), or analyzed
   function analysisTag(it) {
     if (it.analyze_queued) return ' <span class="tag" title="Waiting for the off-air deck">queued</span>';
@@ -105,7 +114,7 @@
       '<label>Quiet end ' + input('trail', it.trail_set_s, it.trail_s) + ' s <span class="dim">' + measured(it.trail_s) + '</span></label>' +
       '<button type="button" class="sm primary" data-t="save">Save</button>' +
       '<button type="button" class="sm" data-t="clear" title="Remove the figures set here">Use measured</button>' +
-      '<button type="button" class="sm" data-t="forget" title="Measure again on the next play">Forget measured</button>' +
+      '<button type="button" class="sm" data-t="forget" title="Forget the measured quiet start, end and level: measured again on the next play">Forget measured</button>' +
       '<button type="button" class="sm" data-t="analyze" title="Measure it again on the off-air deck">Analyze again</button>' +
       '<span class="dim small">' + (it.analyzed_at ? 'analyzed ' + esc(R.timeOf(it.analyzed_at, true))
         : it.analyze_failed_at ? 'analysis failed: ' + esc(it.analyze_error || '') : 'measured from plays') + '</span>' +
@@ -129,7 +138,7 @@
         await R.post('/api/v1/analyze', body);
         R.toast(label + ': queued for analysis on the off-air deck', 'ok');
       } else if (t === 'forget') {
-        if (!confirm('Forget the measured quiet start and end of “' + label + '”? They are measured again on its next play.')) return;
+        if (!confirm('Forget the measured quiet start, end and level of “' + label + '”? They are measured again on its next play.')) return;
         await R.post('/api/v1/library/forget', body);
         R.toast(label + ': measured figures forgotten', 'ok');
       }
@@ -145,9 +154,9 @@
     const last = '<td class="num" title="' + esc(R.timeOf(it.last_played, true)) + '">' + esc(R.ago(it.last_played)) + '</td>';
     const len = '<td class="num">' + (R.num(it.duration_s) ? R.clock(it.duration_s) : '–') + '</td>';
     const cells = it.kind === 'ad'
-      ? len + audible(it) + '<td>' + schedule(it) + slots(it) + '</td><td class="num">' + (R.num(it.plays_hour) || 0) + (it.mode === 'hourly' ? ' / ' + esc(it.per_hour) : '') +
+      ? len + audible(it) + level(it) + '<td>' + schedule(it) + slots(it) + '</td><td class="num">' + (R.num(it.plays_hour) || 0) + (it.mode === 'hourly' ? ' / ' + esc(it.per_hour) : '') +
         '</td><td class="num">' + (R.num(it.plays_today) || 0) + '</td>' + last
-      : len + audible(it) + '<td class="num">' + (R.num(it.plays) || 0) + '</td>' + last;
+      : len + audible(it) + level(it) + '<td class="num">' + (R.num(it.plays) || 0) + '</td>' + last;
     return '<tr data-key="' + esc(it.key) + '" data-label="' + esc(R.whoLine(it)) + '"><td>' + name + '</td>' + cells + '<td class="acts">' + actions(it) + '</td></tr>';
   }
 
@@ -263,7 +272,7 @@
   $('btn-rescan').addEventListener('click', () => R.command('rescan', {}, 'Rescan library'));
   $('btn-forget').hidden = !R.canOperate;
   $('btn-forget').addEventListener('click', async () => {
-    if (!confirm('Forget the measured quiet start and end of every one of the ' + NOUN[kind] + '? Each is measured again on its next play. Figures set by an operator stay.')) return;
+    if (!confirm('Forget the measured quiet start, end and level of every one of the ' + NOUN[kind] + '? Each is measured again on its next play. Figures set by an operator stay.')) return;
     try {
       const r = await R.post('/api/v1/library/forget', { station: R.station || undefined, kind });
       R.toast('Forgotten for ' + r.files + ' ' + NOUN[kind], 'ok');

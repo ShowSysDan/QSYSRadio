@@ -191,6 +191,17 @@ button.ghost-danger:hover:not(:disabled) { color: var(--danger); border-color: r
 .dk.imaging .bar i { background: var(--purple); }
 .dk.ad .bar i { background: var(--warning); }
 .dk-idle { margin: auto; color: var(--text-muted); font: 11px var(--mono); letter-spacing: 2px; padding-bottom: 14px; }
+/* deck meter: rms lights the bar up to its level (-60…+20 dB; green to 0, amber to +12, red above), line = peak, mark = target */
+.dk-lvl { margin-top: auto; display: flex; flex-direction: column; gap: 4px; }
+.dk-lvl + .dk-times { margin-top: 0; }
+.dk > .dk-lvl:last-child { margin-bottom: 12px; }
+.mtr { position: relative; height: 6px; border-radius: 3px; overflow: hidden;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent) 75%, var(--warning) 75% 90%, var(--danger) 90%); }
+.mtr i { position: absolute; inset: 0 0 0 0; background: rgba(0,0,0,.78); transition: left .9s linear; }
+.mtr b { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--text); transition: left .9s linear; }
+.mtr s { position: absolute; top: -1px; bottom: -1px; width: 1px; background: rgba(255,255,255,.55); }
+.dk-read { display: flex; justify-content: space-between; gap: 8px; font: 10px var(--mono); color: var(--text-muted); letter-spacing: .5px; }
+.dk-read em { font-style: normal; color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .dk.analyzing .dk-idle { letter-spacing: 0; text-align: center; padding: 0 8px 14px; overflow-wrap: anywhere; }
 .analysis { font-size: 12px; color: var(--text-dim); margin: 0 0 10px; display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
 .analysis b { color: var(--text); font-weight: 600; }

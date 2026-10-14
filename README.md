@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **1.2.1** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.3.0** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **1.2.1** — stable; standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **1.2.1** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **1.2.1** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.3.0** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.3.0** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.3.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -23,11 +23,11 @@ station settings, the library, syslog.
  ┌────────────────────────── Q-SYS Core ──────────────────────────┐
  │  radio.lua                                                     │
  │   • both decks: load, play, fades, crossfade timing,           │
- │     silence detection, learning (lead-in / tail / peak),       │
- │     file analysis on the off-air deck                          │
+ │     silence detection, learning (lead-in / tail / level),      │
+ │     level matching, file analysis on the off-air deck          │
  │   • keeps playing on its own if the server is gone             │
  │   • once a second: POST /api/v1/core/sync                      │
- │       → queued events, state (only when it changed)            │
+ │       → events, state (when it changed), deck gain + meters    │
  │       ← operator commands, settings, ad plan, files to analyze │
  │  Audio_Player23 ─┬─► PlayerMeter meter.1                       │
  │                  └─► RadioOut input 1 ─────┐                   │
@@ -71,10 +71,14 @@ station settings, the library, syslog.
 - **Ads are scheduled on the server.** Each ad is mixed in, played N times an
   hour, or off; the server works out which ads are owed and sends the Core a
   plan, the Core only plays it.
-- **Learning.** Lua measures lead-in, trailing silence and peak while a track
-  plays cleanly (never during a fade) and reports them with each play; the
-  server keeps them per file and gives the Core back what it needs (trailing
-  silence, unsupported files) after each library upload.
+- **Learning.** Lua measures lead-in, trailing silence, peak and average
+  level while a track plays cleanly (never during a fade) and reports them
+  with each play; the server keeps them per file and gives the Core back what
+  it needs (quiet start / end, average level and peak, unsupported files)
+  after each library upload.
+- **Level matching.** Every item plays at the same average level: the Core
+  turns each file up or down by its measured average, within limits (see
+  [Level matching](#level-matching)). Fades start and end at that level.
 
 ## What the Core told us (probe 0.1.0, 2026-10-12)
 
@@ -111,7 +115,8 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
 `SERVER_TOKEN` (the server's `RADIO_API_TOKEN`) and `STATION_ID`.
 
 - **Timing.** A 250 ms station timer reads each deck's `peak.N` (the meter
-  samples every ~250 ms), watches for trailing silence, and checks the
+  samples every ~250 ms; `rms.N` too while there is sound, for the average
+  level), watches for trailing silence, and checks the
   crossfade point; inside the last tick it arms `Timer.CallAfter` so the fade
   starts on time. Fades step gain every 50 ms on a timer that runs only while
   a deck is fading or loading (~3% of the time).
@@ -146,9 +151,13 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   (−50 dBFS), so a file's own soft fade-in counts as sound, not silence. A
   play the Core fades in (`fade_in_s` > 0) reports no lead-in: the meter is
   not read while the gain moves, so the start can't be seen.
+- **Level matching.** Each item plays at its kind's level plus the trim that
+  brings its measured average to `level_target_db`
+  ([Level matching](#level-matching)); every fade starts and ends there.
 - **Learning** (kept on the server, `library` table, every kind; see also
-  [File analysis](#file-analysis), which replaces it per file): duration,
-  lead-in, minimum trailing silence, peak at unity; an operator's figures
+  [File analysis](#file-analysis), which replaces the quiet start / end per
+  file): duration, lead-in, minimum trailing silence, highest peak and
+  average level at unity; an operator's figures
   (`lead_set_s`, `trail_set_s`) win over them. After each library upload the
   server's figures replace the Core's (so edits and forgotten figures apply). Trailing silence counts
   only when it was heard before any fade began (a crossfade hides the rest
@@ -177,6 +186,8 @@ python3 qsys/test/run_mock.py qsys/test/scenario_basic.lua        # rotation, bu
 python3 qsys/test/run_mock.py qsys/test/scenario_server.lua       # server outage, outbox, replay
 python3 qsys/test/run_mock.py qsys/test/scenario_control.lua      # every panel command, settings push
 python3 qsys/test/run_mock.py qsys/test/scenario_ads.lua          # ad breaks, hourly ads, ad plan
+python3 qsys/test/run_mock.py qsys/test/scenario_analysis.lua     # file analysis on the off-air deck
+python3 qsys/test/run_mock.py qsys/test/scenario_levels.lua       # average levels, level matching, fades, deck meters
 python3 qsys/test/run_mock.py qsys/test/scenario_regressions.lua  # one case per bug found in review
 ```
 
@@ -286,7 +297,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `1.2.1`.
+Expect the version, e.g. `1.3.0`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -419,12 +430,12 @@ Expect:
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
 - In the journal: `migrate: schema "qsysradio" at version 0012 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 1.2.1 starting on port
+  (install.sh already applied them), `[qsysradio] 1.3.0 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":12,"schema_version":12,"version":"1.2.1"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":13,"schema_version":13,"version":"1.3.0"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -550,7 +561,7 @@ account that has access, the dashboard opens without asking.
 In Q-SYS Designer, with the station's design open:
 
 1. **Components.** You need two Audio Players, a True Peak/RMS meter with
-   2 channels and a mixer that sums the players for the air chain. Wire
+   2 channels (the script reads its `peak.N` and `rms.N`) and a mixer that sums the players for the air chain. Wire
    Player 1 to meter input 1 and mixer input 1, Player 2 to meter input 2
    and mixer input 2. The meter must take the player's output directly, not
    the mixer's: file analysis mutes a player's mixer input and still reads
@@ -592,14 +603,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 1.2.1 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.3.0 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 1.2.1`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.3.0`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -630,7 +641,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (8 in 1.2.1).
+The last line prints the number of tables (8 in 1.3.0).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -672,7 +683,7 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 1.2.0, server is 1.2.1`.
+  `station=Main runs radio.lua 1.2.1, server is 1.3.0`.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -790,6 +801,7 @@ sudo journalctl -u qsysradio --since "1 hour ago" --no-pager | tail -n 50
 | `meter component 'PlayerMeter' not found`, `Deck A: component 'Audio_Player23' not found` | The Code Name differs from `CFG` (step 10) |
 | `Deck A: 'Audio_Player23' has no control 'gain' (Script Access on?)` | Script Access is `None`, or the Code Name differs from `CFG` (step 10) |
 | `meter 'PlayerMeter' has no control peak.1` (or `peak.2`) | The meter's Script Access is `None`, or it has fewer than 2 channels (step 10) |
+| `! meter 'PlayerMeter' has no control rms.1: average levels are not measured` | The meter has no RMS reading: use a True Peak/RMS meter (step 10). The station plays on; files are not measured, so level matching only uses levels measured before |
 | `! mixer 'RadioOut' with input.1/2.mute.1 not found: file analysis is off` | The mixer's Code Name differs from `CFG.MIXER`, its Script Access is `None`, or the players are on other inputs (`MIX_A` / `MIX_B`). The station plays on; only file analysis is off |
 | `library: cannot list media/Audio/Test/Tuning/` | That folder is not on the Core: upload it, or change Music folder on the Settings page |
 | `! server: sync failed (403 ); N events queued`; journal: `/api/v1/core/sync: rejected request from <core-ip> (bad or missing X-Radio-Token)` | `CFG.SERVER_TOKEN` differs from `RADIO_API_TOKEN` (`grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`): paste it and run again |
@@ -944,7 +956,9 @@ MockCore scenarios and `live_core.py`.
   change; mix-in ads and bumpers it picks itself show without a name), songs until
   the next bumper and the next ad break (and hourly ads owed), library size;
   transport (Skip, Bumper now, Ad break now, Stop after current, Stop now /
-  Start); both decks live; the queue (reorder, remove, clear);
+  Start); both decks live, each with its player gain (and the level-match
+  trim it plays with) and its meter after that gain (bar = rms, line = peak,
+  mark = the Average level), once a second; the queue (reorder, remove, clear);
   activity (every command, who sent it, and the Core's answer); recent plays.
   Titles too long for their card slide slowly back and forth, also when the
   computer asks for reduced motion (Remote Desktop, Windows with animation
@@ -953,10 +967,11 @@ MockCore scenarios and `live_core.py`.
   (`/` jumps to it, Esc clears), sort, quick filters (never played,
   unsupported; station IDs; per hour / mix in / off; adjusted), all kept in
   the URL so a view can be bookmarked. Length and length without the
-  measured silence, totals. Click the length without silence (operators) to
+  measured silence, totals; the average level (hover: peak and how long was
+  measured; sort Loudest / Quietest). Click the length without silence (operators) to
   see the measured quiet start and end and set your own (blank = measured;
   the Core never measures over a figure set here), go back to the measured
-  ones, or forget them (measured again on the next play). **Forget
+  ones, or forget them and the level (measured again on the next play). **Forget
   measured** in the toolbar does that for the whole page. Changes reach the
   Core with a rescan the server queues. Music: Play next, Queue, Play now. Imaging: Bumper now and the
   **ID** toggle (marks a station ID). Advertisements: Play now, the schedule (Mix in /
@@ -1087,21 +1102,23 @@ when the server is unreachable.
 
 ## File analysis
 
-The Core measures each file's quiet start and end on the deck that is off
-air, instead of (or before) learning them from plays:
+The Core measures each file's quiet start, quiet end and average level on
+the deck that is off air, instead of (or before) learning them from plays:
 
 - **Off air.** The deck's RadioOut input (`input.N.mute.1`) is muted before
   the file loads, and the player plays at full level into its meter (the
   meter is before the mixer). Every on-air play unmutes its deck first; a
   restart of the script unmutes both.
 - **When.** While the station plays: on the deck that is not live, only
-  while the song on air has more than 30 s left and no skip or break is
+  while the song on air has more than 50 s left and no skip or break is
   asked for. Anything the station needs the deck for (crossfade, skip,
   break, Play now, Start) takes it back at once and the file is tried again
   later. While stopped: both decks, about twice as fast.
-- **What.** The first 6 s (where the sound starts), then a jump to 15 s
-  before the end and play to the end (where it stops). A file shorter than
-  that plays through. About 17 s per song. The quiet end reads up to ~0.7 s
+- **What.** The first 6 s (where the sound starts), then 20 s from the
+  middle (its average level, see [Level matching](#level-matching)), then a
+  jump to 15 s before the end and play to the end (where it stops). A file
+  too short for all three plays through (its level from everything heard).
+  About 37 s per song. The quiet end reads up to ~0.7 s
   short because the meter takes a moment to fall: the safe side, the next
   item starts a touch later.
 - **Which files.** The server keeps the job (`stations.analyze_from`) and
@@ -1126,11 +1143,48 @@ air, instead of (or before) learning them from plays:
   current figures stay in use until the new ones arrive. Each row shows a
   tag: ✓ analyzed (hover for when), "queued", or "failed". The **Not
   analyzed** filter lists the rest.
-- **Final.** Analyzed figures (`library.analyzed_at`) are not learned over
-  by plays, on the server or the Core. Figures set by an operator still win;
-  **Forget measured** clears the analysis too.
+- **Final.** An analyzed quiet start and end (`library.analyzed_at`) are not
+  learned over by plays, on the server or the Core. Figures set by an
+  operator still win; **Forget measured** clears the analysis too. The
+  average level is not final: plays keep adding to it.
 - **The panel.** The analyzing deck shows "analyzing · off air" on the
   dashboard and never counts as on air (Coming up ignores it).
+
+## Level matching
+
+Every song, bumper and ad plays at the same average level, set on Settings →
+Levels:
+
+- **Measured.** While a file plays cleanly (never during a fade, only while
+  there is sound) the Core reads its deck's `rms.N` every 250 ms and averages
+  it at unity gain (`rms − gain`, averaged as power, not as dB). Each play
+  reports that average and the seconds it heard (`level`, `level_s`; from
+  10 s of sound, or half of a short file), and [file analysis](#file-analysis)
+  measures 20 s from the middle of the file. The server keeps
+  `library.level_db`: the average of every measurement, weighted by the
+  seconds each heard, so it steadies with every play; `library.peak_dbfs`
+  keeps the highest peak. The Core uses a file's first measurement at once
+  and the server's average after each library upload.
+- **Applied.** At each play the deck's gain is the kind's level (Music /
+  Bumper / Advertisement level) plus the trim: **Average level** (0 dB) minus
+  the file's average, at most **Raise quiet files, at most** (6 dB) up and
+  **Lower loud files, at most** (20 dB) down, and never raised so far that
+  the file's peak passes the **Peak ceiling** (+18 dB). A file not measured
+  yet plays without a trim. Both limits at 0 turn level matching off.
+- **Fades.** A fade-in rises to the trimmed gain; a crossfade, skip, break,
+  silence or stop fades down from wherever the deck is. Nothing jumps to
+  0 dB on the way (`scenario_levels.lua` checks every kind of transition).
+- **The scale.** dB on the player meter (−120 … +20, after the player's
+  gain): the numbers the deck meters on the dashboard show. The default
+  Average level of 0 dB puts the average 20 dB under the top of the meter.
+- **Where to see it.** The dashboard's deck cards: the player gain, the trim
+  ("match"), and the meter with the Average level marked; a matched song's
+  rms sits around the mark. Library pages: each file's average (sort Loudest
+  / Quietest). Start events carry `trim` (syslog, `core_events`).
+- **Starting over.** Forget measured forgets the level too, and a replaced
+  file (new size) is measured afresh. Updating to 1.3.0 starts a
+  re-analysis of every file once (migration 0013, as Re-analyze all does) so
+  each gets an analyzed level; plays measure as they go anyway.
 
 ## Clock
 
@@ -1194,9 +1248,9 @@ complete record.
 | 1.0.1 | Stable: everything in 0.3 |
 | 1.1.0 | File analysis: quiet start / end measured on the off-air deck, daily |
 | 1.2.0 | Analyze one file from its row; failed analyses retried by the next run |
+| 1.3.0 | Level matching: each file's average level measured, every item played at the same average; deck gain and meters on the dashboard |
 | Next | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
 | Later | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
-| Later | Loudness normalisation from the learned peak |
 
 ## Network requirement
 

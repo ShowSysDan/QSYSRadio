@@ -20,14 +20,22 @@
     return ds.find((d) => d.live && d.state === 'playing') || ds.find((d) => d.state === 'playing') || null;
   }
 
+  // the deck's player gain and meter (after the gain), filled in by renderMeters once a second
+  const meterHtml = (id, trim) => '<div class="dk-lvl" data-m="' + esc(id) + '" hidden title="Player meter after the deck\'s gain (dB): bar = rms, ' +
+    'line = peak, mark = the Average level (Settings → Levels). Once a second.">' +
+    '<div class="mtr"><i></i><b></b><s></s></div><div class="dk-read"><span>GAIN <em class="g"></em>' +
+    (num(trim) ? ' <span class="dim" title="Level matching: what this file gets to reach the Average level">(match ' + R.db(trim) + ')</span>' : '') +
+    '</span><span>RMS <em class="r"></em> · PK <em class="p"></em></span></div></div>';
+
   function deckHtml(id, d) {
     if (d && d.analyzing && d.file) {          // measuring a file, muted at the mixer
       return '<div class="dk analyzing"><div class="dk-head"><span class="dk-id">DECK ' + esc(id) + '</span><span class="dk-state">analyzing · off air</span></div>' +
-        '<div class="dk-idle" title="Measuring its quiet start and end; this deck is muted at the mixer and is taken back the moment the station needs it">' +
-        esc(R.whoLine(d)) + '</div></div>';
+        '<div class="dk-idle" title="Measuring its quiet start, end and average level; this deck is muted at the mixer and is taken back the moment the station needs it">' +
+        esc(R.whoLine(d)) + '</div>' + meterHtml(id) + '</div>';
     }
     if (!d || !d.file || !(playing(d) || d.state === 'loading')) {
-      return '<div class="dk"><div class="dk-head"><span class="dk-id">DECK ' + esc(id) + '</span><span class="dk-state">idle</span></div><div class="dk-idle">NO SIGNAL</div></div>';
+      return '<div class="dk"><div class="dk-head"><span class="dk-id">DECK ' + esc(id) + '</span><span class="dk-state">idle</span></div><div class="dk-idle">NO SIGNAL</div>' +
+        meterHtml(id) + '</div>';
     }
     let cls = 'dk', label = d.state;
     if (d.kind === 'imaging') { cls += ' imaging'; label = 'imaging'; }
@@ -39,8 +47,26 @@
     const lamp = cls.includes(' live') ? '<span class="onair-lamp">ON AIR</span>' : '<span class="dk-state">' + esc(label) + '</span>';
     return '<div class="' + cls + '" data-deck="' + esc(id) + '"><div class="dk-head"><span class="dk-id">DECK ' + esc(id) + '</span>' + lamp + '</div>' +
       '<div class="dk-title">' + esc(w.title) + '</div>' + (w.artist ? '<div class="dk-artist">' + esc(w.artist) + '</div>' : '') +
-      '<div class="dk-file">' + esc((d.dir || '') + d.file) + '</div>' +
+      '<div class="dk-file">' + esc((d.dir || '') + d.file) + '</div>' + meterHtml(id, d.trim) +
       '<div class="dk-times"><span class="el"></span><span class="rem"></span></div><div class="bar"><i></i></div></div>';
+  }
+
+  // the decks' gain and meters from the Core's last sync; hidden while it is offline
+  const meterPos = (v) => Math.max(0, Math.min(100, ((num(v) == null ? -120 : v) + 60) / 80 * 100)).toFixed(1) + '%';   // -60…+20 dB
+  const put = (el, prop, v) => { if (el[prop] !== v) el[prop] = v; };
+  function renderMeters() {
+    const st = core(), all = st && last.station.meters, target = st && st.settings && st.settings.level_target_db;
+    document.querySelectorAll('.dk-lvl[data-m]').forEach((el) => {
+      const m = all && all[el.dataset.m];
+      put(el, 'hidden', !m);
+      if (!m) return;
+      put(el.querySelector('.mtr i').style, 'left', meterPos(m.rms));
+      put(el.querySelector('.mtr b').style, 'left', meterPos(m.peak));
+      put(el.querySelector('.mtr s').style, 'left', meterPos(num(target) == null ? 0 : target));
+      put(el.querySelector('.g'), 'textContent', R.db(m.gain, -100) + ' dB');
+      put(el.querySelector('.r'), 'textContent', R.db(m.rms, -120));
+      put(el.querySelector('.p'), 'textContent', R.db(m.peak, -120));
+    });
   }
 
   // clocks between polls: extrapolate from the Core's last report
@@ -269,7 +295,7 @@
   function render(d) {
     if (!d) return;
     last = d;
-    renderKpis(); renderTransport(); renderDecks(); renderNext(); renderActivity(); tick();
+    renderKpis(); renderTransport(); renderDecks(); renderMeters(); renderNext(); renderActivity(); tick();
     R.setHTML($('recent'), d.recent.map((p) => R.playRow(p, false)).join('') || '<tr><td colspan="6" class="empty-state">No plays logged yet.</td></tr>');
   }
 

@@ -5,8 +5,8 @@ so repeats count as duplicates and change nothing. Each event is stored in
 its own savepoint, so one malformed event is rejected on its own instead of
 failing the batch (which would make the Core resend it forever). Only newly
 stored events touch play_log, the library's per-file figures (lead-in,
-trailing silence, peak, unsupported) and the log; log lines are returned to
-the caller to write after the transaction commits.
+trailing silence, average level, peak, unsupported) and the log; log lines are
+returned to the caller to write after the transaction commits.
 """
 import json
 import logging
@@ -21,6 +21,14 @@ END_KINDS = {'track_end': 'music', 'bumper_end': 'imaging', 'ad_end': 'ad'}
 WARN_KINDS = {'file_unsupported', 'file_failed', 'dead_air_guard', 'library_empty'}
 _META = ('kind', 't', 'at', 'boot', 'seq')
 SEQ_MAX = 2 ** 31 - 1
+# one measurement's level figures (%(level)s dB over %(level_s)s seconds, %(peak)s): a file's average level is the
+# energy average of every measurement, weighted by the seconds each heard; its peak is the highest seen
+LEVEL_SET = """level_db = CASE WHEN %(level)s::float8 IS NULL THEN level_db
+                              WHEN level_db IS NULL OR level_s IS NULL THEN %(level)s
+                              ELSE 10 * log((power(10, level_db / 10) * level_s + power(10, %(level)s / 10) * %(level_s)s)
+                                            / (level_s + %(level_s)s)) END,
+               level_s = CASE WHEN %(level)s::float8 IS NULL THEN level_s ELSE COALESCE(level_s, 0) + %(level_s)s END,
+               peak_dbfs = GREATEST(peak_dbfs, %(peak)s)"""
 
 
 class BadRequest(ValueError):
@@ -47,6 +55,14 @@ def clean(ev):
     data.update(kind=kind, boot=boot, seq=seq)
     data['_at'] = at
     return data
+
+
+def _levels(ev):
+    """The level figures in a Core event, for LEVEL_SET: dB on the meter's scale, seconds > 0 (else not used)."""
+    level, secs, peak = number(ev.get('level')), number(ev.get('level_s')), number(ev.get('peak'))
+    ok = level is not None and -120 < level <= 40 and secs is not None and 0 < secs <= 86400
+    return {'level': level if ok else None, 'level_s': secs if ok else None,
+            'peak': peak if peak is not None and -120 < peak <= 40 else None}
 
 
 def _log_line(station, ev, replayed):
@@ -107,21 +123,22 @@ def _apply(cur, station, ev):
                      text(ev.get('deck'), 10), END_KINDS[kind], ev['seq'], file, file))
         if kind in END_KINDS:
             # this play's measurements (every kind); trailing silence keeps the shortest seen (LEAST skips NULL);
-            # an analyzed file keeps its analyzed figures
-            cur.execute("""UPDATE library SET lead_in_s = CASE WHEN analyzed_at IS NULL THEN COALESCE(%s, lead_in_s) ELSE lead_in_s END,
-                               trail_s = CASE WHEN analyzed_at IS NULL THEN LEAST(trail_s, %s) ELSE trail_s END,
-                               peak_dbfs = COALESCE(%s, peak_dbfs)
-                           WHERE station = %s AND key = %s""",
-                        (number(ev.get('lead_in')), number(ev.get('trail')), number(ev.get('peak')), station,
-                         (text(ev.get('dir'), 500) or '') + (file or '')))
+            # an analyzed file keeps its analyzed quiet start / end; the level always counts
+            cur.execute(f"""UPDATE library SET lead_in_s = CASE WHEN analyzed_at IS NULL THEN COALESCE(%(lead)s, lead_in_s) ELSE lead_in_s END,
+                                trail_s = CASE WHEN analyzed_at IS NULL THEN LEAST(trail_s, %(trail)s) ELSE trail_s END, {LEVEL_SET}
+                            WHERE station = %(station)s AND key = %(key)s""",
+                        dict(_levels(ev), lead=number(ev.get('lead_in')), trail=number(ev.get('trail')), station=station,
+                             key=(text(ev.get('dir'), 500) or '') + (file or '')))
     elif kind == 'analysis':
-        # a file analyzed off air: its figures replace what plays learned; a failed one is retried by the next run
+        # a file analyzed off air: its quiet start / end replace what plays learned, its level joins them;
+        # a failed one is retried by the next run
         key = (text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')
         if ev.get('ok') is True:
-            cur.execute("""UPDATE library SET analyzed_at = NOW(), analyze_failed_at = NULL, analyze_error = NULL, analyze_wanted = FALSE,
-                               lead_in_s = %s, trail_s = %s, duration_s = COALESCE(%s, duration_s)
-                           WHERE station = %s AND key = %s""",
-                        (number(ev.get('lead_in')), number(ev.get('trail')), number(ev.get('duration')), station, key))
+            cur.execute(f"""UPDATE library SET analyzed_at = NOW(), analyze_failed_at = NULL, analyze_error = NULL, analyze_wanted = FALSE,
+                                lead_in_s = %(lead)s, trail_s = %(trail)s, duration_s = COALESCE(%(duration)s, duration_s), {LEVEL_SET}
+                            WHERE station = %(station)s AND key = %(key)s""",
+                        dict(_levels(ev), lead=number(ev.get('lead_in')), trail=number(ev.get('trail')),
+                             duration=number(ev.get('duration')), station=station, key=key))
         else:
             cur.execute("""UPDATE library SET analyze_failed_at = NOW(), analyze_error = %s, analyze_wanted = FALSE
                            WHERE station = %s AND key = %s""", (text(ev.get('status'), 200) or 'failed', station, key))

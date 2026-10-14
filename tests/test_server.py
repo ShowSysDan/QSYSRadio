@@ -8,6 +8,7 @@ so they never touch the real qsysradio or shared schemas. Skipped when no
 database is configured.
 """
 import json
+import math
 import os
 import threading
 import time
@@ -241,7 +242,7 @@ def test_learned_figures_live_on_the_server(app):
         ev(5, 'file_unsupported', file='bad.wma', dir='M/', status='Unsupported file format')])
     row = sql("SELECT duration_s, lead_in_s, trail_s, peak_dbfs FROM qsr_test.library WHERE station='L1' AND key='M/a.mp3'",
               fetch=True)[0]
-    assert tuple(row) == (200.0, 0.6, 3.0, -5.0)             # a cut play keeps the trail it cannot measure
+    assert tuple(row) == (200.0, 0.6, 3.0, -4.5)             # a cut play keeps the trail it cannot measure; the highest peak
     assert library_post(app, 'L1', items).json['learned'] == {'M/a.mp3': {'trail': 3.0, 'lead': 0.6},
                                                            'M/bad.wma': {'unsupported': True}}
     op = signed_in(app, 'operator')
@@ -471,6 +472,49 @@ def test_quiet_start_and_end_can_be_adjusted_and_forgotten(app):
     assert trim(op, key='M/a.mp3', lead=None, trail=None).status_code == 200                       # back to measured
     assert forget(op, key='I/b.wav').json['files'] == 1
     assert library_post(app, 'T1', items).json['learned'] == {}
+
+
+def test_average_level_and_deck_readout(app):
+    """A file's average level is the energy average of its measurements (plays and analysis), weighted by
+    the seconds each heard; its peak is the highest. The Core gets both; a replaced file starts again;
+    Forget measured forgets them. The decks' gain and meters from each sync reach the panel."""
+    items = [{'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music', 'size': 10},
+             {'key': 'M/b.mp3', 'dir': 'M/', 'file': 'b.mp3', 'kind': 'music', 'size': 20}]
+    library_post(app, 'LV1', items)
+    sync(app, station='LV1', events=[
+        ev(1, 'track_start', deck='A', file='a.mp3', dir='M/', duration=200.0),
+        ev(2, 'track_end', deck='A', file='a.mp3', dir='M/', reason='end', level=4.0, level_s=150.0, peak=12.0),
+        ev(3, 'analysis', file='a.mp3', dir='M/', ok=True, lead_in=0.4, trail=1.5, duration=200.0, level=10.0, level_s=50.0,
+           peak=14.0),
+        ev(4, 'track_start', deck='B', file='a.mp3', dir='M/', duration=200.0, trim=-6.4),
+        ev(5, 'track_end', deck='B', file='a.mp3', dir='M/', reason='cut', level=99.0, level_s=10.0, peak=13.0),  # off the scale
+        ev(6, 'track_start', deck='A', file='a.mp3', dir='M/', duration=200.0, trim=-6.4),
+        ev(7, 'track_end', deck='A', file='a.mp3', dir='M/', reason='cut', level=-30.0),                        # no seconds
+        ev(8, 'track_start', deck='B', file='b.mp3', dir='M/', duration=100.0),
+        ev(9, 'track_end', deck='B', file='b.mp3', dir='M/', reason='end', level=-9.5, level_s=90.0, peak=2.0)])
+    level = 10 * math.log10((10 ** 0.4 * 150 + 10 ** 1.0 * 50) / 200)
+    row = sql("SELECT level_db, level_s, peak_dbfs FROM qsr_test.library WHERE station='LV1' AND key='M/a.mp3'", fetch=True)[0]
+    assert (row[0], row[1], row[2]) == (pytest.approx(level), 200.0, 14.0)
+    learned = library_post(app, 'LV1', items).json['learned']
+    assert learned['M/a.mp3'] == {'trail': 1.5, 'lead': 0.4, 'analyzed': True, 'level': round(level, 1), 'peak': 14.0}
+    assert learned['M/b.mp3'] == {'level': -9.5, 'peak': 2.0}
+    op = signed_in(app, 'operator')
+    rows = op.get('/api/v1/library?station=LV1&sort=quietest').json['items']
+    assert [r['key'] for r in rows] == ['M/b.mp3', 'M/a.mp3'] and rows[1]['level_db'] == pytest.approx(level)
+    assert rows[1]['level_s'] == 200.0 and rows[1]['peak_dbfs'] == 14.0
+    assert [r['key'] for r in op.get('/api/v1/library?station=LV1&sort=loudest').json['items']] == ['M/a.mp3', 'M/b.mp3']
+    items[1]['size'] = 21                                  # replaced with a new file: measured afresh
+    assert 'M/b.mp3' not in library_post(app, 'LV1', items).json['learned']
+    assert op.post('/api/v1/library/forget', json={'station': 'LV1', 'key': 'M/a.mp3'}, headers=WEB).json['files'] == 1
+    assert tuple(sql("SELECT level_db, level_s, peak_dbfs FROM qsr_test.library WHERE station='LV1' AND key='M/a.mp3'",
+                     fetch=True)[0]) == (None, None, None)
+    # the decks' readout: cleaned, and gone when a Core does not send it
+    sync(app, station='LV1', state=STATE, meters={'A': {'peak': 3.4, 'rms': -2.1, 'gain': -6.4},
+                                                  'B': {'peak': -500, 'rms': 'loud', 'gain': -100}, 'C': {'peak': 1}})
+    assert op.get('/api/v1/now?station=LV1').json['station']['meters'] == {
+        'A': {'peak': 3.4, 'rms': -2.1, 'gain': -6.4}, 'B': {'peak': -120.0, 'gain': -100.0}}
+    sync(app, station='LV1', meters='nope')
+    assert op.get('/api/v1/now?station=LV1').json['station']['meters'] is None
 
 
 def test_file_analysis_job(app):
