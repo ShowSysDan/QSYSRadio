@@ -160,7 +160,8 @@ button.ghost-danger:hover:not(:disabled) { color: var(--danger); border-color: r
 
 /* ── Decks (instance-card style) ────────────────────────────────────────── */
 .decks { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.dk { position: relative; overflow: hidden; border-radius: 12px; padding: 12px 14px 0; display: flex; flex-direction: column; gap: 8px; min-height: 170px;
+.dk { position: relative; overflow: hidden; border-radius: 12px; padding: 12px 14px 0; display: grid; grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: 1fr auto; min-height: 200px;
   background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,0) 55%), var(--surface2); border: 1px solid var(--border); box-shadow: var(--hl); }
 .dk::before { content: ''; position: absolute; inset: 0 0 auto 0; height: 2px; background: var(--border); }
 .dk.live { border-color: var(--danger); box-shadow: var(--hl), var(--lift), 0 0 0 1px var(--danger), 0 0 30px -6px rgba(239,68,68,.8); }
@@ -172,6 +173,7 @@ button.ghost-danger:hover:not(:disabled) { color: var(--danger); border-color: r
 .dk.ad { border-color: rgba(245,158,11,.6); box-shadow: var(--hl), 0 0 0 1px rgba(245,158,11,.6), 0 0 26px -8px rgba(245,158,11,.8); }
 .dk.ad::before { background: var(--warning); }
 .dk.fading { opacity: .75; }
+.dk-main { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .dk-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .dk-id { font-family: var(--mono); font-size: 11px; color: var(--text-dim); background: rgba(0,0,0,.4); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; }
 .dk-state { font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 1px; padding: 2px 7px; border-radius: 3px;
@@ -185,23 +187,28 @@ button.ghost-danger:hover:not(:disabled) { color: var(--danger); border-color: r
 .dk-times { display: flex; justify-content: space-between; align-items: baseline; font: 12px var(--mono); color: var(--text-dim); margin-top: auto; }
 .dk-times .rem { font-size: 22px; font-weight: 700; color: var(--warning); font-variant-numeric: tabular-nums; }
 .dk.live .dk-times .rem { color: #fca5a5; text-shadow: 0 0 14px rgba(239,68,68,.5); }
-.bar { height: 3px; margin: 0 -14px; background: rgba(255,255,255,.06); }
+.bar { grid-column: 1 / -1; height: 3px; margin: 0 -14px; background: rgba(255,255,255,.06); }
 .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--warning), var(--danger)); box-shadow: 0 0 8px rgba(239,68,68,.6); transition: width .25s linear; }
 .dk.incoming .bar i { background: linear-gradient(90deg, var(--accent), var(--cyan)); box-shadow: var(--glow-g); }
 .dk.imaging .bar i { background: var(--purple); }
 .dk.ad .bar i { background: var(--warning); }
 .dk-idle { margin: auto; color: var(--text-muted); font: 11px var(--mono); letter-spacing: 2px; padding-bottom: 14px; }
-/* deck meter: rms lights the bar up to its level (-60…+20 dB; green to 0, amber to +12, red above), line = peak, mark = target */
-.dk-lvl { margin-top: auto; display: flex; flex-direction: column; gap: 4px; }
-.dk-lvl + .dk-times { margin-top: 0; }
-.dk > .dk-lvl:last-child { margin-bottom: 12px; }
-.mtr { position: relative; height: 6px; border-radius: 3px; overflow: hidden;
-  background: linear-gradient(90deg, var(--accent-dim), var(--accent) 75%, var(--warning) 75% 90%, var(--danger) 90%); }
-.mtr i { position: absolute; inset: 0 0 0 0; background: rgba(0,0,0,.78); transition: left .9s linear; }
-.mtr b { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--text); transition: left .9s linear; }
-.mtr s { position: absolute; top: -1px; bottom: -1px; width: 1px; background: rgba(255,255,255,.55); }
-.dk-read { display: flex; justify-content: space-between; gap: 8px; font: 10px var(--mono); color: var(--text-muted); letter-spacing: .5px; }
-.dk-read em { font-style: normal; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+/* deck meter column: rms now, a vertical meter (-60…+20 dB, widest around 0: 0 dB at 70%, +12 at 88.8%, as
+   dashboard.js maps it; rms lights it green to 0, amber to +12, red above; white line = peak, cyan tick = the
+   Average level), the player gain and its level-match part */
+.dk-lvl { grid-row: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; width: 46px; margin-right: 12px;
+  padding: 0 10px 12px 0; border-right: 1px solid var(--border); }
+.dk-lvl .mv { display: flex; flex-direction: column; align-items: center; line-height: 1.15; }
+.dk-lvl .mv em { font: 700 11px var(--mono); color: var(--text); font-style: normal; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dk-lvl .mv span { font: 8px var(--mono); letter-spacing: 1px; color: var(--text-muted); }
+.dk-lvl .mv .trim { letter-spacing: 0; font-size: 9px; color: var(--cyan); }
+.mtr { position: relative; flex: 1; width: 100%; min-height: 64px; }
+.mtr-bar { position: absolute; inset: 0 auto 0 2px; width: 8px; border-radius: 2px; overflow: hidden;
+  background: linear-gradient(0deg, var(--accent-dim), var(--accent) 70%, var(--warning) 70% 88.8%, var(--danger) 88.8%); }
+.mtr-bar i { position: absolute; inset: 0 0 auto 0; height: 100%; background: rgba(0,0,0,.8); transition: height .9s linear; }
+.mtr-bar b { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; margin-bottom: -1px; background: var(--text); transition: bottom .9s linear; }
+.mtr s { position: absolute; left: -2px; width: 14px; height: 2px; margin-bottom: -1px; bottom: 70%; background: var(--cyan); box-shadow: 0 0 6px rgba(34,211,238,.6); }
+.mtr u { position: absolute; left: 15px; transform: translateY(50%); font: 8px/1 var(--mono); color: var(--text-muted); text-decoration: none; }
 .dk.analyzing .dk-idle { letter-spacing: 0; text-align: center; padding: 0 8px 14px; overflow-wrap: anywhere; }
 .analysis { font-size: 12px; color: var(--text-dim); margin: 0 0 10px; display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
 .analysis b { color: var(--text); font-weight: 600; }
