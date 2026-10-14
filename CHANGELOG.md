@@ -5,6 +5,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.4.1] - 2026-10-14
+
+### Changed
+- **Softer glow.** Every coloured glow on the panel (the halos around the
+  status pill, active tab, on-air deck, big numbers, primary buttons and
+  lamps, the tiles' corner tint, the page's background glow) is 30 %
+  fainter. One knob sets them all: `--glow` at the top of `radio.css`
+  (1 = the 1.4.0 look). Focus rings and borders are unchanged.
+- **Long lines scroll like a ticker.** A title or note too long for its
+  place (Dashboard cards, the on-air line in the nav rail) scrolls by
+  continuously, round and round (about 35 px a second), instead of sliding
+  to its end and back. A dot marks where it starts again, and it fades in
+  and out softly at the ends of its line.
+
+### Fixed
+- README: a backup holds 9 tables (the app's and `schema_migrations`), not
+  8, and the journal's migration lines end at version 0013.
+
+Redeploy the server: `git pull && sudo systemctl restart qsysradio` (reload
+open panel pages). The Core only changed its version number: paste
+radio.lua when convenient (until then the server logs a version mismatch).
+
 ## [1.4.0] - 2026-10-14
 
 ### Added

@@ -50,19 +50,29 @@
   };
   R.who = (p) => ({ title: String(p.title || p.file || '?'), artist: p.artist ? String(p.artist) : '' });
   R.whoLine = (p) => { const w = R.who(p); return (w.artist ? w.artist + ' – ' : '') + w.title; };
-  // text that slides back and forth when it is wider than its box (el gets class "marq")
+  // text wider than its box scrolls by like a ticker, ~35 px/s, round and round: a second copy (after a dot)
+  // follows the first, so the loop has no seam (el gets class "marq"; called again only re-measures)
   R.marquee = (el, text) => {
     if (!el) return;
-    if (el.dataset.text !== text) {
+    if (el.dataset.text !== text || !(el.firstElementChild && el.firstElementChild.firstElementChild)) {   // new text, or written over
       el.dataset.text = text;
       el.classList.add('marq');
-      el.innerHTML = '<span>' + R.esc(text) + '</span>';
+      el.innerHTML = '<span><span>' + R.esc(text) + '</span></span>';
     }
-    const over = el.firstChild.scrollWidth - el.clientWidth;
-    el.classList.toggle('scroll', over > 2);
-    if (over > 2) {
-      el.style.setProperty('--dist', over + 'px');
-      el.style.setProperty('--dur', Math.max(5, over / 35 + 3) + 's');   // ~35 px/s, with pauses at each end
+    const run = el.firstChild, one = run.firstChild, over = one.offsetWidth > el.clientWidth + 2;
+    if (over !== (run.childNodes.length > 1)) {
+      if (over) run.insertAdjacentHTML('beforeend', '<i aria-hidden="true">•</i><span aria-hidden="true">' + R.esc(text) + '</span>');
+      else while (run.childNodes.length > 1) run.lastChild.remove();
+    }
+    el.classList.toggle('scroll', over);
+    if (over) {
+      // one lap: from the text to its copy (sub-pixel, so the loop does not jump); rewritten only when the width
+      // really changed (a new duration shifts the animation, and measuring mid-scroll wobbles by a hundredth)
+      const dist = run.lastChild.getBoundingClientRect().left - one.getBoundingClientRect().left;
+      if (Math.abs(dist - (parseFloat(el.style.getPropertyValue('--dist')) || 0)) > 0.5) {
+        el.style.setProperty('--dist', dist.toFixed(2) + 'px');
+        el.style.setProperty('--dur', (dist / 35).toFixed(2) + 's');
+      }
     }
   };
   // write innerHTML only when it changed (keeps buttons alive under the cursor)

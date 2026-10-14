@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **1.4.0** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.4.1** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **1.4.0** — stable; standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **1.4.0** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **1.4.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.4.1** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.4.1** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.4.1** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -297,7 +297,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `1.4.0`.
+Expect the version, e.g. `1.4.1`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -381,7 +381,9 @@ migrate: applied 0001_app_settings.sql
 migrate: applied 0002_core_events_play_log.sql
 migrate: applied 0003_stations_commands_library.sql
 migrate: applied 0004_events_unique_per_station.sql
-migrate: schema "qsysradio" at version 0004
+...
+migrate: applied 0013_level_matching.sql
+migrate: schema "qsysradio" at version 0013
 ==> systemd service...
 [INFO]  Wrote /etc/systemd/system/qsysradio.service
 [INFO]  Service is running.
@@ -401,7 +403,8 @@ Keep the two `CFG` lines for step 10.
   networks, use the one the Core can reach.
 - Print the token again any time: `grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`.
 - Re-running is safe: the secrets in `.env` are kept and only pending
-  migrations run (`... at version 0012 (nothing to do)`).
+  migrations run (`... at version 0013 (nothing to do)`: the number of the
+  last file in `server/migrations/`).
 - Without sudo (`./install.sh`) it sets up the venv, `.env` and the database,
   ends with `Done (no systemd service without sudo).` and prints no `CFG`
   lines. `./start.sh` then runs the server in the foreground.
@@ -429,13 +432,13 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `migrate: schema "qsysradio" at version 0012 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 1.4.0 starting on port
+- In the journal: `migrate: schema "qsysradio" at version 0013 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 1.4.1 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":13,"schema_version":13,"version":"1.4.0"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":13,"schema_version":13,"version":"1.4.1"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -603,14 +606,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 1.4.0 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.4.1 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 1.4.0`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.4.1`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -641,7 +644,8 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (8 in 1.4.0).
+The last line prints the number of tables (9 in 1.4.1: the app's tables and
+`schema_migrations`).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -683,7 +687,7 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 1.3.1, server is 1.4.0`.
+  `station=Main runs radio.lua 1.4.0, server is 1.4.1`.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -955,6 +959,12 @@ MockCore scenarios and `live_core.py`.
   the rail stays at the top while the page scrolls and shows what is on air
   with its countdown (not on the Dashboard, which shows it larger), with the
   song's progress as a red line along its bottom edge.
+- **Long lines scroll.** A line too long for its place (a title or note on
+  the Dashboard cards, what is on air in the nav rail) scrolls by like a
+  ticker, round and round (about 35 px a second; a dot marks where it starts
+  again, and it fades in and out at the ends of its line), also when the
+  computer asks for reduced motion (Remote Desktop, Windows with animation
+  effects off): everything else then stops moving.
 - **Dashboard:** on-air countdown, up next (a break when an ad slot opens or a
   bumper is due before the song ends; else the queue or the server's pick),
   **Coming up**: the next 10 songs / ads / bumpers with estimated start times
@@ -974,9 +984,6 @@ MockCore scenarios and `live_core.py`.
   measured: the numbers are the Core's), and the peak line holds a second
   before it falls. The queue (reorder, remove, clear);
   activity (every command, who sent it, and the Core's answer); recent plays.
-  Titles too long for their card slide back and forth (about 35 px a second), also when the
-  computer asks for reduced motion (Remote Desktop, Windows with animation
-  effects off): everything else then stops moving.
 - **Music**, **Imaging & IDs** and **Advertisements** pages (one tab each): search
   (`/` jumps to it, Esc clears), sort, quick filters (never played,
   unsupported; station IDs; per hour / mix in / off; adjusted), all kept in
