@@ -1,13 +1,13 @@
 -- QSYSRadio deck controller (Q-SYS Lua 5.3). Docs: README.md. Station settings are
 -- edited on the server's web page and pushed here; SETTINGS below are only the
 -- fallback until the server has been reached once.
-RADIO_VERSION = "1.2.0"
+RADIO_VERSION = "1.2.1"
 
 CFG = {
-  PLAYER_A = "Audio_Player_01", METER_A = 1,
-  PLAYER_B = "Audio_Player_02", METER_B = 2,
-  METER = "PlayerOutput01",
-  MIXER = "PlayerSum", MIX_A = 1, MIX_B = 2,   -- the players' mixer: a deck's input is muted while it analyzes ("" = never)
+  PLAYER_A = "Audio_Player23", METER_A = 1,
+  PLAYER_B = "Audio_Player24", METER_B = 2,
+  METER = "PlayerMeter",
+  MIXER = "RadioOut", MIX_A = 1, MIX_B = 2,   -- the players' mixer: a deck's input is muted while it analyzes ("" = never)
   SERVER_URL = "",     -- e.g. "http://10.0.0.20:5410"; "" = run standalone
   SERVER_TOKEN = "",   -- RADIO_API_TOKEN from the server's .env
   STATION_ID = "",     -- "" = the design name
@@ -371,7 +371,7 @@ function Deck:fadingOut(t)
 end
 
 -- ── ANALYZER: quiet start / end of the files the server lists, on a deck that is off air ──
--- (its PlayerSum input muted; the meter is before the mixer): the first K.scan_head_s, then the last K.scan_tail_s
+-- (its RadioOut input muted; the meter is before the mixer): the first K.scan_head_s, then the last K.scan_tail_s
 Analyzer = { todo = {}, done = {}, rev = "" }
 
 function Analyzer.apply(list, rev)

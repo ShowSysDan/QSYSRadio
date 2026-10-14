@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.2.1] - 2026-10-14
+
+### Changed
+- radio.lua's `CFG` defaults follow the station's design: players
+  `Audio_Player23` / `Audio_Player24`, meter `PlayerMeter`, mixer `RadioOut`
+  (inputs 1 and 2, whose `input.N.mute.1` take each player off air while it
+  analyzes). README, the MockCore and the help texts use the same names.
+
+Redeploy the Core: paste radio.lua and re-enter `SERVER_URL`,
+`SERVER_TOKEN` and `STATION_ID` (the component names are already right). The
+server only changed help text and its version: `git pull && sudo systemctl
+restart qsysradio` when convenient.
+
 ## [1.2.0] - 2026-10-14
 
 ### Added

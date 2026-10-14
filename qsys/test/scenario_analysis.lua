@@ -1,6 +1,6 @@
 -- Scenario: file analysis. The server's list of files to analyze is applied
 -- directly (no server); checks the figures, that analysis audio never reaches
--- the air (the deck's PlayerSum input is muted) and the live deck never is,
+-- the air (the deck's RadioOut input is muted) and the live deck never is,
 -- that on-air use takes the deck back at once, both decks while stopped, and a
 -- design without the mixer. Run with run_mock.py.
 dofile("qsys/test/mock_core.lua")
@@ -34,7 +34,7 @@ end
 local leaks, mutedLive, usedDecks = 0, 0, {}
 local function watch()
   for i, d in ipairs({ DeckA, DeckB }) do
-    local mute, playing = MockCore.mixer and MockCore.mixer["input." .. i .. ".mute.1"].Boolean, MockCore.players[i == 1 and "Audio_Player_01" or "Audio_Player_02"].playing
+    local mute, playing = MockCore.mixer and MockCore.mixer["input." .. i .. ".mute.1"].Boolean, MockCore.players[i == 1 and "Audio_Player23" or "Audio_Player24"].playing
     if d.job and playing and not mute then leaks = leaks + 1 end
     if d.job then usedDecks[d.id] = true end
     if d == Station.live and d.state == "playing" and mute then mutedLive = mutedLive + 1 end

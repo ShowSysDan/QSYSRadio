@@ -72,7 +72,7 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 - `POST /api/v1/core/library` after every scan (bulk `execute_values`);
   reply: `learned` {key: {trail, lead} | {unsupported}} for the Core.
 - File analysis (`analysis.py`): the server sends `analyze` [keys] when `analyze_rev` differs
-  (only to a Core that sends `analyze_rev`, i.e. has the PlayerSum mixer); the Core measures
+  (only to a Core that sends `analyze_rev`, i.e. has the RadioOut mixer); the Core measures
   them on the off-air deck (its mixer input muted; every on-air `Deck:play` unmutes) and
   reports `analysis` events. Analyzed figures are final (plays don't learn over them); a failure is
   retried by the next run, never the same one; one file (`analyze_wanted`) goes without a run.
