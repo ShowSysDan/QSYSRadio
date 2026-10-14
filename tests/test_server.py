@@ -485,7 +485,7 @@ def test_file_analysis_job(app):
     state = dict(STATE, analyze={'can': True, 'left': 0})
     assert 'analyze' not in sync(app, station='AN1', analyze_rev='', state=state).json          # no job: nothing to do
     assert op.get('/api/v1/now?station=AN1').json['station']['analysis'] == {
-        'active': False, 'left': 0, 'never': 3, 'can': True, 'auto_at': None, 'at': 'off'}
+        'active': False, 'left': 0, 'never': 3, 'failed': 0, 'can': True, 'auto_at': None, 'at': 'off'}
     assert analyze(viewer, scope='new').status_code == 403
     assert analyze(op, scope='bogus').status_code == 400
     assert analyze(op, scope='new').status_code == 200
@@ -506,30 +506,39 @@ def test_file_analysis_job(app):
     assert tuple(row) == (0.4, 1.5, 201.0, True)
     assert library_post(app, 'AN1', items).json['learned']['M/a.mp3'] == {'trail': 1.5, 'lead': 0.4, 'analyzed': True}
     r = sync(app, station='AN1', analyze_rev=r['analyze_rev']).json
-    assert r['analyze'] == ['M/b.mp3']                                     # a failed file is not retried by the job
+    assert r['analyze'] == ['M/b.mp3']                                     # a failed file waits for the next run
     now = op.get('/api/v1/now?station=AN1').json['station']['analysis']
-    assert (now['active'], now['left'], now['never'], now['can']) == (True, 1, 1, True)    # can: the Core's last state
+    assert (now['active'], now['left'], now['never'], now['failed'], now['can']) == (True, 1, 2, 1, True)
+    rows = {i['key']: i for i in op.get('/api/v1/library?station=AN1&only=not_analyzed').json['items']}
+    assert set(rows) == {'M/b.mp3', 'I/c.wav'}
+    assert rows['M/b.mp3']['analyze_queued'] is True and rows['I/c.wav']['analyze_queued'] is False
+    assert rows['I/c.wav']['analyze_error'] == 'Unsupported format' and rows['I/c.wav']['analyze_failed_at']
     sync(app, station='AN1', events=[ev(7, 'analysis', file='b.mp3', dir='M/', ok=True, lead_in=0.1, trail=0.3, duration=100.0)])
     r = sync(app, station='AN1', analyze_rev=r['analyze_rev']).json
     assert r['analyze'] == [] and r['analyze_rev'] == ''                   # done: the Core's list is cleared
     assert sql("SELECT analyze_from FROM qsr_test.stations WHERE station='AN1'", fetch=True)[0][0] is None
     # one file again; a changed file is owed again; re-analyze all; stop
     assert analyze(op, key='M/nope.mp3').status_code == 400
-    assert analyze(op, key='M/b.mp3').status_code == 200
+    assert analyze(op, key='M/b.mp3').status_code == 200               # just that file: no run, keeps its figures
     assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['M/b.mp3']
+    assert sql("SELECT analyzed_at IS NOT NULL FROM qsr_test.library WHERE station='AN1' AND key='M/b.mp3'", fetch=True)[0][0]
+    now = op.get('/api/v1/now?station=AN1').json['station']['analysis']
+    assert (now['active'], now['left']) == (True, 1)
+    rows = {i['key']: i for i in op.get('/api/v1/library?station=AN1').json['items']}
+    assert rows['M/b.mp3']['analyze_queued'] is True and rows['M/a.mp3']['analyze_queued'] is False
     analyze(op, scope='stop')
     assert sync(app, station='AN1', analyze_rev='x').json['analyze'] == []
     items[0]['size'] = 99
     library_post(app, 'AN1', items)
-    analyze(op, scope='new')
-    assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['M/a.mp3', 'M/b.mp3']
+    analyze(op, scope='new')                                               # a new run: the failed file is tried again
+    assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['I/c.wav', 'M/a.mp3']
     analyze(op, scope='all')
     assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['I/c.wav', 'M/a.mp3', 'M/b.mp3']
     # the daily run starts by itself once its time has passed today, once a day
     analyze(op, scope='stop')
     sql("""INSERT INTO qsr_test.app_settings (key, value) VALUES ('core.analyze_at', '"00:00"')
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""")
-    assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['M/a.mp3', 'M/b.mp3']
+    assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['I/c.wav', 'M/a.mp3']
     analyze(op, scope='stop')
     assert sync(app, station='AN1', analyze_rev='x').json['analyze'] == []  # not again today
 

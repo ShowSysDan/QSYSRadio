@@ -115,14 +115,16 @@ def _apply(cur, station, ev):
                         (number(ev.get('lead_in')), number(ev.get('trail')), number(ev.get('peak')), station,
                          (text(ev.get('dir'), 500) or '') + (file or '')))
     elif kind == 'analysis':
-        # a file analyzed off air: its figures replace what plays learned (a failed one is not retried by the job)
-        ok = ev.get('ok') is True
-        cur.execute("""UPDATE library SET analyzed_at = NOW(),
-                           lead_in_s = CASE WHEN %s THEN %s ELSE lead_in_s END, trail_s = CASE WHEN %s THEN %s ELSE trail_s END,
-                           duration_s = COALESCE(%s, duration_s)
-                       WHERE station = %s AND key = %s""",
-                    (ok, number(ev.get('lead_in')), ok, number(ev.get('trail')), number(ev.get('duration')) if ok else None,
-                     station, (text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')))
+        # a file analyzed off air: its figures replace what plays learned; a failed one is retried by the next run
+        key = (text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')
+        if ev.get('ok') is True:
+            cur.execute("""UPDATE library SET analyzed_at = NOW(), analyze_failed_at = NULL, analyze_error = NULL, analyze_wanted = FALSE,
+                               lead_in_s = %s, trail_s = %s, duration_s = COALESCE(%s, duration_s)
+                           WHERE station = %s AND key = %s""",
+                        (number(ev.get('lead_in')), number(ev.get('trail')), number(ev.get('duration')), station, key))
+        else:
+            cur.execute("""UPDATE library SET analyze_failed_at = NOW(), analyze_error = %s, analyze_wanted = FALSE
+                           WHERE station = %s AND key = %s""", (text(ev.get('status'), 200) or 'failed', station, key))
     elif kind == 'file_unsupported':
         cur.execute('UPDATE library SET unsupported = TRUE WHERE station = %s AND key = %s',
                     (station, (text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')))

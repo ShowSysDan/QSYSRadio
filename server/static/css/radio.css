@@ -249,6 +249,7 @@ table.plays { width: 100%; border-collapse: collapse; font-size: 13px; }
 .tag.imaging { color: var(--purple); border-color: rgba(167,139,250,.35); background: rgba(167,139,250,.08); }
 .tag.ad { color: var(--warning); border-color: rgba(245,158,11,.35); background: rgba(245,158,11,.08); }
 .tag.bad { color: var(--danger); border-color: rgba(239,68,68,.35); }
+.tag.ok { color: var(--accent); border-color: rgba(34,197,94,.35); }
 .rule { display: inline-flex; gap: 6px; align-items: center; }
 .rule select, .rule input { padding: 4px 8px; font-size: 12px; }
 .rule input { width: 64px; }
@@ -328,9 +329,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .marq.scroll > span { animation: marq var(--dur, 8s) ease-in-out infinite alternate; }
 @keyframes marq { 0%, 15% { transform: translateX(0); } 85%, 100% { transform: translateX(calc(-1 * var(--dist, 0px))); } }
 @media (prefers-reduced-motion: reduce) {
-  .marq.scroll > span { animation: none; }
-  .marq { text-overflow: ellipsis; }
   * { transition-duration: .01ms !important; animation-duration: .01ms !important; }
+  /* the slow title slide stays on: Remote Desktop and Windows with animations off ask for reduced motion,
+     and a cut-off title is worse than a slow slide */
+  .marq.scroll > span { animation-duration: var(--dur, 8s) !important; }
   button:hover { transform: none; }
 }
 

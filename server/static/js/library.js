@@ -12,12 +12,15 @@
     next: '<svg viewBox="0 0 24 24"><path d="M4 6h10v2H4zm0 5h10v2H4zm0 5h6v2H4zm12-3v-3h2v3h3v2h-3v3h-2v-3h-3v-2z"/></svg>',
     queue: '<svg viewBox="0 0 24 24"><path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h10v2H4z"/></svg>',
     play: '<svg viewBox="0 0 24 24"><path d="M7 5v14l11-7z"/></svg>',
+    analyze: '<svg viewBox="0 0 24 24"><path d="M3 11h2v2H3zm4-4h2v10H7zm4-4h2v18h-2zm4 6h2v6h-2zm4-2h2v10h-2z"/></svg>',
   };
   const NOUN = { music: 'songs', imaging: 'imaging files', ad: 'advertisements' };
   const FILTERS = {
-    music: [['', 'All'], ['never', 'Never played'], ['adjusted', 'Adjusted'], ['unsupported', 'Unsupported']],
-    imaging: [['', 'All'], ['ident', 'Station IDs'], ['never', 'Never played'], ['adjusted', 'Adjusted'], ['unsupported', 'Unsupported']],
-    ad: [['', 'All'], ['hourly', 'Per hour'], ['mix', 'Mix in'], ['off', 'Off'], ['never', 'Never played'], ['adjusted', 'Adjusted']],
+    music: [['', 'All'], ['never', 'Never played'], ['not_analyzed', 'Not analyzed'], ['adjusted', 'Adjusted'], ['unsupported', 'Unsupported']],
+    imaging: [['', 'All'], ['ident', 'Station IDs'], ['never', 'Never played'], ['not_analyzed', 'Not analyzed'], ['adjusted', 'Adjusted'],
+      ['unsupported', 'Unsupported']],
+    ad: [['', 'All'], ['hourly', 'Per hour'], ['mix', 'Mix in'], ['off', 'Off'], ['never', 'Never played'], ['not_analyzed', 'Not analyzed'],
+      ['adjusted', 'Adjusted']],
   };
   const HEAD = {
     music: ['Artist – Title', 'Length', 'Without silence', 'Plays', 'Last played', ''],
@@ -29,6 +32,11 @@
 
   function actions(it) {
     if (!R.canOperate || it.unsupported) return '';
+    return button('analyze', 'analyze', '', it.analyzed_at ? 'Analyze again on the off-air deck (analyzed ' + esc(R.timeOf(it.analyzed_at, true)) + ')'
+      : 'Analyze on the off-air deck (measures its quiet start and end)') + playActions(it);
+  }
+
+  function playActions(it) {
     if (it.kind === 'music') {
       return button('next', 'next', 'Play next', 'Play after the current track') + button('queue', 'queue', 'Queue', 'Add to the end of the queue') +
         button('now', 'play', 'Play now', 'Fade to this now', true);
@@ -62,11 +70,22 @@
   function audible(it) {
     const lead = pick(it.lead_set_s, it.lead_in_s), trail = pick(it.trail_set_s, it.trail_s);
     const known = R.num(it.duration_s) && (lead != null || trail != null);
-    const inner = (known ? R.clock(it.audible_s) : '–') + (adjusted(it) ? ' <span class="tag" title="Set by an operator">adj</span>' : '');
+    const inner = (known ? R.clock(it.audible_s) : '–') + (adjusted(it) ? ' <span class="tag" title="Set by an operator">adj</span>' : '') +
+      analysisTag(it);
     const tip = known ? 'quiet start ' + (lead || 0).toFixed(1) + ' s, quiet end ' + (trail || 0).toFixed(1) + ' s' +
       (it.analyzed_at ? ' (analyzed)' : ' (from plays)') : 'not measured yet';
     return '<td class="num" title="' + tip + '">' + (R.canOperate && !it.unsupported
       ? '<button type="button" class="linkbtn" data-a="trim" title="' + tip + ': view or adjust">' + inner + '</button>' : inner) + '</td>';
+  }
+
+  // analysis state: queued in the run, failed (tried again by the next run), or analyzed
+  function analysisTag(it) {
+    if (it.analyze_queued) return ' <span class="tag" title="Waiting for the off-air deck">queued</span>';
+    if (!it.analyzed_at && it.analyze_failed_at) {
+      return ' <span class="tag bad" title="Analysis failed ' + esc(R.timeOf(it.analyze_failed_at, true)) + ': ' + esc(it.analyze_error || '') +
+        '. Tried again by the next run.">failed</span>';
+    }
+    return it.analyzed_at ? ' <span class="tag ok" title="Analyzed ' + esc(R.timeOf(it.analyzed_at, true)) + '">✓</span>' : '';
   }
 
   // the editor under a row: measured figures, the operator's (blank = use the measured one)
@@ -88,7 +107,8 @@
       '<button type="button" class="sm" data-t="clear" title="Remove the figures set here">Use measured</button>' +
       '<button type="button" class="sm" data-t="forget" title="Measure again on the next play">Forget measured</button>' +
       '<button type="button" class="sm" data-t="analyze" title="Measure it again on the off-air deck">Analyze again</button>' +
-      '<span class="dim small">' + (it.analyzed_at ? 'analyzed ' + esc(R.timeOf(it.analyzed_at, true)) : 'measured from plays') + '</span>' +
+      '<span class="dim small">' + (it.analyzed_at ? 'analyzed ' + esc(R.timeOf(it.analyzed_at, true))
+        : it.analyze_failed_at ? 'analysis failed: ' + esc(it.analyze_error || '') : 'measured from plays') + '</span>' +
       '<button type="button" class="linkbtn" data-t="close">close</button>' +
       '<div class="dim small">Quiet start: where the sound begins, in seconds from the start of the file (the Core starts just before it, ' +
       'within Settings → Silence detection). Quiet end: seconds of silence at the end (the next item starts that much early). ' +
@@ -271,6 +291,11 @@
     else if (a === 'bumper') R.command('bumper_now', { key }, 'Bumper now: ' + label);
     else if (a === 'ident') setIdent(tr, !b.classList.contains('on'));
     else if (a === 'trim') trimRow(tr);
+    else if (a === 'analyze') {
+      R.post('/api/v1/analyze', { station: R.station || undefined, key })
+        .then(() => { R.toast(label + ': queued for analysis on the off-air deck', 'ok'); refresh(); })
+        .catch((err) => R.toast(label + ': ' + err.message, 'bad'));
+    }
     else if (a === 'ad' && confirm('Fade to an ad break with “' + label + '” now?')) R.command('play_now', { key }, 'Play now: ' + label);
   });
 
@@ -289,7 +314,8 @@
       : a.active
         ? '<span><b>Analyzing</b> on the off-air deck, between songs: ' + R.num(a.left) + ' file' + (a.left === 1 ? '' : 's') + ' to go.</span>' +
           btn('stop', 'Stop', 'Stop analyzing (what is done stays)')
-        : '<span><b>File analysis</b>: ' + (a.never ? R.num(a.never) + ' file' + (a.never === 1 ? '' : 's') + ' not analyzed yet' : 'every file analyzed') +
+        : '<span><b>File analysis</b>: ' + (a.never ? R.num(a.never) + ' file' + (a.never === 1 ? '' : 's') + ' not analyzed yet' +
+          (a.failed ? ' (' + R.num(a.failed) + ' failed, tried again by the next run)' : '') : 'every file analyzed') +
           ' · ' + daily + ' (Settings).</span>' + (a.never ? btn('new', 'Analyze now', 'Measure the files not analyzed yet, on the off-air deck') : '') +
           btn('all', 'Re-analyze all', 'Measure every file again'));
   }

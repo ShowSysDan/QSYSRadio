@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.2.0] - 2026-10-14
+
+### Added
+- **Analyze one file from its row.** Every row on the Music, Imaging & IDs
+  and Advertisements pages has an Analyze button (the bars icon). It
+  analyzes just that file, first in line, without starting a run; the file
+  keeps its current figures until the new ones arrive. Rows show ✓
+  (analyzed; hover for when), "queued" or "failed" (hover for why), and a
+  **Not analyzed** filter lists the files still to do.
+
+### Changed
+- **A failed analysis is tried again.** It used to count as analyzed, so a
+  one-off load error was never retried. Now it is skipped for the rest of
+  that run and tried again by the next (the daily run, Analyze now or
+  Re-analyze all); the library line says how many failed. Migration 0012
+  also un-marks files that 1.1.0 marked analyzed after a failure.
+- An analyzed file is still never analyzed again by itself: only when asked
+  (its row, Re-analyze all, Forget measured) or when it is replaced.
+
+### Fixed
+- **Long Up next titles did not scroll** on computers that ask for reduced
+  motion (Remote Desktop, Windows with animation effects off): the panel
+  turned the slide off and cut the title. The slow slide now stays on there.
+
+Redeploy the server (`git pull && sudo systemctl restart qsysradio`, runs
+migration 0012). radio.lua only changed its version number: paste it when
+convenient (until then the journal notes the version difference).
+
 ## [1.1.0] - 2026-10-13
 
 ### Added

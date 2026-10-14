@@ -74,7 +74,8 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 - File analysis (`analysis.py`): the server sends `analyze` [keys] when `analyze_rev` differs
   (only to a Core that sends `analyze_rev`, i.e. has the PlayerSum mixer); the Core measures
   them on the off-air deck (its mixer input muted; every on-air `Deck:play` unmutes) and
-  reports `analysis` events. Analyzed figures are final (plays don't learn over them).
+  reports `analysis` events. Analyzed figures are final (plays don't learn over them); a failure is
+  retried by the next run, never the same one; one file (`analyze_wanted`) goes without a run.
 - Ads: the server sends `ads` {due, mix, next, next_why, ident, no_bumpers} when `ads_rev` differs
   (`ads.py`); the Core only plays the plan (without one, every ad is a mix-in).
   `next` is the song to play next, picked on the server (`next_song`: least
