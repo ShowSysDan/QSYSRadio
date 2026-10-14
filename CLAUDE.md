@@ -66,11 +66,17 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 
 ## Core <-> server protocol
 - `POST /api/v1/core/sync` (≈1/s, X-Radio-Token): events (station, boot,
-  seq unique; stored once, each in a savepoint), optional state, command ack;
+  seq unique; stored once, each in a savepoint), optional state, command ack,
+  `meters` (each deck's gain, peak, rms; kept on `stations` for the panel);
   reply: commands with id > ack, settings when the rev differs, ack_reset.
   One advisory lock per station serialises sync and `add_command`.
 - `POST /api/v1/core/library` after every scan (bulk `execute_values`);
-  reply: `learned` {key: {trail, lead} | {unsupported}} for the Core.
+  reply: `learned` {key: {trail, lead, level, peak} | {unsupported}} for the Core.
+- Level matching: `*_end` and `analysis` events carry `level` / `level_s` (rms
+  average at unity, seconds heard) and `peak`; the server keeps their
+  seconds-weighted energy average (`events.LEVEL_SET`) and the highest peak.
+  The Core plays each item at its kind's gain + `levelTrim`; fades start from
+  the deck's current gain, never from 0 dB.
 - File analysis (`analysis.py`): the server sends `analyze` [keys] when `analyze_rev` differs
   (only to a Core that sends `analyze_rev`, i.e. has the RadioOut mixer); the Core measures
   them on the off-air deck (its mixer input muted; every on-air `Deck:play` unmutes) and

@@ -10,6 +10,13 @@
   R.num = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
   R.REASONS = { end: 'End', silence: 'Silence', cut: 'Skipped', eof: 'End of file', core_restart: 'Core restart' };
   R.KINDS = { music: 'Music', imaging: 'Imaging', ad: 'Ad' };
+  // a level in dB with its sign ("+4.2", "−6.0"); at or under floor (the meter's / gain's bottom) "−∞"
+  R.db = (v, floor) => {
+    v = R.num(v);
+    if (v == null) return '–';
+    if (floor != null && v <= floor + 0.5) return '−∞';
+    return (v > 0.04 ? '+' : v < -0.04 ? '−' : '') + Math.abs(v).toFixed(1);
+  };
 
   R.clock = (sec) => {
     sec = R.num(sec);

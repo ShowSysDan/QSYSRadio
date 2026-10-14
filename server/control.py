@@ -71,6 +71,20 @@ def _clean_state(state):
     return s
 
 
+def _clean_meters(meters):
+    """The decks' readout from the Core: {A: {peak, rms, gain}, B: …} in dB (meter -120…+20, player gain
+    -100…+20), or None."""
+    if not isinstance(meters, dict):
+        return None
+    out = {}
+    for deck in ('A', 'B'):
+        m = meters.get(deck)
+        if isinstance(m, dict):
+            out[deck] = {k: round(max(lo, min(20.0, v)), 1) for k, lo in (('peak', -120.0), ('rms', -120.0), ('gain', -100.0))
+                         if (v := number(m.get(k))) is not None}
+    return out or None
+
+
 # ── Core side ────────────────────────────────────────────────────────────────
 
 def core_sync(conn, payload, now):
@@ -92,11 +106,14 @@ def core_sync(conn, payload, now):
             # but never reported must not run twice; undelivered ones still go
             cur.execute("""UPDATE commands SET done_at = NOW(), ok = FALSE, note = 'the Core restarted before reporting'
                            WHERE station = %s AND done_at IS NULL AND delivered_at IS NOT NULL""", (station,))
-        cur.execute("""INSERT INTO stations (station, radio_version, boot, settings_rev, last_seen)
-                       VALUES (%s, %s, %s, %s, NOW())
+        meters = _clean_meters(payload.get('meters'))
+        cur.execute("""INSERT INTO stations (station, radio_version, boot, settings_rev, last_seen, meters)
+                       VALUES (%s, %s, %s, %s, NOW(), %s)
                        ON CONFLICT (station) DO UPDATE SET radio_version = EXCLUDED.radio_version,
-                           boot = EXCLUDED.boot, settings_rev = EXCLUDED.settings_rev, last_seen = NOW()""",
-                    (station, text(payload.get('version'), 50), boot, text(payload.get('settings_rev'), 50) or ''))
+                           boot = EXCLUDED.boot, settings_rev = EXCLUDED.settings_rev, last_seen = NOW(),
+                           meters = EXCLUDED.meters""",
+                    (station, text(payload.get('version'), 50), boot, text(payload.get('settings_rev'), 50) or '',
+                     json.dumps(meters) if meters else None))
         if state is not None:
             cur.execute('UPDATE stations SET state = %s, state_at = NOW() WHERE station = %s',
                         (json.dumps(state), station))
@@ -143,7 +160,7 @@ def core_sync(conn, payload, now):
 
 def core_library(conn, payload):
     """The Core's file list after a scan. Returns (count, per-file figures the
-    Core uses: {key: {trail, lead} | {unsupported}}, log_line)."""
+    Core uses: {key: {trail, lead, level, peak} | {unsupported}}, log_line)."""
     station = _station_name(payload)
     items = payload.get('items')
     if items == {}:                 # Lua encodes an empty table as {}
@@ -171,7 +188,10 @@ def core_library(conn, payload):
                                    duration_s = COALESCE(EXCLUDED.duration_s, library.duration_s),
                                    lead_in_s = COALESCE(EXCLUDED.lead_in_s, library.lead_in_s),
                                    trail_s = COALESCE(EXCLUDED.trail_s, library.trail_s),
-                                   peak_dbfs = COALESCE(EXCLUDED.peak_dbfs, library.peak_dbfs),
+                                   peak_dbfs = COALESCE(EXCLUDED.peak_dbfs, CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size
+                                                                                 THEN library.peak_dbfs END),
+                                   level_db = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size THEN library.level_db END,
+                                   level_s = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size THEN library.level_s END,
                                    unsupported = library.unsupported AND library.size IS NOT DISTINCT FROM EXCLUDED.size,
                                    analyzed_at = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size
                                                       THEN library.analyzed_at END,
@@ -184,16 +204,19 @@ def core_library(conn, payload):
                            imaging_dir = EXCLUDED.imaging_dir, ads_dir = EXCLUDED.ads_dir""",
                     (station, text(payload.get('music_dir'), 500), text(payload.get('imaging_dir'), 500),
                      text(payload.get('ads_dir'), 500)))
-        # what the Core uses: unsupported files, and the quiet start / end (where to start, when to hand over);
-        # fixed = the operator set a figure, analyzed = measured off air: the Core does not learn over either
+        # what the Core uses: unsupported files, the quiet start / end (where to start, when to hand over) and
+        # the average level with its peak (level matching); fixed = the operator set a figure, analyzed =
+        # measured off air: the Core does not learn over either
         cur.execute("""SELECT key, unsupported, COALESCE(trail_set_s, trail_s) AS trail, COALESCE(lead_set_s, lead_in_s) AS lead,
-                              trail_set_s IS NOT NULL OR lead_set_s IS NOT NULL AS fixed, analyzed_at IS NOT NULL AS analyzed
+                              trail_set_s IS NOT NULL OR lead_set_s IS NOT NULL AS fixed, analyzed_at IS NOT NULL AS analyzed,
+                              level_db AS level, CASE WHEN level_db IS NOT NULL THEN peak_dbfs END AS peak
                        FROM library
                        WHERE station = %s AND present
                          AND (unsupported OR trail_s IS NOT NULL OR lead_in_s IS NOT NULL OR trail_set_s IS NOT NULL
-                              OR lead_set_s IS NOT NULL)""", (station,))
+                              OR lead_set_s IS NOT NULL OR level_db IS NOT NULL)""", (station,))
         learned = {r['key']: {'unsupported': True} if r['unsupported'] else
                    dict({k: round(r[k], 2) for k in ('trail', 'lead') if r[k] is not None},
+                        **{k: round(r[k], 1) for k in ('level', 'peak') if r[k] is not None},
                         **{k: True for k in ('fixed', 'analyzed') if r[k]})
                    for r in cur.fetchall()}
     conn.commit()
@@ -230,7 +253,7 @@ def status(conn, station):
     """Live Core state + recent commands for the dashboard. state_age_s says
     how old the Core's elapsed/remaining figures are."""
     with conn.cursor() as cur:
-        cur.execute("""SELECT station, state, radio_version, boot, last_seen, library_at,
+        cur.execute("""SELECT station, state, radio_version, boot, last_seen, library_at, meters,
                               EXTRACT(EPOCH FROM NOW() - last_seen) AS age,
                               EXTRACT(EPOCH FROM NOW() - state_at) AS state_age
                        FROM stations WHERE station = %s""", (station,))
@@ -253,7 +276,7 @@ def status(conn, station):
     return {'station': r['station'], 'online': age < ONLINE_S, 'age_s': round(age, 1),
             'state_age_s': round(float(r['state_age']), 2) if r['state_age'] is not None else None,
             'version': r['radio_version'], 'boot': r['boot'], 'last_seen': iso(r['last_seen']),
-            'library_at': iso(r['library_at']), 'state': state, 'commands': cmds, 'next_ad': next_ad,
+            'library_at': iso(r['library_at']), 'state': state, 'meters': r['meters'], 'commands': cmds, 'next_ad': next_ad,
             'holds': holds, 'ident': {'due': ids['due'], 'next_at': iso(ids['next_at']), 'count': len(ids['keys'])},
             'analysis': analyze}
 
@@ -345,13 +368,15 @@ def set_trim(conn, station, key, lead, trail, user):
 
 
 def forget_measured(conn, station, key, kind, user):
-    """Forget the measured quiet start / end of one file (key) or every file of a kind; they are
-    measured again on the next play. Operator figures stay. Returns (files, log line)."""
+    """Forget the measured quiet start / end and level of one file (key) or every file of a kind; they
+    are measured again on the next play. Operator figures stay. Returns (files, log line)."""
     if not key and kind not in KINDS:
         raise BadRequest('give a file (key) or a kind')
     with conn.cursor() as cur:
-        cur.execute("""UPDATE library SET lead_in_s = NULL, trail_s = NULL, analyzed_at = NULL, analyze_failed_at = NULL
-                       WHERE station = %s AND (lead_in_s IS NOT NULL OR trail_s IS NOT NULL OR analyzed_at IS NOT NULL)
+        cur.execute("""UPDATE library SET lead_in_s = NULL, trail_s = NULL, analyzed_at = NULL, analyze_failed_at = NULL,
+                              level_db = NULL, level_s = NULL, peak_dbfs = NULL
+                       WHERE station = %s AND (lead_in_s IS NOT NULL OR trail_s IS NOT NULL OR analyzed_at IS NOT NULL
+                                               OR level_db IS NOT NULL OR peak_dbfs IS NOT NULL)
                          AND """ + ('key = %s' if key else 'kind = %s'), (station, key or kind))
         n = cur.rowcount
     conn.commit()
@@ -365,6 +390,8 @@ _SORTS = {
     'plays': 'plays DESC',
     'last_played': 'last_played DESC NULLS LAST',
     'least_recent': 'last_played ASC NULLS FIRST',
+    'loudest': 'level_db DESC NULLS LAST',
+    'quietest': 'level_db ASC NULLS LAST',
 }
 
 
@@ -382,6 +409,7 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
     (total, a page of items, totals over every matching file)."""
     sql = """SELECT l.key, l.kind, l.directory, l.file, l.artist, l.title, l.duration_s, l.unsupported, l.ident,
                     l.lead_in_s, l.trail_s, l.lead_set_s, l.trail_set_s, l.analyzed_at, l.analyze_failed_at, l.analyze_error,
+                    l.level_db, l.level_s, l.peak_dbfs,
                     COALESCE({owed}, FALSE) AS analyze_queued,
                     GREATEST(0, l.duration_s - COALESCE(l.lead_set_s, l.lead_in_s, 0)
                                              - COALESCE(l.trail_set_s, l.trail_s, 0)) AS audible_s,

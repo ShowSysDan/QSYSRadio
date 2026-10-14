@@ -1,7 +1,7 @@
 -- QSYSRadio deck controller (Q-SYS Lua 5.3). Docs: README.md. Station settings are
 -- edited on the server's web page and pushed here; SETTINGS below are only the
 -- fallback until the server has been reached once.
-RADIO_VERSION = "1.2.1"
+RADIO_VERSION = "1.3.0"
 
 CFG = {
   PLAYER_A = "Audio_Player23", METER_A = 1,
@@ -20,6 +20,7 @@ SETTINGS = {
   crossfade_s = 4, fade_in_s = 0, skip_fade_s = 1.5, silence_fade_s = 1, stop_fade_s = 2, bumper_fade_s = 2,
   silence_threshold_dbfs = -50, silence_hold_s = 2, end_guard_s = 20, lead_skip_max_s = 3, lead_skip_keep_s = 0.3,
   fade_out_drop_db = 20, fade_out_early_s = 2,
+  level_target_db = 0, level_raise_max_db = 6, level_cut_max_db = 20, level_peak_max_db = 18,
   bumper_every_n_tracks = 4, bumper_tail_s = 1, artist_separation = 2, dead_air_s = 1.5,
 }
 DEFAULTS = {}
@@ -28,7 +29,7 @@ for k, v in pairs(SETTINGS) do DEFAULTS[k] = v end
 -- internals (not settings)
 local K = {
   floor_db = -100, tick_s = 0.25, fast_s = 0.05, load_timeout_s = 1.5, chores_s = 30,
-  quiet_s = 0.5, scan_head_s = 6, scan_tail_s = 15, scan_need_s = 30, scan_settle_s = 0.5, sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000,
+  quiet_s = 0.5, scan_head_s = 6, scan_body_s = 20, scan_tail_s = 15, scan_need_s = 50, scan_settle_s = 0.5, level_min_s = 10, sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, outbox_max = 5000,
 }
 -- only what must survive a reboot while the server is unreachable; everything else lives on the server
 FILES = { outbox = "media/_radio/outbox.json", settings = "media/_radio/settings.json" }
@@ -131,7 +132,8 @@ local function emit(kind, data)
 end
 
 -- ── LIBRARY ───────────────────────────────────────────────────────────────────
--- per file (all kinds): { trail = s, lead = s, fixed = operator's, unsupported = true }: the server's, + this boot's plays
+-- per file (all kinds): { trail = s, lead = s, fixed = operator's, level = average dB, peak = dB, unsupported = true }:
+-- the server's, + this boot's plays (levels at unity gain)
 LEARNED = {}
 Library = { music = {}, imaging = {}, ad = {}, byKey = {}, root = "Audio/" }
 
@@ -202,16 +204,32 @@ end
 -- the server's per-file figures (reply to the library upload): they replace this boot's (edits, forgotten figures)
 function Library.learn(map)
   if type(map) ~= "table" then return end
-  for _, L in pairs(LEARNED) do L.trail, L.lead, L.fixed, L.analyzed = nil, nil, nil, nil end
+  for _, L in pairs(LEARNED) do L.trail, L.lead, L.fixed, L.analyzed, L.level, L.peak = nil, nil, nil, nil, nil, nil end
   for key, v in pairs(map) do
     if type(v) == "table" then
       local L = LEARNED[key] or {}
       L.trail, L.lead, L.fixed, L.analyzed = tonumber(v.trail), tonumber(v.lead), v.fixed == true or nil, v.analyzed == true or nil
+      L.level, L.peak = tonumber(v.level), tonumber(v.peak)
       if v.unsupported == true then L.unsupported = true end
       LEARNED[key] = L
       if L.unsupported and Library.byKey[key] then Library.remove(Library.byKey[key]) end
     end
   end
+end
+
+-- a measurement's level figures for this boot: the first average (the server keeps the average of all), the highest peak
+local function learnLevel(L, ev)
+  L.level = L.level or ev.level
+  if ev.peak then L.peak = math.max(L.peak or ev.peak, ev.peak) end
+end
+
+-- level matching: the gain that brings a file's average to level_target_db, within the raise / cut
+-- limits; a raise never lifts its peak past level_peak_max_db. Fades start and end at the result
+local function levelTrim(L)
+  if not L.level then return 0 end
+  local g = clamp(SETTINGS.level_target_db - L.level, -SETTINGS.level_cut_max_db, SETTINGS.level_raise_max_db)
+  if g > 0 and L.peak then g = clamp(SETTINGS.level_peak_max_db - L.peak, 0, g) end
+  return round(g, 1)
 end
 
 -- ── DECK ──────────────────────────────────────────────────────────────────────
@@ -221,7 +239,7 @@ local DECK_CONTROLS = { "gain", "play", "stop", "playing", "locate", "filename",
                         "status", "remaining", "loop", "mute" }
 
 function Deck.new(id, compName, meterIdx)
-  local self = setmetatable({ id = id, state = "idle", gain = K.floor_db }, Deck)
+  local self = setmetatable({ id = id, state = "idle", gain = K.floor_db, pow = 0, powN = 0, shownPeak = -120 }, Deck)
   local ok, comp = pcall(Component.New, compName)
   if not ok or not comp then error("Deck " .. id .. ": component '" .. compName .. "' not found") end
   self.c = {}
@@ -232,6 +250,9 @@ function Deck.new(id, compName, meterIdx)
   end
   self.peak = Meter["peak." .. meterIdx]
   if not self.peak then error("meter '" .. CFG.METER .. "' has no control peak." .. meterIdx) end
+  local okRms, rms = pcall(function() return Meter["rms." .. meterIdx] end)
+  self.rms = okRms and rms or nil
+  if not self.rms then log("! meter '%s' has no control rms.%d: average levels are not measured", CFG.METER, meterIdx) end
   self.c.playing.EventHandler = function(ctl)
     if not ctl.Boolean and (self.state == "playing" or self.state == "fading") and not self.expectStop then
       self:ended()
@@ -252,7 +273,7 @@ end
 function Deck:stop()
   self.expectStop = true
   trigger(self.c.stop)
-  self.state, self.fade, self.track, self.pending, self.loadCb = "idle", nil, nil, nil, nil
+  self.state, self.fade, self.track, self.pending, self.loadCb, self.trim = "idle", nil, nil, nil, nil, nil
 end
 
 function Deck:load(track, cb)
@@ -296,7 +317,7 @@ end
 
 -- skip = seconds of quiet start to jump over (seek right after play: an early seek only plays silence)
 function Deck:play(gainDb, fadeInS, skip)
-  self.fade = nil
+  self.fade, self.playGain = nil, gainDb
   if fadeInS and fadeInS > 0 then
     self:setGain(K.floor_db)
     self.fade = { from = K.floor_db, to = gainDb, t0 = now(), dur = fadeInS }
@@ -310,6 +331,7 @@ function Deck:play(gainDb, fadeInS, skip)
   if skip > 0 then set(self.c.locate, "Value", skip) end
   self.state, self.playStart, self.fadedIn = "playing", now() - skip, fadeInS and fadeInS > 0   -- times stay file positions
   self.firstAudioAt, self.lastAudioAt, self.silentSince, self.peakMax, self.loudAt, self.fadedAt = nil, nil, nil, nil, nil, nil
+  self.pow, self.powN = 0, 0
 end
 
 function Deck:fadeOut(seconds, onDone)
@@ -349,20 +371,30 @@ function Deck:remainingEst(t)
   return math.max(0, est)
 end
 
--- one meter read per station tick, only during clean playback (no fade), so
--- learned lead-in / trail / peak are never skewed by the gain moving
+-- one meter read per station tick; it is learned from only during clean playback (no fade), so
+-- learned lead-in / trail / peak / average level are never skewed by the gain moving
 function Deck:sample(t)
-  if self.state ~= "playing" or self.fade or t < (self.settleUntil or 0) then return end
   local m = self.peak.Value
   if type(m) ~= "number" then return end
+  if m > self.shownPeak then self.shownPeak = m end    -- the panel's readout: the loudest since the last sync
+  if self.state ~= "playing" or self.fade or t < (self.settleUntil or 0) then return end
   local unity = (m > -118) and (m - self.gain) or -200
   if unity > SETTINGS.silence_threshold_dbfs then
     self.lastAudioAt, self.firstAudioAt, self.silentSince = t, self.firstAudioAt or t, nil
     if unity > (self.peakMax or -200) then self.peakMax = unity end
     if unity > self.peakMax - SETTINGS.fade_out_drop_db then self.loudAt = t end
+    local r = self.rms and self.rms.Value             -- the average level counts sound only (energy average)
+    if type(r) == "number" and r > -118 then self.pow, self.powN = self.pow + 10 ^ ((r - self.gain) / 10), self.powN + 1 end
   else
     self.silentSince = self.silentSince or t
   end
+end
+
+-- the average level (dB at unity gain) and seconds measured since play, once there is enough to go on
+function Deck:level()
+  local secs = self.powN * K.tick_s
+  if secs <= 0 or secs < math.min(K.level_min_s, (self.duration or 0) / 2) then return nil end
+  return round(10 * math.log(self.pow / self.powN, 10), 1), round(secs, 1)
 end
 
 -- in its fade-out: fade_out_drop_db under its own peak for a moment (start the next item early)
@@ -370,8 +402,9 @@ function Deck:fadingOut(t)
   return SETTINGS.fade_out_early_s > 0 and self.loudAt ~= nil and t - self.loudAt >= K.quiet_s
 end
 
--- ── ANALYZER: quiet start / end of the files the server lists, on a deck that is off air ──
--- (its RadioOut input muted; the meter is before the mixer): the first K.scan_head_s, then the last K.scan_tail_s
+-- ── ANALYZER: quiet start / end and average level of the files the server lists, on a deck that is off air ──
+-- (its RadioOut input muted; the meter is before the mixer): the first K.scan_head_s, K.scan_body_s from the
+-- middle (the average level), then the last K.scan_tail_s
 Analyzer = { todo = {}, done = {}, rev = "" }
 
 function Analyzer.apply(list, rev)
@@ -410,18 +443,34 @@ function Analyzer.start(d, t)
   end
 end
 
+-- jump within the file being analyzed: times stay file positions; the meter settles before it counts again
+local function seek(d, t, pos)
+  set(d.c.locate, "Value", pos)
+  d.playStart, d.lastAudioAt, d.silentSince, d.settleUntil = t - pos, nil, nil, t + K.scan_settle_s
+end
+
 function Analyzer.step(d, t)
   local j = d.job
   if t - j.started > (d.duration or 0) + 30 then return Analyzer.finish(d, false, "timed out") end
-  if j.phase ~= "head" or not d.playStart then return end
-  local played = t - d.playStart
-  if not d.firstAudioAt and played < K.scan_head_s and played < d.duration - 1 then return end
-  j.lead, j.phase = d.firstAudioAt and d.firstAudioAt - d.playStart or K.scan_head_s, "tail"
-  local pos = d.duration - K.scan_tail_s
-  if pos > played + 1 then             -- jump to the end (a short file just plays on)
-    set(d.c.locate, "Value", pos)
-    d.playStart, d.lastAudioAt, d.silentSince, d.settleUntil = t - pos, nil, nil, t + K.scan_settle_s
+  if not d.playStart or not (j.phase == "head" or j.phase == "body") then return end
+  local played, dur = t - d.playStart, d.duration
+  if j.phase == "head" then
+    if not d.firstAudioAt and played < K.scan_head_s and played < dur - 1 then return end
+    j.lead = d.firstAudioAt and d.firstAudioAt - d.playStart or K.scan_head_s
+    local body = (dur - K.scan_body_s) / 2
+    if body > played + 1 and body + K.scan_body_s <= dur - K.scan_tail_s then   -- room for the middle
+      seek(d, t, body)
+      d.pow, d.powN, j.phase, j.bodyEnd = 0, 0, "body", body + K.scan_body_s
+      return
+    end
+  elseif played < j.bodyEnd then
+    return
+  else
+    j.level, j.levelS = d:level()
   end
+  j.phase = "tail"
+  local pos = dur - K.scan_tail_s
+  if pos > played + 1 then seek(d, t, pos) end   -- jump to the end (a short file just plays on)
 end
 
 -- ok: played to its end; else err says why. Results go to the server, which keeps them
@@ -431,9 +480,13 @@ function Analyzer.finish(d, ok, err)
   if ev.ok then
     ev.lead_in, ev.duration = round(j.lead, 2), round(d.duration, 1)
     ev.trail = round(d.lastAudioAt and math.max(0, d.duration - (d.lastAudioAt - d.playStart)) or math.min(K.scan_tail_s, d.duration), 2)
+    ev.level, ev.level_s = j.level, j.levelS
+    if not ev.level then ev.level, ev.level_s = d:level() end   -- no middle (a short file): everything heard
+    if d.peakMax then ev.peak = round(d.peakMax, 1) end
     local L = LEARNED[j.key] or {}
     LEARNED[j.key] = L
     if not L.fixed then L.lead, L.trail, L.analyzed = ev.lead_in, ev.trail, true end
+    learnLevel(L, ev)
   end
   d.job, d.settleUntil = nil, nil
   d:stop()
@@ -615,6 +668,8 @@ function Station.finishTrack(d, reason)
     if not keep then L.trail = math.min(L.trail or ev.trail, ev.trail) end
   end
   if d.peakMax then ev.peak = round(d.peakMax, 1) end
+  ev.level, ev.level_s = d:level()
+  learnLevel(L, ev)
   emit(KINDS[tr.kind].event .. "_end", ev)
 end
 
@@ -652,18 +707,20 @@ function Station.startTrack(deck, track, opts, attempt)
     end
     local L = LEARNED[track.key] or {}
     local skip = L.lead and math.min(SETTINGS.lead_skip_max_s, math.max(0, L.lead - SETTINGS.lead_skip_keep_s)) or 0
-    d:play(SETTINGS[KINDS[track.kind].gain], opts.fadeIn or 0, skip)
+    d.trim = levelTrim(L)
+    d:play(SETTINGS[KINDS[track.kind].gain] + d.trim, opts.fadeIn or 0, skip)
     if track.kind == "music" then
       Station.live, Station.other, Station.state = d, otherDeck(d), "playing"
       Station.tracksSinceBumper, Station.tracksSinceAd = Station.tracksSinceBumper + 1, Station.tracksSinceAd + 1
       push(Station.history, track, 50)
       emit("track_start", { deck = d.id, file = track.name, dir = track.dir, artist = track.artist,
-        title = track.title, duration = round(d.duration or 0, 1), skip = skip > 0 and round(skip, 1) or nil })
+        title = track.title, duration = round(d.duration or 0, 1), skip = skip > 0 and round(skip, 1) or nil,
+        trim = d.trim ~= 0 and d.trim or nil })
     else
       Station.spotDeck, Station.state = d, (track.kind == "ad" and "ad" or "bumper")
       if track.kind == "ad" then Station.tracksSinceAd = 0 else Station.tracksSinceBumper = 0 end
       emit(KINDS[track.kind].event .. "_start", { deck = d.id, file = track.name, dir = track.dir, artist = track.artist,
-        title = track.title, duration = round(d.duration or 0, 1) })
+        title = track.title, duration = round(d.duration or 0, 1), trim = d.trim ~= 0 and d.trim or nil })
     end
   end)
 end
@@ -979,7 +1036,7 @@ function Station.snapshot(t)
     local info = trackInfo(d.track or d.pending) or {}
     info.state, info.live, info.analyzing = d.state, (d == Station.live) or nil, d.job and true or nil
     if d.playStart and (d.state == "playing" or d.state == "fading") then
-      info.elapsed = round(t - d.playStart, 1)
+      info.elapsed, info.gain, info.trim = round(t - d.playStart, 1), d.playGain and round(d.playGain, 1), d.trim
       local rem = d:remainingEst(t)
       info.remaining = rem and round(rem, 1)
     end
@@ -1116,13 +1173,23 @@ local function handleReply(resp)
   end
 end
 
+-- a deck's readout for the panel: its player gain now, and its meter (after the gain): the loudest peak
+-- since the last sync, the rms now
+local function meterReadout(d)
+  local r, g = d.rms and d.rms.Value, d.c.gain.Value
+  local m = { peak = round(d.shownPeak, 1), rms = type(r) == "number" and round(r, 1) or nil,
+              gain = round(type(g) == "number" and g or d.gain, 1) }
+  d.shownPeak = -120
+  return m
+end
+
 function Server.sync()
   if not (Server.enabled() and json and HttpClient) or now() < Server.nextTry then return end
   if Server.libraryDirty and Server.fails == 0 then Server.postLibrary() end
   local t = now()
   local body = { station = stationName(), version = RADIO_VERSION, boot = BOOT_ID,
                  ack = Server.lastCmd, settings_rev = Server.settingsRev, ads_rev = Server.adsRev,
-                 analyze_rev = DeckA.mix and Analyzer.rev or nil }
+                 analyze_rev = DeckA.mix and Analyzer.rev or nil, meters = { A = meterReadout(DeckA), B = meterReadout(DeckB) } }
   local rev = STATE_REV
   if rev ~= Server.sentRev or t - Server.stateAt >= K.state_every_s then body.state = Station.snapshot(t) end
   local batch = {}

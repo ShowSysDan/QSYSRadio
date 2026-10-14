@@ -24,12 +24,13 @@ SPEC = [
     ('bumper_every_n_tracks', 'Bumper every N songs', 'Bumpers & advertisements', 'int', 0, 50, 1, 4,
      'How many songs between bumpers. 0 = never (Bumper now still works).'),
     ('imaging_gain_db', 'Bumper level', 'Bumpers & advertisements', 'float', -40, 20, 0.5, 0,
-     'Play gain for imaging (dB). Lower it if bumpers are hotter than the music.'),
+     'Added to every bumper after level matching (dB). Lower it if bumpers sound hotter than the music.'),
     ('ad_every_n_tracks', 'Ad break every N songs', 'Bumpers & advertisements', 'int', 0, 50, 1, 0,
      'How many songs between ad breaks. 0 = only when an hourly ad is owed (Ad break now still works).'),
     ('ads_per_break', 'Advertisements per break', 'Bumpers & advertisements', 'int', 1, 10, 1, 2,
      'At most this many advertisements back to back. Those owed this hour go first, then mix-ins.'),
-    ('ad_gain_db', 'Advertisement level', 'Bumpers & advertisements', 'float', -40, 20, 0.5, 0, 'Play gain for advertisements (dB).'),
+    ('ad_gain_db', 'Advertisement level', 'Bumpers & advertisements', 'float', -40, 20, 0.5, 0,
+     'Added to every advertisement after level matching (dB).'),
     ('bumper_fade_s', 'Song fade under a break', 'Bumpers & advertisements', 'float', 0, 20, 0.5, 2,
      'How long the outgoing song takes to fade out once a bumper or ad starts (seconds).'),
     ('bumper_tail_s', 'Next song starts under a break', 'Bumpers & advertisements', 'float', 0, 10, 0.5, 1,
@@ -46,7 +47,20 @@ SPEC = [
     ('stop_fade_s', 'Stop fade', 'Fades', 'float', 0, 20, 0.5, 2,
      'Fade when the station is stopped from the panel (seconds).'),
 
-    ('play_gain_db', 'Music level', 'Levels', 'float', -40, 20, 0.5, 0, 'Play gain for songs (dB).'),
+    ('level_target_db', 'Average level', 'Levels', 'float', -40, 20, 0.5, 0,
+     'Level matching: every song, bumper and ad is turned up or down so its average (rms) level reads this on the '
+     'player meter (dB, the same scale as the deck meters on the Dashboard). Each file\'s average is measured on its plays '
+     'and by file analysis; a file not measured yet plays as it is. Its kind\'s level is added on top.'),
+    ('level_raise_max_db', 'Raise quiet files, at most', 'Levels', 'float', 0, 20, 0.5, 6,
+     'The most a file quieter than the average level is turned up (dB), and never so far that its peak passes '
+     'the peak ceiling. 0 = never turn up.'),
+    ('level_cut_max_db', 'Lower loud files, at most', 'Levels', 'float', 0, 40, 0.5, 20,
+     'The most a file louder than the average level is turned down (dB). 0 = never turn down; both limits 0 = '
+     'level matching off.'),
+    ('level_peak_max_db', 'Peak ceiling', 'Levels', 'float', -20, 20, 0.5, 18,
+     'A file is never turned up so far that its measured peak passes this on the player meter (dB; +20 is the top '
+     'of the meter). Peaks are read four times a second, so a short true peak can be a little higher.'),
+    ('play_gain_db', 'Music level', 'Levels', 'float', -40, 20, 0.5, 0, 'Added to every song after level matching (dB).'),
 
     ('silence_threshold_dbfs', 'Silence threshold', 'Silence detection', 'float', -90, -10, 1, -50,
      'Below this level (dBFS, at unity gain) audio counts as silence.'),
@@ -67,9 +81,9 @@ SPEC = [
 
     ('analyze_at', 'Analyze new files daily at', 'Silence detection', 'choice',
      ('off',) + tuple(f'{h:02d}:00' for h in range(24)), None, None, '04:00',
-     'Each day at this time (server time) the Core measures the quiet start and end of every file not analyzed yet, '
-     'on the deck that is off air (its RadioOut input muted), between songs. Analyzed figures are final: plays no '
-     'longer learn over them. The library pages can also start a run.'),
+     'Each day at this time (server time) the Core measures the quiet start, end and average level of every file not analyzed yet, '
+     'on the deck that is off air (its RadioOut input muted), between songs. An analyzed quiet start and end are final: '
+     'plays no longer learn over them (the level keeps learning). The library pages can also start a run.'),
 
     ('artist_separation', 'Artist separation', 'Rotation', 'int', 0, 20, 1, 2,
      'Avoid repeating an artist within the last N songs.'),

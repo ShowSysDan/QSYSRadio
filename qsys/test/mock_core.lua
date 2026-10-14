@@ -1,7 +1,7 @@
 --[[---------------------------------------------------------------------------
   MockCore :: an offline stand-in for the Q-SYS Lua runtime
   File:    qsys/test/mock_core.lua
-  Version: 0.2.0
+  Version: 0.3.0
 
   Enough of Component / Timer / dir / Design / Network / Controls / json / io
   to run radio.lua (and probe.lua) under plain Lua 5.3 with a simulated
@@ -10,12 +10,13 @@
     - status only fires its EventHandler when the string changes
     - after a failed load `remaining` keeps the previous file's value
     - progress / remaining tick in whole seconds; stop rewinds to 0
-    - the meter is post-gain, floors at -120, releases at ~60 dB/s
+    - the meter is post-gain, floors at -120, releases at ~60 dB/s; rms.N reads
+      the file's crest (default 3 dB) under peak.N
     - `playing` goes false at end of file (and `stopped` true)
 
   Usage (see run_mock.py / scenario_basic.lua):
     dofile("qsys/test/mock_core.lua")
-    MockCore.setup{ dirs = { ["Test/Tuning/"] = { {name="a.flac", duration=30, lead=1, trail=0.5, level=-10, fade=0}, ... } },
+    MockCore.setup{ dirs = { ["Test/Tuning/"] = { {name="a.flac", duration=30, lead=1, trail=0.5, level=-10, fade=0, crest=3}, ... } },
                     controls = { inputs = 3, outputs = 6 } }
     dofile("qsys/radio/radio.lua")
     MockCore.at(120, function() MockCore.press(1) end)   -- operator skip at t=120
@@ -273,7 +274,8 @@ function Player:advance(dt)
   local target = (program <= -119) and -120 or math.max(-120, program + self.ctl["gain"].Value)
   if target >= self.meterVal then self.meterVal = target
   else self.meterVal = math.max(target, self.meterVal - 60 * dt) end
-  for _, c in ipairs(self.meterCtl) do c.Value = self.meterVal end
+  local crest = self.file and self.file.crest or 3
+  for i, c in ipairs(self.meterCtl) do c.Value = (i == 3 and self.meterVal > -117) and self.meterVal - crest or self.meterVal end
 end
 
 -------------------------------------------------------------------------------

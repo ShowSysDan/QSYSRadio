@@ -5,6 +5,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.3.0] - 2026-10-14
+
+### Added
+- **Level matching.** Every song, bumper and ad plays at the same average
+  level. The Core measures each file's average (the player meter's `rms.N`
+  at unity gain, while there is sound, never during a fade) on every play and
+  in file analysis; the server keeps the average of all measurements,
+  weighted by the seconds each heard, and the highest peak. At each play the
+  deck's gain is the kind's level plus the trim to **Average level**
+  (Settings → Levels; default 0 dB on the player meter), at most
+  **Raise quiet files, at most** (6 dB) up and **Lower loud files, at most**
+  (20 dB) down, and never raised past the **Peak ceiling** (+18 dB). A file
+  not measured yet plays as it is; both limits at 0 turn it off.
+- **Fades follow the trim.** Fade-ins rise to the trimmed gain and every
+  fade-out (crossfade, skip, break, silence, stop) starts where the deck
+  is, never at 0 dB. The new MockCore scenario `scenario_levels.lua` checks
+  every kind of transition.
+- **Deck readout on the dashboard.** Each deck card shows its player gain
+  (live, once a second, so fades show) with the level-match trim, and its
+  meter after that gain: rms bar, peak line, the Average level marked. The
+  Core sends the readout with every sync (`meters`).
+- **Level on the library pages.** A Level column (hover: peak and how long
+  was measured) and Loudest / Quietest sorts.
+
+### Changed
+- **File analysis measures 20 s from the middle** of each file for its
+  average level, between the quiet start and the quiet end (about 37 s per
+  song instead of 17), and starts only while the song on air has more than
+  50 s left. Migration 0013 starts a re-analysis of every file once, as
+  Re-analyze all does, so each gets an analyzed level.
+- The learned peak keeps the highest seen (it was the last play's).
+- **Forget measured** forgets the average level and peak too; a replaced
+  file (new size) is measured afresh.
+- Music / Bumper / Advertisement level are added on top of level matching.
+
+Redeploy both: paste radio.lua on the Core first (re-enter `SERVER_URL`,
+`SERVER_TOKEN` and `STATION_ID`), then `git pull && sudo systemctl restart
+qsysradio` (migration 0013 starts the re-analysis; a Core still on 1.2.1
+would analyze without measuring levels).
+
 ## [1.2.1] - 2026-10-14
 
 ### Changed
