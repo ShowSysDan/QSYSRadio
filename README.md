@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **1.1.0** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.2.0** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **1.1.0** — stable; standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **1.1.0** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **1.1.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.2.0** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.2.0** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.2.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -286,7 +286,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `1.1.0`.
+Expect the version, e.g. `1.2.0`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -390,7 +390,7 @@ Keep the two `CFG` lines for step 10.
   networks, use the one the Core can reach.
 - Print the token again any time: `grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`.
 - Re-running is safe: the secrets in `.env` are kept and only pending
-  migrations run (`... at version 0011 (nothing to do)`).
+  migrations run (`... at version 0012 (nothing to do)`).
 - Without sudo (`./install.sh`) it sets up the venv, `.env` and the database,
   ends with `Done (no systemd service without sudo).` and prints no `CFG`
   lines. `./start.sh` then runs the server in the foreground.
@@ -418,13 +418,13 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `migrate: schema "qsysradio" at version 0011 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 1.1.0 starting on port
+- In the journal: `migrate: schema "qsysradio" at version 0012 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 1.2.0 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":11,"schema_version":11,"version":"1.1.0"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":12,"schema_version":12,"version":"1.2.0"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -592,14 +592,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 1.1.0 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.2.0 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 1.1.0`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.2.0`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -630,7 +630,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (8 in 1.1.0).
+The last line prints the number of tables (8 in 1.2.0).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -672,7 +672,7 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 1.0.2, server is 1.1.0`.
+  `station=Main runs radio.lua 1.1.0, server is 1.2.0`.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -946,6 +946,9 @@ MockCore scenarios and `live_core.py`.
   transport (Skip, Bumper now, Ad break now, Stop after current, Stop now /
   Start); both decks live; the queue (reorder, remove, clear);
   activity (every command, who sent it, and the Core's answer); recent plays.
+  Titles too long for their card slide slowly back and forth, also when the
+  computer asks for reduced motion (Remote Desktop, Windows with animation
+  effects off): everything else then stops moving.
 - **Music**, **Imaging & IDs** and **Advertisements** pages (one tab each): search
   (`/` jumps to it, Esc clears), sort, quick filters (never played,
   unsupported; station IDs; per hour / mix in / off; adjusted), all kept in
@@ -1104,13 +1107,25 @@ air, instead of (or before) learning them from plays:
 - **Which files.** The server keeps the job (`stations.analyze_from`) and
   sends the next 20 owed files in the sync reply whenever that list changes
   (`analyze`, `analyze_rev`); each result is an `analysis` event. Short
-  imaging and ads go first. A file that fails is not retried by that job.
-  A file whose size changes (replaced) is owed again.
+  imaging and ads go first.
+- **Done is done.** An analyzed file is marked (`library.analyzed_at`) and
+  never analyzed again by itself: the daily run only takes files never
+  analyzed. It is analyzed again only when you ask (its row's Analyze
+  button, **Re-analyze all**, **Forget measured**) or when the file is
+  replaced (its size changes). A file whose analysis *fails* (a load error)
+  is not marked: it is skipped for the rest of that run and tried again by
+  the next one (`analyze_failed_at`, `analyze_error`; a red "failed" tag on
+  its row says why).
 - **Daily.** Settings → Silence detection → "Analyze new files daily at"
   (default 04:00, server time; off) starts a run for files never analyzed.
   The library pages show progress and have **Analyze now** (files not
-  analyzed yet), **Re-analyze all** and **Stop**; a file's quiet start / end
-  editor has **Analyze again**.
+  analyzed yet), **Re-analyze all** and **Stop**.
+- **One file.** Every row has an Analyze button (the bars icon; operators),
+  also in the file's quiet start / end editor. It analyzes just that file
+  (`library.analyze_wanted`) without starting a run, first in line; its
+  current figures stay in use until the new ones arrive. Each row shows a
+  tag: ✓ analyzed (hover for when), "queued", or "failed". The **Not
+  analyzed** filter lists the rest.
 - **Final.** Analyzed figures (`library.analyzed_at`) are not learned over
   by plays, on the server or the Core. Figures set by an operator still win;
   **Forget measured** clears the analysis too.
@@ -1178,9 +1193,10 @@ complete record.
 | 0.3 | Server: play log, control panel, settings, sign-in, syslog, NTP check; advertisements, fair rotation and ad-break fitting on the server; pause ads / bumpers; station IDs; quiet start / end and fade-out handling for every kind, adjustable per file |
 | 1.0.1 | Stable: everything in 0.3 |
 | 1.1.0 | File analysis: quiet start / end measured on the off-air deck, daily |
-| 1.2 | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
-| 1.3 | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
-| 1.4 | Loudness normalisation from the learned peak |
+| 1.2.0 | Analyze one file from its row; failed analyses retried by the next run |
+| Next | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
+| Later | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
+| Later | Loudness normalisation from the learned peak |
 
 ## Network requirement
 

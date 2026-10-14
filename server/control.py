@@ -175,6 +175,8 @@ def core_library(conn, payload):
                                    unsupported = library.unsupported AND library.size IS NOT DISTINCT FROM EXCLUDED.size,
                                    analyzed_at = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size
                                                       THEN library.analyzed_at END,
+                                   analyze_failed_at = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size
+                                                            THEN library.analyze_failed_at END,
                                    present = TRUE, last_seen = NOW()""", list(rows.values()), page_size=1000)
         cur.execute("""INSERT INTO stations (station, library_at, music_dir, imaging_dir, ads_dir)
                        VALUES (%s, NOW(), %s, %s, %s)
@@ -348,7 +350,7 @@ def forget_measured(conn, station, key, kind, user):
     if not key and kind not in KINDS:
         raise BadRequest('give a file (key) or a kind')
     with conn.cursor() as cur:
-        cur.execute("""UPDATE library SET lead_in_s = NULL, trail_s = NULL, analyzed_at = NULL
+        cur.execute("""UPDATE library SET lead_in_s = NULL, trail_s = NULL, analyzed_at = NULL, analyze_failed_at = NULL
                        WHERE station = %s AND (lead_in_s IS NOT NULL OR trail_s IS NOT NULL OR analyzed_at IS NOT NULL)
                          AND """ + ('key = %s' if key else 'kind = %s'), (station, key or kind))
         n = cur.rowcount
@@ -369,6 +371,7 @@ _SORTS = {
 # list filters: name -> SQL condition (the select below is aliased x)
 FILTERS = {'never': 'last_played IS NULL', 'unsupported': 'unsupported', 'ident': 'ident',
            'adjusted': 'lead_set_s IS NOT NULL OR trail_set_s IS NOT NULL',
+           'not_analyzed': 'analyzed_at IS NULL AND NOT unsupported',
            'hourly': "mode = 'hourly'", 'mix': "mode = 'mix'", 'off': "mode = 'off'"}
 
 
@@ -378,7 +381,8 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
     this hour's / today's plays (the server's clock and TIMEZONE). Returns
     (total, a page of items, totals over every matching file)."""
     sql = """SELECT l.key, l.kind, l.directory, l.file, l.artist, l.title, l.duration_s, l.unsupported, l.ident,
-                    l.lead_in_s, l.trail_s, l.lead_set_s, l.trail_set_s, l.analyzed_at,
+                    l.lead_in_s, l.trail_s, l.lead_set_s, l.trail_set_s, l.analyzed_at, l.analyze_failed_at, l.analyze_error,
+                    COALESCE({owed}, FALSE) AS analyze_queued,
                     GREATEST(0, l.duration_s - COALESCE(l.lead_set_s, l.lead_in_s, 0)
                                              - COALESCE(l.trail_set_s, l.trail_s, 0)) AS audible_s,
                     COALESCE(p.plays, 0) AS plays, p.last_played, COALESCE(p.plays_hour, 0) AS plays_hour,
@@ -391,7 +395,8 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
                                 WHERE pl.station = l.station AND pl.file = l.file
                                   AND COALESCE(pl.directory, '') = l.directory) p ON TRUE
              LEFT JOIN ad_rules r ON r.station = l.station AND r.key = l.key
-             WHERE l.station = %s AND l.present"""
+             LEFT JOIN stations s ON s.station = l.station
+             WHERE l.station = %s AND l.present""".replace('{owed}', analysis.owed_sql('l', 's.analyze_from', 's.analyze_run_at'))
     args = [station]
     if kind in KINDS:
         sql += ' AND l.kind = %s'
@@ -413,7 +418,8 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
         total = totals['n']
         cur.execute(sql + f' ORDER BY {_SORTS.get(sort, _SORTS["artist"])}, key LIMIT %s OFFSET %s',
                     args + [limit, offset])
-        items = [dict(r, last_played=iso(r['last_played']), analyzed_at=iso(r['analyzed_at'])) for r in cur.fetchall()]
+        items = [dict(r, last_played=iso(r['last_played']), analyzed_at=iso(r['analyzed_at']),
+                      analyze_failed_at=iso(r['analyze_failed_at'])) for r in cur.fetchall()]
         if any(i['kind'] == 'ad' for i in items):
             sched, hour_start = ads.schedule(cur, station)
             for i in items:
