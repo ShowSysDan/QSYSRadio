@@ -5,24 +5,20 @@
   <div class="section-title">Station settings</div>
   <span class="dim small">Sent to the Core within a second of saving. It keeps them if the server goes away.</span>
 </div>
-<section class="tile purple">
-  <div id="sync" class="banner"></div>
-  <form id="set-form"><div id="groups"></div>
-    <div class="form-actions"><button type="submit" class="primary">Save settings</button>
-      <button type="button" data-revert>Discard changes</button></div>
-  </form>
-</section>
+<div id="sync" class="banner"></div>
+<form id="set-form"><div id="groups" class="set-grid"></div>
+  <div class="form-actions"><span class="unsaved"></span>
+    <button type="button" data-revert>Discard changes</button><button type="submit" class="primary">Save settings</button></div>
+</form>
 
-<div class="section-header" style="margin-top:24px">
+<div class="section-header" style="margin-top:28px">
   <div class="section-title">Server settings</div>
   <span class="dim small">Used by this server within {{ reload_s }} s of saving; no restart. Defaults come from .env.</span>
 </div>
-<section class="tile blue">
-  <form id="srv-form"><div id="srv-groups"></div>
-    <div class="form-actions"><button type="submit" class="primary">Save server settings</button>
-      <button type="button" data-revert>Discard changes</button>
-      <button type="button" id="btn-syslog-test" title="Send one WARNING line to the saved syslog server">Send test message</button></div>
-  </form>
-</section>
+<form id="srv-form"><div id="srv-groups" class="set-grid"></div>
+  <div class="form-actions"><span class="unsaved"></span>
+    <button type="button" id="btn-syslog-test" title="Send one WARNING line to the saved syslog server">Send test message</button>
+    <button type="button" data-revert>Discard changes</button><button type="submit" class="primary">Save server settings</button></div>
+</form>
 {% endblock %}
 {% block scripts %}<script src="{{ url_for('static', filename='js/settings.js') }}?v={{ version }}"></script>{% endblock %}

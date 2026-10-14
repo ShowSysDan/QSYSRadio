@@ -100,16 +100,18 @@ def start(conn, station, scope, key, user):
 
 
 def view(cur, station, state):
-    """For the panel: {active, left, never, failed, can, at, auto_at}."""
+    """For the panel: {active, left, never, failed, can, at, auto_at, last}; last = the latest result
+    (analyzed or failed), so a library page reloads when one comes in."""
     job = _job(cur, station)
     since = job and job['analyze_from']
     cur.execute(f'SELECT count(*) FROM library WHERE {OWED}', (station, since, since, job and job['analyze_run_at']))
     left = cur.fetchone()[0]
     cur.execute("""SELECT count(*) FILTER (WHERE analyzed_at IS NULL) AS never,
-                          count(*) FILTER (WHERE analyzed_at IS NULL AND analyze_failed_at IS NOT NULL) AS failed
+                          count(*) FILTER (WHERE analyzed_at IS NULL AND analyze_failed_at IS NOT NULL) AS failed,
+                          max(GREATEST(analyzed_at, analyze_failed_at)) AS last
                    FROM library WHERE station = %s AND present AND NOT unsupported""", (station,))
     counts = cur.fetchone()
     can = (state.get('analyze') or {}).get('can') is True
     return {'active': since is not None or left > 0, 'left': left, 'never': counts['never'], 'failed': counts['failed'], 'can': can,
-            'auto_at': iso(job and job['analyze_auto_at']),
+            'auto_at': iso(job and job['analyze_auto_at']), 'last': iso(counts['last']),
             'at': core_settings.load(cur).get('analyze_at', core_settings.BY_NAME['analyze_at'][7])}

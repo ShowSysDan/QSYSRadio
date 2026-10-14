@@ -8,29 +8,44 @@
   <link rel="preload" href="{{ url_for('static', filename='fonts/outfit-latin-wght-normal.woff2') }}" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/radio.css') }}?v={{ version }}">
 </head>
-<body data-can-operate="{{ 1 if user and user.can_operate else 0 }}" data-is-admin="{{ 1 if user and user.is_admin else 0 }}">
+<body data-page="{{ page }}" data-can-operate="{{ 1 if user and user.can_operate else 0 }}" data-is-admin="{{ 1 if user and user.is_admin else 0 }}">
   <header class="header">
     <div class="header-left">
-      <a class="logo" href="{{ url_for('dashboard') }}">QSYS<span>Radio</span></a>
+      <a class="brand" href="{{ url_for('dashboard') }}" title="Dashboard">
+        <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 15h2v-6H4zm4 3h2V6H8zm4 3h2V3h-2zm4-3h2V6h-2zm4-3h2v-6h-2z"/></svg>
+        <span class="logo">QSYS<span>Radio</span></span></a>
       <span class="version">v{{ version }}</span>
       <span id="station-pill" class="status-pill wait"><i></i><span>connecting</span></span>
       <select id="station-select" class="station-select" hidden title="Station"></select>
+      <a id="hdr-analysis" class="hdr-chip" href="{{ url_for('library_kind', which='music') }}" hidden title="File analysis on the off-air deck"><i></i><span></span></a>
     </div>
     <div class="header-actions">
-      <span id="server-clock" class="server-clock" title="Server time">--:--:--</span>
+      <div class="clock-box" title="Server time"><span class="clock-lbl">SERVER</span><span id="server-clock" class="server-clock">--:--:--</span></div>
       {% if user %}
-      <span class="userbox">{{ user.display_name }}{% if not user.can_operate %} <span class="tag ro">read-only</span>{% endif %}
-        <a href="{{ url_for('logout') }}" title="Sign out of QSYSRadio and the other apps">Sign out</a></span>
+      <details class="usermenu" id="usermenu">
+        <summary title="{{ user.display_name }}"><span class="avatar">{{ (user.display_name or user.username or '?')[:1] | upper }}</span>
+          <span class="um-name">{{ user.display_name }}</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5z"/></svg></summary>
+        <div class="um-menu">
+          <div class="um-who"><b>{{ user.display_name }}</b>
+            <span class="tag {{ 'ok' if user.is_admin else ('ro' if not user.can_operate else '') }}">{{ 'Admin' if user.is_admin else ('Operator' if user.can_operate else 'Read-only') }}</span></div>
+          <a href="{{ url_for('logout') }}" title="Sign out of QSYSRadio and the other apps">Sign out</a>
+        </div>
+      </details>
       {% endif %}
     </div>
   </header>
-  <nav class="tabs">
-    <a href="{{ url_for('dashboard') }}" class="tab {{ 'active' if page == 'dashboard' }}">Dashboard</a>
-    <a href="{{ url_for('library_kind', which='music') }}" class="tab {{ 'active' if page == 'music' }}">Music</a>
-    <a href="{{ url_for('library_kind', which='imaging') }}" class="tab {{ 'active' if page == 'imaging' }}">Imaging &amp; IDs</a>
-    <a href="{{ url_for('library_kind', which='ads') }}" class="tab {{ 'active' if page == 'ad' }}">Advertisements</a>
-    <a href="{{ url_for('log_page') }}" class="tab {{ 'active' if page == 'log' }}">Play log</a>
-    {% if user and user.is_admin %}<a href="{{ url_for('settings_page') }}" class="tab {{ 'active' if page == 'settings' }}">Settings</a>{% endif %}
+  <nav class="nav">
+    <div class="tabs">
+      <a href="{{ url_for('dashboard') }}" class="tab {{ 'active' if page == 'dashboard' }}"><svg viewBox="0 0 24 24"><path d="M3 3h8v10H3zm10 0h8v6h-8zM3 15h8v6H3zm10-4h8v10h-8z"/></svg><span>Dashboard</span></a>
+      <a href="{{ url_for('library_kind', which='music') }}" class="tab {{ 'active' if page == 'music' }}"><svg viewBox="0 0 24 24"><path d="M12 3v10.6A4 4 0 1 0 14 17V7h4V3z"/></svg><span>Music</span><b class="tab-n" data-count="music"></b></a>
+      <a href="{{ url_for('library_kind', which='imaging') }}" class="tab {{ 'active' if page == 'imaging' }}"><svg viewBox="0 0 24 24"><path d="M3 10h2v4H3zm4-3h2v10H7zm4-4h2v18h-2zm4 4h2v10h-2zm4 3h2v4h-2z"/></svg><span>Imaging &amp; IDs</span><b class="tab-n" data-count="imaging"></b></a>
+      <a href="{{ url_for('library_kind', which='ads') }}" class="tab {{ 'active' if page == 'ad' }}"><svg viewBox="0 0 24 24"><path d="M18 3v18l-6-4H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h6zM6 17h3l1 4H7z"/></svg><span>Advertisements</span><b class="tab-n" data-count="ad"></b></a>
+      <a href="{{ url_for('log_page') }}" class="tab {{ 'active' if page == 'log' }}"><svg viewBox="0 0 24 24"><path d="M4 4h16v2H4zm0 5h16v2H4zm0 5h10v2H4zm0 5h10v2H4zm13-4 4 3-4 3z"/></svg><span>Play log</span></a>
+      {% if user and user.is_admin %}<a href="{{ url_for('settings_page') }}" class="tab {{ 'active' if page == 'settings' }}"><svg viewBox="0 0 24 24"><path d="M3 6h9v2H3zm13 0h5v2h-5zm-2-2h2v6h-2zM3 16h5v2H3zm9 0h9v2h-9zm-2-2h2v6h-2z"/></svg><span>Settings</span></a>{% endif %}
+    </div>
+    <a class="now" id="nav-now" href="{{ url_for('dashboard') }}" hidden title="On air now: open the dashboard">
+      <span class="lamp-off">OFF</span><span class="now-t"></span><span class="now-rem"></span></a>
+    <div class="nav-progress"><i id="nav-progress"></i></div>
   </nav>
   <main class="main">{% block main %}{% endblock %}</main>
   <div class="toasts" id="toasts"></div>

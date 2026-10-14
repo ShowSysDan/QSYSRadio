@@ -529,7 +529,7 @@ def test_file_analysis_job(app):
     state = dict(STATE, analyze={'can': True, 'left': 0})
     assert 'analyze' not in sync(app, station='AN1', analyze_rev='', state=state).json          # no job: nothing to do
     assert op.get('/api/v1/now?station=AN1').json['station']['analysis'] == {
-        'active': False, 'left': 0, 'never': 3, 'failed': 0, 'can': True, 'auto_at': None, 'at': 'off'}
+        'active': False, 'left': 0, 'never': 3, 'failed': 0, 'can': True, 'auto_at': None, 'at': 'off', 'last': None}
     assert analyze(viewer, scope='new').status_code == 403
     assert analyze(op, scope='bogus').status_code == 400
     assert analyze(op, scope='new').status_code == 200
@@ -553,6 +553,7 @@ def test_file_analysis_job(app):
     assert r['analyze'] == ['M/b.mp3']                                     # a failed file waits for the next run
     now = op.get('/api/v1/now?station=AN1').json['station']['analysis']
     assert (now['active'], now['left'], now['never'], now['failed'], now['can']) == (True, 1, 2, 1, True)
+    assert now['last']                                                     # the latest result: library pages reload on it
     rows = {i['key']: i for i in op.get('/api/v1/library?station=AN1&only=not_analyzed').json['items']}
     assert set(rows) == {'M/b.mp3', 'I/c.wav'}
     assert rows['M/b.mp3']['analyze_queued'] is True and rows['I/c.wav']['analyze_queued'] is False
