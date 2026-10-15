@@ -54,7 +54,7 @@
   // follows the first, so the loop has no seam (el gets class "marq"; called again only re-measures)
   R.marquee = (el, text) => {
     if (!el) return;
-    if (el.dataset.text !== text) {
+    if (el.dataset.text !== text || !(el.firstElementChild && el.firstElementChild.firstElementChild)) {   // new text, or written over
       el.dataset.text = text;
       el.classList.add('marq');
       el.innerHTML = '<span><span>' + R.esc(text) + '</span></span>';
@@ -66,11 +66,12 @@
     }
     el.classList.toggle('scroll', over);
     if (over) {
-      // one lap: from the text to its copy (sub-pixel, so the loop does not jump)
-      const dist = (run.lastChild.getBoundingClientRect().left - one.getBoundingClientRect().left).toFixed(2) + 'px';
-      if (el.style.getPropertyValue('--dist') !== dist) {
-        el.style.setProperty('--dist', dist);
-        el.style.setProperty('--dur', (parseFloat(dist) / 35).toFixed(2) + 's');
+      // one lap: from the text to its copy (sub-pixel, so the loop does not jump); rewritten only when the width
+      // really changed (a new duration shifts the animation, and measuring mid-scroll wobbles by a hundredth)
+      const dist = run.lastChild.getBoundingClientRect().left - one.getBoundingClientRect().left;
+      if (Math.abs(dist - (parseFloat(el.style.getPropertyValue('--dist')) || 0)) > 0.5) {
+        el.style.setProperty('--dist', dist.toFixed(2) + 'px');
+        el.style.setProperty('--dur', (dist / 35).toFixed(2) + 's');
       }
     }
   };
