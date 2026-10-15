@@ -1,10 +1,11 @@
 # Q-SYS Radio Automation
 
-Version **1.6.0** · see [CHANGELOG.md](CHANGELOG.md)
+Version **2.0.0** · see [CHANGELOG.md](CHANGELOG.md)
 
-A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
-Core does the real-time work (deck control, crossfades, silence detection,
-never going dead) and is kept as light as possible. A Python/Flask app with a
+Radio-station automation built on a Q-SYS Core: one script runs every
+station on the Core, each station with two decks. Lua on the Core does the
+real-time work (deck control, crossfades, silence detection, never going
+dead) and is kept as light as possible. A Python/Flask app with a
 PostgreSQL backend does everything else: the play log, the web control panel,
 station settings, the library, syslog.
 
@@ -13,26 +14,29 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **1.6.0** — stable; standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **1.6.0** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **1.6.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings by station, per-file figures shared by every station, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **2.0.0** — stable; every station on the Core from one script, each faulted and rebuilt on its own; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **2.0.0** — offline Core stand-in (any number of players) + a live simulated Core with several stations for demos |
+| `server` — Flask + Postgres | **2.0.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings by station, per-file figures shared by every station, one sync a second per Core (each station its own transaction), syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
 ```
  ┌────────────────────────── Q-SYS Core ──────────────────────────┐
- │  radio.lua                                                     │
- │   • both decks: load, play, fades, crossfade timing,           │
- │     silence detection, learning (lead-in / tail / level),      │
- │     level matching, file analysis on the off-air deck          │
+ │  radio.lua: every station in CFG.STATIONS, each on its own     │
+ │   • each station's two decks: load, play, fades, crossfade     │
+ │     timing, silence detection, learning (lead-in / tail /      │
+ │     level), level matching, file analysis on the off-air deck  │
+ │   • a station that fails is stopped and rebuilt on its own     │
  │   • keeps playing on its own if the server is gone             │
- │   • once a second: POST /api/v1/core/sync                      │
+ │   • once a second, for all stations: POST /api/v1/core/sync    │
  │       → events, state (when it changed), deck gain + meters    │
  │       ← operator commands, settings, ad plan, files to analyze │
+ │  station "Main":                                               │
  │  Audio_Player23 ─┬─► PlayerMeter meter.1                       │
  │                  └─► RadioOut input 1 ─────┐                   │
  │  Audio_Player24 ─┬─► PlayerMeter meter.2   │                   │
  │                  └─► RadioOut input 2 ─────┴─► air chain       │
+ │  station "Lobby": two more players, a meter (and a mixer) …    │
  └──────────────────────────────┬─────────────────────────────────┘
                                 │ HTTP (the Core pulls)
  ┌──────────────────────── App server ────────────────────────────┐
@@ -54,10 +58,21 @@ station settings, the library, syslog.
   on the server to keep audio flowing.
 - **Never go dead.** If the server is unreachable, Lua keeps playing (local
   shuffle) and keeps events in an outbox to replay later.
-- **Lua stays light.** One 250 ms timer; a 50 ms timer only while a deck is
-  fading or loading; one HTTP request a second; controls looked up once.
-  The Core keeps only two files: the last settings (written when they change)
-  and the event outbox (written only while the server is unreachable).
+- **One script, many stations.** `CFG.STATIONS` in radio.lua lists every
+  station on the Core (two Audio Players each); each has its own decks,
+  library, settings, queue, ad plan and file analysis, and behaves as a
+  station of its own. The Core syncs them all in one request a second.
+- **One station's failure is its own.** Each station's tick, each deck's
+  handlers, each command and each station's part of a reply run in their
+  own pcall; a station that keeps failing (or cannot be built) is stopped,
+  reported and rebuilt after a back-off while the others play on. On the
+  server each station's part of the sync is its own transaction.
+- **Lua stays light.** One 250 ms timer and one HTTP request a second for
+  every station together; a 50 ms timer only while a deck is fading or
+  loading; controls looked up once; nothing allocated per tick; every list
+  has a cap. The Core keeps only two files: the last settings (written when
+  they change) and the event outbox (written only while the server is
+  unreachable or does not take a station's events).
 - **Settings live in Python.** Every station setting is defined, documented
   and validated in `server/core_settings.py`, edited on the web page and
   pushed to the Core. `radio.lua` only carries fallback values (a test keeps
@@ -67,8 +82,9 @@ station settings, the library, syslog.
   (`station_settings`). A station stores only what differs, the server's own
   settings (IDs, ad timing, daily analysis) included; the folders are set
   per station only, so a new station never inherits another's.
-- **Per-deck metering.** Player 1 → `meter.1`, Player 2 → `meter.2`.
-- **Two decks only.** A bumper or ad plays on the free deck; the next track
+- **Per-deck metering.** Each player feeds its own meter channel (`peak.N`,
+  `rms.N`; `meters` in its station's `CFG` entry).
+- **Two decks per station.** A bumper or ad plays on the free deck; the next track
   starts under it on the other deck. Ads in one break play back to back,
   alternating decks.
 - **Three kinds of file.** Music, imaging (bumpers, stingers, IDs: one pool)
@@ -122,10 +138,53 @@ Facts from the first real run that the deck controller and server will build on.
 ## Deck controller
 
 `qsys/radio/radio.lua` (Lua 5.3, Text Controller or Control Script). Edit only
-the `CFG` block at the top: player / meter names, `SERVER_URL`,
-`SERVER_TOKEN` (the server's `RADIO_API_TOKEN`) and `STATION_ID`.
+the `CFG` block at the top: `SERVER_URL`, `SERVER_TOKEN` (the server's
+`RADIO_API_TOKEN`), `AUTOSTART`, `CORE_ID` (the Core's name for the server;
+`""` = the design name) and `STATIONS`, one entry per station
+(Installation, [step 10](#10-connect-the-q-sys-core)):
 
-- **Timing.** A 250 ms station timer reads each deck's `peak.N` (the meter
+```lua
+STATIONS = {
+  { id = "Main", players = { "Audio_Player23", "Audio_Player24" }, meter = "PlayerMeter", meters = { 1, 2 },
+    mixer = "RadioOut", mix = { 1, 2 } },
+  { id = "Lobby", players = { "Lobby_A", "Lobby_B" }, meter = "LobbyMeter", meters = { 1, 2 }, mixer = "" },
+},
+```
+
+- **Stations.** Each entry is a station of its own: its two players
+  (`players`; each player belongs to one station), the meter channels that
+  read them (`meter`, `meters`: `peak.N` and `rms.N`; one meter may serve
+  several stations on different channels) and, for file analysis, the mixer
+  inputs they feed (`mixer`, `mix`: `input.N.mute.1`; `""` or absent = no
+  analysis for that station). `id` names the station on the server: never
+  `""`, and unique among all the Cores that use the server (an entry without
+  one, or with one already used in this `CFG`, is skipped and logged). Each station has its own copy of the settings (the server's
+  values for that station, else `SETTINGS`), library, shuffle, queue, ad
+  plan, file analysis and command ack. Stations listing the same folder
+  share its track records. One 250 ms timer and one sync request a second
+  serve them all.
+- **Faults.** Each station's tick, each deck's `playing` handler, each fade
+  or load step, each command and each station's part of a sync reply run in
+  their own pcall: an error is logged (`! Main: tick failed: …`) and the
+  other stations never notice. A station whose tick fails 5 times in a row,
+  or that cannot be built (a player, meter or control missing, Script
+  Access off, two stations on one player, a bad entry), is **faulted**: its
+  decks stop, a `station_fault` event says why, and it is built again from
+  its `CFG` entry after 30 s, then 1, 2 and 4 min, then every 5 min (back to
+  30 s after 10 min of healthy running). It keeps its settings, its command
+  ack and whether it was on air, keeps syncing (the Dashboard shows a red
+  banner with the reason; the library pages' file analysis line names the
+  fault too) and answers commands "station fault: …".
+- **Memory.** Every list has a cap: one outbox for all stations (10,000
+  events, the oldest dropped and counted per station), the last 500 events,
+  history 50, queue 100, files to analyze 5,000; a station's per-file
+  figures are those of the files its latest scan listed (a folder change
+  drops the old folder's). The 250 ms and 50 ms timers allocate nothing. The
+  Core reports its Lua memory with every sync (`mem_kb`) and in its
+  heartbeat; the server warns when it keeps growing, judged on the lowest
+  sample of each 10 minutes (one sample includes garbage not yet collected,
+  so it saws up and down) ([Troubleshooting](#troubleshooting)).
+- **Timing.** A 250 ms timer reads each deck's `peak.N` (the meter
   samples every ~250 ms; `rms.N` too while there is sound, for the average
   level), watches for trailing silence, and checks the
   crossfade point; inside the last tick it arms `Timer.CallAfter` so the fade
@@ -179,16 +238,74 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
   of the file). A file the player cannot play
   ("Unsupported…") is remembered there, for every station, until its size changes; any other
   load failure only skips the file until the next scan.
-- **Files on the Core** (`media/_radio/`): `settings.json` (the server's
-  settings, so a reboot during an outage plays the right folders) and
-  `outbox.json` (events not yet delivered; written every 30 s only while the
-  server is unreachable). An unreadable file is kept as `<name>.bad`, never
-  overwritten.
+- **Files on the Core** (`media/_radio/`), one each for all stations:
+  `settings.json` (each station's settings from the server,
+  `{stations: {<id>: {rev, settings}}}`, written once per sync reply that
+  changed any, so a reboot during an outage plays the right folders) and
+  `outbox.json` (every station's events not yet delivered; written every
+  30 s only while the server is unreachable or answers a station's part
+  with `{error}`, at most every 2 min above 2,000 events). A 1.x file is read as the first station's. An unreadable
+  file is kept as `<name>.bad`, never overwritten.
 - **Never dead.** If neither deck is busy for `dead_air_s`, something starts;
   with an empty music folder it backs off and logs once.
 - **No Q-SYS panel controls.** Everything is operated from the web panel;
-  the script's Debug Output shows one short line per event (the server keeps
-  every field) and a heartbeat every 30 s.
+  the script's Debug Output shows one short line per event, with its
+  station (the server keeps every field), and one heartbeat every 30 s for
+  the whole Core: `heartbeat: Lua 840 KB, outbox 0 | Main: playing <file> |
+  Lobby: FAULT (player 'Lobby_B' not found)`.
+
+### Core ↔ server protocol
+
+The Core always asks; nothing connects to the Core. Both requests carry
+`X-Radio-Token` (`RADIO_API_TOKEN`).
+
+- **`POST /api/v1/core/sync`, once a second for every station:**
+  `{version, boot, core, mem_kb, stations: [{station, ack, settings_rev,
+  ads_rev, analyze_rev, meters: {A: {peak, rms, gain}, B: …}, state,
+  events, dropped}]}`. `ack` is the last command id the station ran;
+  `analyze_rev` comes only from a station with a mixer; `state` only when it
+  changed or every 10 s (with `fault` while the station is faulted);
+  `events` are the station's share of at most 100 per request (shared
+  fairly, each with `station`, `boot` and a sequence number unique on the
+  Core); `dropped` only when the outbox lost some of its events. The reply
+  is `{stations: {<id>: {commands (id > ack), settings + settings_rev (when
+  the station's rev differs), ads + ads_rev (the ad plan, when it changed),
+  analyze + analyze_rev (files to analyze), ack_reset (the server's
+  database is older than the ack), accepted, duplicates, rejected} |
+  {error}}}`. The server handles each station in its own transaction under
+  that station's lock (every web change to the station, from a command to
+  an ID mark, takes the same lock before it touches any row, so none can
+  deadlock with that station's sync; a file's figures are shared by every
+  station that has it, so a change to many files at once, such as Forget
+  measured for a whole kind, can rarely meet another station's sync on the
+  same files: PostgreSQL cancels one of the two, the sync part gets
+  `{error}` and the web change answers 409, nothing changed, try again); a
+  station whose part fails gets `{error}` and the Core sends its events
+  again next time (and keeps them in `outbox.json` meanwhile). The database
+  gone answers 503 for the whole request and the Core backs off (2 s,
+  doubling to 30 s).
+- **`POST /api/v1/core/library`, after each scan:** the station's files in
+  parts of at most 1,000, `{station, boot, scan, part, parts, music_dir,
+  imaging_dir, ads_dir, items: [{key, dir, file, kind, artist, title,
+  size}]}`, one upload in flight for the whole Core (the stations take
+  turns, one part per second). Parts before the last are answered `{ok,
+  scan, part, parts}`; the last `{ok, items, learned}`: the station's files
+  and the per-file figures the Core uses (`{key: {trail, lead, level, peak,
+  fixed, analyzed} | {unsupported}}`; a reply that arrives after the station
+  scanned again is not used: the new scan's upload brings them). The server
+  stages a scan (`library.scan`): new files count at once, but only the last
+  part, with every part in, marks the files not in the scan gone, so a
+  broken upload never shrinks the library. If a part is missing, the last
+  part gets 409 and the Core sends the whole scan again, with a new scan id,
+  after a back-off (10 s, doubling to 2 min).
+- **Older Cores.** The server also answers a 1.x Core (one station:
+  `{station, version, boot, ack, …}` at the top level, the library in one
+  upload) as before, for one version, so the server can be updated first.
+- **The plan is cached.** The server makes a station's ads plan (and the
+  next song) again only when the station's events came in, when something
+  it depends on changed (ad rules, holds, IDs, settings, a complete library
+  scan, a command), when it changes by the clock (a slot opens) or after
+  30 s, so the cost of a sync stays small with many stations.
 
 ### Testing without a Core
 
@@ -204,11 +321,14 @@ python3 qsys/test/run_mock.py qsys/test/scenario_ads.lua          # ad breaks, h
 python3 qsys/test/run_mock.py qsys/test/scenario_analysis.lua     # file analysis on the off-air deck
 python3 qsys/test/run_mock.py qsys/test/scenario_levels.lua       # average levels, level matching, fades, deck meters
 python3 qsys/test/run_mock.py qsys/test/scenario_regressions.lua  # one case per bug found in review
+python3 qsys/test/run_mock.py qsys/test/scenario_multi.lua        # several stations: faults, rebuilds, outage, library in parts, memory
 ```
 
 `qsys/test/live_core.py --server http://127.0.0.1:5410 --token T` runs
 radio.lua in real time against a real server with a simulated library, for
-demos and end-to-end testing of the control panel.
+demos and end-to-end testing of the control panel. `--stations 3` runs
+three stations on the simulated Core (`Main`, `Main-2`, `Main-3`),
+`--core NAME` names it, `--speed 4` runs the clock four times faster.
 
 ## Repository layout
 
@@ -220,7 +340,8 @@ qsys/
 server/
   app.py              routes (pages, web API, Core API)
   auth.py             shared sign-in (shared.users / shared.app_sessions)
-  control.py          Core sync + library, commands, status, settings
+  control.py          Core sync (each station its own transaction) + library in parts, commands, status, settings
+  cores.py            each Core: boot, version, Lua memory and the leak warning
   core_settings.py    every station setting: label, range, default, help; the layers
   events.py           Core events -> core_events + play_log
   media.py            each file's figures, shared by every station (media_files, library_figures)
@@ -313,7 +434,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `1.6.0`.
+Expect the version, e.g. `2.0.0`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -445,13 +566,13 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `migrate: schema "qsysradio" at version 0015 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 1.6.0 starting on port
+- In the journal: `migrate: schema "qsysradio" at version 0016 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 2.0.0 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":15,"schema_version":15,"version":"1.6.0"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":16,"schema_version":16,"version":"2.0.0"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -574,19 +695,25 @@ account that has access, the dashboard opens without asking.
 
 ### 10. Connect the Q-SYS Core
 
-In Q-SYS Designer, with the station's design open:
+In Q-SYS Designer, with the design open. One script runs every station on
+the Core; each station needs its own components (steps 1 to 4 per station):
 
-1. **Components.** You need two Audio Players, a True Peak/RMS meter with
-   2 channels (the script reads its `peak.N` and `rms.N`) and a mixer that sums the players for the air chain. Wire
-   Player 1 to meter input 1 and mixer input 1, Player 2 to meter input 2
-   and mixer input 2. The meter must take the player's output directly, not
-   the mixer's: file analysis mutes a player's mixer input and still reads
-   its meter. Code Names must match `CFG`: `Audio_Player23`,
-   `Audio_Player24`, `PlayerMeter`, `RadioOut` (or change `CFG`;
-   `MIXER = ""` turns file analysis off).
-2. **Script Access.** Select each of the four, then set **Properties** →
-   **Script Access** to `Script` (or `All`). With the default `None`, the
-   script cannot see them.
+1. **Components.** Per station: two Audio Players, a True Peak/RMS meter
+   channel for each (the script reads `peak.N` and `rms.N`) and a mixer that
+   sums the players for the station's air chain. Wire Player 1 to a meter
+   input and mixer input 1, Player 2 to the next meter input and mixer
+   input 2. The meter must take the player's output directly, not the
+   mixer's: file analysis mutes a player's mixer input and still reads its
+   meter. One meter can serve several stations (channels 1 and 2 for one,
+   3 and 4 for the next); a player belongs to one station only. The first
+   station's defaults are `Audio_Player23`, `Audio_Player24`, `PlayerMeter`
+   channels 1 and 2, `RadioOut` inputs 1 and 2; Code Names must match its
+   `CFG.STATIONS` entry (`mixer = ""` turns file analysis off for that
+   station).
+2. **Script Access.** Select each player, meter and mixer, then set
+   **Properties** → **Script Access** to `Script` (or `All`). With the
+   default `None`, the script cannot see them (the station is faulted:
+   `player '…' has no control 'gain' (Script Access on?)`).
 3. **Player root.** Keep both players' Root the same; the probe found
    `Audio/`. The script sets the folder and file itself. The probe also
    found `Track Count = 1` (mono out). QSC's training material says a
@@ -601,35 +728,43 @@ In Q-SYS Designer, with the station's design open:
    the imaging folder, or set "Bumper every N songs" to 0. Ads are optional:
    put them in their own folder and set the station's Advertisements folder
    on the Settings page.
-5. **Script.** Add a Text Controller (or Control Script). Open its Lua
-   editor, paste all of `qsys/radio/radio.lua`, and change only `CFG`:
+5. **Script.** Add one Text Controller (or Control Script) for the whole
+   Core. Open its Lua editor, paste all of `qsys/radio/radio.lua`, and change
+   only `CFG`, with one `STATIONS` entry per station:
    ```lua
    CFG = {
-     PLAYER_A = "Audio_Player23", METER_A = 1,
-     PLAYER_B = "Audio_Player24", METER_B = 2,
-     METER = "PlayerMeter",
-     MIXER = "RadioOut", MIX_A = 1, MIX_B = 2, -- mixer inputs muted while a deck analyzes
      SERVER_URL = "http://<server-ip>:5410",   -- from install.sh
      SERVER_TOKEN = "<token>",                 -- RADIO_API_TOKEN from .env
-     STATION_ID = "Main",                      -- unique per Core; "" = the design name
      AUTOSTART = true,
+     CORE_ID = "",                             -- "" = the design name; names this Core to the server
+     STATIONS = {                              -- id: never "", unique on the server (every Core)
+       { id = "Main", players = { "Audio_Player23", "Audio_Player24" }, meter = "PlayerMeter", meters = { 1, 2 },
+         mixer = "RadioOut", mix = { 1, 2 } },  -- mixer inputs muted while a deck analyzes; "" = no analysis
+       { id = "Lobby", players = { "Lobby_A", "Lobby_B" }, meter = "PlayerMeter", meters = { 3, 4 },
+         mixer = "LobbyOut", mix = { 1, 2 } },
+     },
    }
    ```
-6. **Run.** Use File → Save to Core & Run. The script scans the folders and
-   starts the first track on Player 1. With `AUTOSTART = false` it waits for
-   Start on the dashboard.
+6. **Run.** Use File → Save to Core & Run. The script scans each station's
+   folders and starts its first track on its Player 1. With
+   `AUTOSTART = false` every station waits for Start on the dashboard. A new
+   station plays radio.lua's fallback folders until you set its own on the
+   Settings page (choose it in the header first).
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 1.6.0 starting on Core 8 Flex (<design name>)
-   16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
+   16:00:01 radio 2.0.0 starting on Core 8 Flex (<design name>)
+   16:00:01 Main: library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
+   16:00:01 Lobby: library: 19 music in media/Audio/Test/Tuning/, …
    ```
-   There should be no `! server: sync failed` lines. Every event prints one
-   line, and a heartbeat prints every 30 s.
+   There should be no `! server: sync failed` and no `station_fault`
+   lines. Every event prints one line with its station, and one heartbeat
+   for the whole Core prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 1.6.0`, and under On air "No Core has
-   connected yet" becomes the playing track (artist – title). The journal
-   shows `INFO BOOT station=Main ...` and then `PLAY` lines:
+   becomes `· Main on <design name> · radio.lua 2.0.0`, and under On air "No
+   Core has connected yet" becomes the playing track (artist – title). The
+   header's drop-down lists every station. The journal shows
+   `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
    sudo journalctl -u qsysradio -f
    ```
@@ -658,7 +793,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (11 in 1.6.0).
+The last line prints the number of tables (12 in 2.0.0).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -670,8 +805,8 @@ The last line prints the number of tables (11 in 1.6.0).
   private.
 - What the script learns about each file is in the database (`media_files`,
   one row per file shared by every station; `library` lists each station's files).
-  The Core's `media/_radio/` only holds the last settings and, during an
-  outage, undelivered events.
+  The Core's `media/_radio/` only holds every station's last settings and,
+  during an outage, undelivered events.
 
 ### 12. Update
 
@@ -701,7 +836,18 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 1.5.0, server is 1.6.0`.
+  `station=Main runs radio.lua 1.6.0, server is 2.0.0`.
+- **From 1.x to 2.0.0** (one script for every station): update the server
+  first, as above; it keeps serving the 1.x Core, which plays on. Then paste
+  the new radio.lua into the **same** Text Controller and move the old
+  `CFG` into `CFG.STATIONS[1]` with the same id, so the station's history,
+  settings and library carry on: the old `STATION_ID`, or, if it was `""`,
+  the design name (the name in the panel's station drop-down).
+  `PLAYER_A` / `PLAYER_B` → `players = { A, B }`, `METER` → `meter`,
+  `METER_A` / `METER_B` → `meters = { A, B }`, `MIXER` → `mixer`,
+  `MIX_A` / `MIX_B` → `mix = { A, B }`; `SERVER_URL`, `SERVER_TOKEN` and
+  `AUTOSTART` stay. The Core's settings file and unsent events become the
+  first station's by themselves. One restart: a short gap on air.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -729,8 +875,10 @@ code does not know (code rolled back?)…`, and health shows `"ok":false` with
 If the old code does not work with the newer schema, restore the backup
 taken before the update. 1.5.0 and older never run on the schema of 1.6.0 or
 later (migration 0015 moved each file's figures from `library` to
-`media_files`): going back to 1.5.0 or older always needs that backup. Stop
-the service first:
+`media_files`): going back to 1.5.0 or older always needs that backup.
+1.6.0 runs on the 2.0.0 schema (migration 0016 only adds), but only with
+the 1.6.0 radio.lua and its old `CFG` on the Core: a 2.0.0 Core needs a
+2.0.0 server. Stop the service first:
 
 ```
 sudo systemctl stop qsysradio
@@ -819,15 +967,25 @@ sudo journalctl -u qsysradio --since "1 hour ago" --no-pager | tail -n 50
 
 | You see | Fix |
 |---|---|
-| `meter component 'PlayerMeter' not found`, `Deck A: component 'Audio_Player23' not found` | The Code Name differs from `CFG` (step 10) |
-| `Deck A: 'Audio_Player23' has no control 'gain' (Script Access on?)` | Script Access is `None`, or the Code Name differs from `CFG` (step 10) |
-| `meter 'PlayerMeter' has no control peak.1` (or `peak.2`) | The meter's Script Access is `None`, or it has fewer than 2 channels (step 10) |
-| `! meter 'PlayerMeter' has no control rms.1: average levels are not measured` | The meter has no RMS reading: use a True Peak/RMS meter (step 10). The station plays on; files are not measured, so level matching only uses levels measured before |
-| `! mixer 'RadioOut' with input.1/2.mute.1 not found: file analysis is off` | The mixer's Code Name differs from `CFG.MIXER`, its Script Access is `None`, or the players are on other inputs (`MIX_A` / `MIX_B`). The station plays on; only file analysis is off |
-| `library: cannot list media/Audio/Test/Tuning/` | That folder is not on the Core: upload it, or change the station's Music folder on the Settings page |
+| `station_fault  Main player 'Audio_Player23' not found` (or `meter 'PlayerMeter' not found`); a red **Station fault** banner on the Dashboard, the header pill `fault · Main`, `(fault)` in the station drop-down, journal `WARNING STATION_FAULT station=Main error=…` | The Code Name differs from the station's `CFG.STATIONS` entry (step 10). Only that station is stopped; the script builds it again by itself (after 30 s, then 1, 2, 4 min, then every 5 min) and it plays as soon as the component is there |
+| `station_fault  Main player 'Audio_Player23' has no control 'gain' (Script Access on?)` | Script Access is `None`, or the Code Name names another kind of component (step 10) |
+| `station_fault  Main meter 'PlayerMeter' has no control peak.3` | The meter's Script Access is `None`, or it has fewer channels than `meters` names (step 10) |
+| `station_fault  Lobby player 'Audio_Player23' is station Main's` | Two stations name the same player: each player belongs to one station |
+| `station_fault  Lobby players must name two Audio Players` | The entry's `players` must list two different players |
+| `station_fault  Main tick: …`, after `! Main: tick failed: …` lines | A script error in that station 5 times in a row. It is stopped and built again; the other stations play on. Send the Debug Output lines with the error to whoever maintains the script |
+| `! CFG.STATIONS[2] has no id: skipped`, `! CFG.STATIONS[2]: the id 'Main' is taken: skipped` | Every entry needs an `id` of its own (step 10) |
+| `! Main: meter 'PlayerMeter' has no control rms.1: average levels are not measured` | The meter has no RMS reading: use a True Peak/RMS meter (step 10). The station plays on; files are not measured, so level matching only uses levels measured before |
+| `! Main: mixer 'RadioOut' with input.1/2.mute.1 not found: file analysis is off` | The mixer's Code Name differs from the station's `mixer`, its Script Access is `None`, or the players are on other inputs (`mix`). The station plays on; only file analysis is off |
+| `Main: library: cannot list media/Audio/Test/Tuning/` | That folder is not on the Core: upload it, or change the station's Music folder on the Settings page |
 | `! server: sync failed (403 ); N events queued`; journal: `/api/v1/core/sync: rejected request from <core-ip> (bad or missing X-Radio-Token)` | `CFG.SERVER_TOKEN` differs from `RADIO_API_TOKEN` (`grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`): paste it and run again |
 | Journal: `/api/v1/core/sync: refused, RADIO_API_TOKEN is not set in .env` | Re-run `sudo ./install.sh` (it generates one), then put it in `CFG.SERVER_TOKEN` |
-| `! server: sync failed (…)` with no 403 and nothing in the journal | The Core cannot reach the server: check `SERVER_URL`, the Core's routing and the firewall (steps 6, 10). It keeps playing and queues up to 5000 events until it can |
+| `! server: sync failed (…)` with no 403 and nothing in the journal | The Core cannot reach the server: check `SERVER_URL`, the Core's routing and the firewall (steps 6, 10). Every station keeps playing, and the Core queues up to 10,000 events for all of them until it can |
+| `! server: sync failed (400 )` right after pasting radio.lua 2.0.0 | The server is older than 2.0.0: update it (step 12); the stations play on meanwhile |
+| `! server: Main: <error>; its events are sent again`; journal: `station=Main sync failed, rolled back (the other stations go on): …` | The server could not take that station's part of the sync (the journal says why). Only that station waits; its events are kept (in `outbox.json` too, so a restart loses none) and sent again |
+| "Another station was saving the same files at that moment, so nothing was changed. Try again."; journal: `POST /api/v1/library/forget cancelled by the database, nothing changed (409): deadlock detected` | Another station that has the same files was saving their figures at that moment, and PostgreSQL cancelled your change to avoid a deadlock. Nothing was changed: do it again |
+| `! server: Main library part 3 of 3 not taken (409); the whole list again in 10 s`; journal: `WARNING LIBRARY library scan … part(s) … not received; send the whole scan again` | A part of the station's file list was lost on the way. Nothing to do: the Core sends the whole list again, and the library is not shrunk meanwhile |
+| Journal: `station=Main outbox overflowed: N event(s) lost on the Core` | A long outage filled the Core's outbox (10,000 events); the oldest of that station's events were lost |
+| Journal: `WARNING core=<id> Lua memory 48.0 MB at its lowest in 10 min, was 1.2 MB after start: possible leak` | The script's Lua memory keeps growing: a whole 10 minutes never went below twice the lowest since start-up (the lowest 10-minute low after the first 10 min) and 32 MB. Garbage piling up between collections does not count, only memory that stays. At most once an hour. The stations play on; send the heartbeat lines (`heartbeat: Lua … KB`) to whoever maintains the script. Pasting the script again (a restart) frees it |
 | Journal: `station=Main runs radio.lua X, server is Y` | Paste radio.lua from this checkout onto the Core |
 
 ### Database access
@@ -964,21 +1122,30 @@ QSYSRADIO_ENV_FILE=/path/to/test.env venv/bin/python -m pytest tests/
 
 The suite uses its own throw-away schemas (`qsr_test`, `qsr_test_shared`) in
 the database the test .env points at (the PG user needs CREATE on it). It
-covers the Core API, commands, sign-in and permissions, settings, the play
-log, per-file figures shared between stations (including two stations
-uploading at once), the data migrations (each in a scratch schema), and
-failure handling. `requirements-dev.txt` also brings `lupa` for the
+covers the Core API (the batched sync of many stations, one station's
+failure kept to itself, the library in parts, the 1.x Core's requests, the
+cached ads plan, the memory warning (garbage sawing up and down never
+warns), every web write taking the station's lock first, a 14-station sync
+timed), commands,
+sign-in and permissions, settings, the play log, per-file figures shared
+between stations (including two stations uploading at once), the data
+migrations (each in a scratch schema), failure handling, and radio.lua
+itself (MockCore) against the server: one station, and three on one Core. `requirements-dev.txt` also brings `lupa` for the
 MockCore scenarios and `live_core.py`.
 
 ## Web control panel
 
-- **Header and nav rail (every page):** the station's state, file analysis
+- **Header and nav rail (every page):** the station's state (`fault ·
+  Main` when the Core had to stop it), file analysis
   progress while a run is on (click: the Music page), the server clock and
   your account menu (role, Sign out). The tabs carry each library's count;
   the rail stays at the top while the page scrolls and shows what is on air
   with its countdown (not on the Dashboard, which shows it larger), with the
   song's progress as a red line along its bottom edge.
-- **Dashboard:** on-air countdown, up next (a break when an ad slot opens or a
+- **Dashboard:** a red **Station fault** banner when the Core had to stop the
+  station (why, and when it tries again; transport is off meanwhile, the
+  other stations on the Core play on); next to Transport the station, its
+  Core and its radio.lua version; on-air countdown, up next (a break when an ad slot opens or a
   bumper is due before the song ends; else the queue or the server's pick),
   **Coming up**: the next 10 songs / ads / bumpers with estimated start times
   (server time; rebuilt every poll, the Core still decides at each song
@@ -1081,9 +1248,10 @@ in elsewhere. Signing out signs out of every app that shares the cookie
 crossfade two rows overlap. Every raw event is kept in
 `qsysradio.core_events`.
 
-Events carry a boot id + sequence number and wait in an outbox on the Core
-(`media/_radio/outbox.json`, up to 5000) until the server has them, so an
-outage or a script restart loses nothing; repeats are ignored.
+Events carry their station, a boot id + sequence number and wait in an
+outbox on the Core (`media/_radio/outbox.json`, up to 10,000 for all the
+Core's stations) until the server has them, so an outage or a script
+restart loses nothing; repeats are ignored.
 
 The web panel's Play log page shows it. To query it with SQL, open a session
 from the app server (it asks for the `qsysradio` password; the placeholders
@@ -1166,10 +1334,13 @@ when the server is unreachable.
 The Core measures each file's quiet start, quiet end and average level on
 the deck that is off air, instead of (or before) learning them from plays:
 
-- **Off air.** The deck's RadioOut input (`input.N.mute.1`) is muted before
+- **Off air.** The deck's input on the station's mixer (`mixer`, input
+  `mix[N]` in its `CFG.STATIONS` entry: `input.N.mute.1`) is muted before
   the file loads, and the player plays at full level into its meter (the
   meter is before the mixer). Every on-air play unmutes its deck first; a
-  restart of the script unmutes both.
+  restart of the script unmutes both. A station without a `mixer` does no
+  file analysis (the library pages say so) and learns its figures from
+  plays only.
 - **When.** While the station plays: on the deck that is not live, only
   while the song on air has more than 50 s left and no skip or break is
   asked for. Anything the station needs the deck for (crossfade, skip,
@@ -1204,7 +1375,9 @@ the deck that is off air, instead of (or before) learning them from plays:
 - **Daily.** Settings → Silence detection → "Analyze new files daily at"
   (default 04:00, server time; off) starts a run for files never analyzed.
   The library pages show progress and have **Analyze now** (files not
-  analyzed yet), **Re-analyze all** and **Stop**.
+  analyzed yet), **Re-analyze all** and **Stop**; while the station is
+  faulted they say so instead (analysis goes on once the Core has built it
+  again).
 - **One file.** Every row has an Analyze button (the bars icon; operators),
   also in the file's quiet start / end editor. It analyzes just that file
   (`library.analyze_wanted`) without starting a run, first in line; its
@@ -1322,6 +1495,7 @@ complete record.
 | 1.4.0 | Panel refresh: nav rail with what is on air on every page, smoothed deck meters, pressed / sent / done transport keys, Settings in boxes, pages that reload themselves |
 | 1.5.0 | Settings by station: All stations, each station's own on top; folders per station |
 | 1.6.0 | Each file's figures shared by every station (by name and size): moved files keep them |
+| 2.0.0 | One radio.lua runs every station on the Core: faults isolated per station, bounded memory, one batched sync a second, the library in parts |
 | Next | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
 | Later | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
 

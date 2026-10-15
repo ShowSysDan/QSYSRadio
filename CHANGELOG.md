@@ -5,6 +5,173 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [2.0.0] - 2026-10-15
+
+### Changed (breaking)
+- **One radio.lua runs every station on the Core.** `CFG.STATIONS` lists
+  them, each with two Audio Players, a meter (peak + rms per player) and,
+  for file analysis, the players' mixer:
+  ```lua
+  CFG = {
+    SERVER_URL = "", SERVER_TOKEN = "", AUTOSTART = true,
+    CORE_ID = "",            -- "" = the design name; names this Core to the server
+    STATIONS = {
+      { id = "Main", players = { "Audio_Player23", "Audio_Player24" }, meter = "PlayerMeter", meters = { 1, 2 },
+        mixer = "RadioOut", mix = { 1, 2 } },      -- mixer = "" (or absent): no file analysis for this station
+    },
+  }
+  ```
+  Each station has its own decks, library, settings (a copy of `SETTINGS`,
+  replaced by the server's values for that station), queue, shuffle, ad
+  plan, file analysis and command ack, and behaves exactly as a 1.6.0
+  station did. The Core has one each of the `Tick`, `Fast`, `Sync` and
+  `Chores` timers for all of them: still one 250 ms timer and one sync
+  request a second, whatever the number of stations. Stations listing the
+  same folder share its track records (not the lists). Station ids must be
+  unique and not empty: an entry without an id, or with an id already used,
+  is skipped (logged); a player that another station already uses faults
+  the later station.
+- **Core ↔ server protocol 2.** One sync request a second carries every
+  station: `{version, boot, core, mem_kb, stations: [{station, ack,
+  settings_rev, ads_rev, analyze_rev (with a mixer), meters, state (when it
+  changed, or every 10 s), events, dropped (when > 0)}]}`; the reply is
+  `{stations: {<id>: {commands, settings, settings_rev, ads, ads_rev,
+  analyze, analyze_rev, ack_reset, accepted, duplicates, rejected} |
+  {error}}}`, every field meaning what it meant in 1.6.0. A station
+  answered with `{error}` (or not answered) keeps its events for the next
+  request, in `outbox.json` too (as in an outage, so a script restart
+  meanwhile loses none); the others are unaffected. At most 100 events go per request,
+  shared fairly between the stations. Every event also names its station.
+- **The library goes up in parts.** After a scan the Core sends a station's
+  files in parts of at most 1,000 (`{station, boot, scan, part, parts,
+  music_dir, imaging_dir, ads_dir, items}`), one upload at a time for the
+  whole Core, the stations taking turns. Parts before the last are answered
+  `{ok, scan, part, parts}`, the last `{ok, items, learned}` as before. The
+  server stages each scan (`library.scan`, `stations.scan` / `scan_parts`):
+  files from any part are in the library at once, but only the last part,
+  with every part of that scan in, marks the files not in it gone, so an
+  interrupted or partial upload never shrinks a library. A last part
+  without the others gets 409 (journal: `LIBRARY library scan … not
+  received; send the whole scan again`) and the Core sends the whole scan
+  again, with a new scan id, after a back-off (10 s, doubling to 2 min).
+- **The server accepts the 1.6.0 Core** (one station, the old body and the
+  whole library in one upload, answered as before) for this one version, so
+  it can be upgraded first. A 2.0.0 Core needs a 2.0.0 server: against
+  1.6.0 it keeps playing on its own and logs `! server: sync failed (400 )`.
+
+### Added
+- **A station that fails is faulted on its own.** Each station's tick, each
+  deck's `playing` handler, each fade or load step, each command and each
+  station's part of a sync reply run in their own pcall. A station whose
+  tick fails 5 times in a row, or that cannot be built (a missing player,
+  meter or control, no Script Access, a bad `CFG` entry), is faulted: its
+  decks stop (the song on air is logged as ended, reason `fault`), a
+  `station_fault` event says why (journal: `WARNING STATION_FAULT
+  station=… error=… retry_s=…`), and it is built again from its `CFG` entry
+  after 30 s, then 1, 2, 4 and every 5 min, back to 30 s after 10 min of
+  healthy running. It keeps its settings, command ack and whether it was on
+  air; a command sent to it meanwhile is answered "station fault: …". It
+  still syncs, so the panel shows it. The other stations never notice.
+- **Fault on the panel.** A red banner on the Dashboard with the reason and
+  the next try; the header pill reads `fault · <station>`, the station
+  drop-down `(fault)`, and the transport keys are off for that station.
+  The library pages' file analysis line names the fault, not the `mixer`
+  hint (a faulted station's state still says whether its `CFG` entry names
+  a mixer). `/api/v1/now` gives each station's `fault` and `core`.
+- **Bounded memory on the Core.** One outbox for every station, at most
+  10,000 events (1.6.0: 5,000 for its one station), the oldest dropped and
+  counted per station (each station reports its own losses once, as
+  `dropped`); event ring 500, history 50, queue 100, files to analyze 5,000.
+  A station keeps per-file figures only for the files its latest scan listed
+  (1.6.0 kept one entry for every file it had played, analyzed or been told
+  about since boot, through every folder change); a library reply that
+  arrives after the station scanned again is not used (the new scan's upload
+  brings the figures). The 250 ms and 50 ms timers allocate nothing (1.6.0
+  allocated about 280 KB per 2,000 ticks). `outbox.json` is written at most
+  every 2 min while it holds more than 2,000 events.
+- **Lua memory, reported and watched.** The Core sends its Lua memory
+  (`collectgarbage("count")`, `mem_kb`) with every sync and prints it in its
+  heartbeat, now one line every 30 s for the whole Core:
+  `heartbeat: Lua 840 KB, outbox 0 | Main: playing <file> | Lobby: FAULT (…)`.
+  The server keeps each Core in a new table `cores` (boot, version, last
+  contact, memory; migration 0016). One sample includes garbage not yet
+  collected (it saws up and down), so the server keeps the lowest sample
+  of each 10-minute window: the lowest window low from 10 minutes after a
+  boot is the settled low, and when a whole window's low stays above twice
+  that and 32 MB it logs one warning an hour: `core=<id> Lua memory <n> MB
+  at its lowest in 10 min, was <m> MB after start: possible leak`. A new
+  boot starts over.
+- **Cores have names.** `CFG.CORE_ID` (default: the design name) names the
+  Core to the server; `stations.core` keeps the Core each station was last
+  seen on, and the Dashboard shows `· Main on <core> · radio.lua 2.0.0`.
+- **MockCore 0.4.0** runs any number of players, meters and mixers by name
+  and has a fake 2.x server; new `scenario_multi.lua` (three to five
+  stations: faults and rebuilds, a long outage, a 3,000-file library in
+  parts with a 409, folder changes with per-file figures kept only for the
+  files listed, four hours of play with flat memory, the 1.x upgrade).
+  `live_core.py --stations N --core NAME` runs several stations against a
+  real server.
+
+### Changed
+- **Each station is its own transaction on the server.** A batched sync
+  uses one pooled connection; each station's part runs under its own
+  station lock and is committed before the next. Every web change to a
+  station (commands, holds, ID marks, ad rules, settings, analysis, quiet
+  start / end, Forget measured) takes that lock first, before it touches
+  any row (`db.lock_station`; All stations settings: every station's, in
+  name order), so none can deadlock with that station's sync. A file's
+  figures are shared by every station that has it, so a change to many
+  files at once (Forget measured for a whole kind) can rarely meet another
+  station's sync on the same files; PostgreSQL then cancels one of the two:
+  that sync part is answered `{error}` (sent again), the web change answers
+  409 "Another station was saving the same files at that moment, so nothing
+  was changed. Try again." (journal: `POST /api/v1/library/forget cancelled
+  by the database, nothing changed (409): deadlock detected`), never a
+  server error. A part that fails (bad data, a database error) is rolled
+  back alone and answered `{error}`; the journal says `station=X sync
+  failed, rolled back (the other stations go on): …` at most once a minute.
+  The database itself gone answers 503 for the whole request, and the Core
+  backs off as before.
+- **The ads plan is cached per station** (`stations.plan`, `plan_rev`,
+  `plan_at`, `plan_until`): made again when the station's events come in,
+  when anything it is made from changes (ad rules, holds, IDs, settings of
+  the station or All stations, a complete library scan, any command: one
+  helper, `ads.stale`), when it changes by the clock alone (an ad or ID slot
+  opens, a slot's window closes, a hold ends, the hour turns) or after
+  30 s; not on every sync of every station. A batched sync of 14 stations
+  with 3,000 files each takes about 0.05 s (0.2 s when every plan is made
+  again).
+- **Event log lines and `core_events.data`** name the station of the sync
+  part that carried the event, once (the event's own `station` field is
+  not stored).
+- **Core log lines** start with the station's id (`Main: library: …`,
+  `! Main: load failed on deck A: …`).
+- **File analysis needs the station's own mixer.** When it is off, the
+  library pages now say to set `mixer` and `mix` in that station's
+  `CFG.STATIONS` entry (was `CFG.MIXER`); the "Analyze new files daily at"
+  help names the station's mixer instead of RadioOut.
+
+Redeploy **both**, in this order:
+1. Back up (README, Installation step 11).
+2. **The server first:** `git pull && sudo systemctl restart qsysradio`
+   (runs migration 0016: the `cores` table and new columns; reload open
+   panel pages). The 1.6.0 Core plays on as before; the journal logs
+   `station=Main runs radio.lua 1.6.0, server is 2.0.0` until step 3.
+3. **Then the Core:** paste the new radio.lua into the **same** Text
+   Controller and copy the old `CFG` into `CFG.STATIONS[1]`, with the same
+   id so the station's history, settings and library carry on: the old
+   `STATION_ID`, or, if it was `""`, the design name (the name in the
+   panel's station drop-down). `PLAYER_A` / `PLAYER_B` become
+   `players = { A, B }`, `METER` `meter`, `METER_A` / `METER_B`
+   `meters = { A, B }`, `MIXER` `mixer`, `MIX_A` / `MIX_B` `mix = { A, B }`;
+   `SERVER_URL`, `SERVER_TOKEN` and `AUTOSTART` stay where they are.
+   `settings.json` and any unsent events on the Core become the first
+   station's by themselves. One restart, so a short gap on air, as with any
+   paste.
+
+Going back: the 1.6.0 server runs on the new schema (migration 0016 only
+adds), and needs the 1.6.0 radio.lua with the old `CFG` on the Core.
+
 ## [1.6.0] - 2026-10-15
 
 ### Changed

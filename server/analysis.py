@@ -1,6 +1,7 @@
 """File analysis: the Core measures each file's quiet start and end on the
-deck that is off air (its RadioOut input muted; the meter is before the
-mixer): the first seconds, then the last 15. The server keeps the job: which
+deck that is off air (its input on the station's mixer muted: `mixer` / `mix`
+in its CFG.STATIONS entry; the meter is before the mixer): the first
+seconds, then the last 15. The server keeps the job: which
 files are owed, the daily run (setting analyze_at), progress. Every sync
 reply carries the next few owed files when that list changes (`analyze`,
 `analyze_rev`); the Core reports each result as an `analysis` event, which
@@ -17,7 +18,7 @@ that has it (media.py).
 import hashlib
 import json
 
-from . import core_settings, media
+from . import core_settings, db, media
 from .db import iso
 from .events import BadRequest
 
@@ -96,6 +97,7 @@ def start(conn, station, scope, key, user):
     if not key and scope not in SCOPES:
         raise BadRequest('scope must be new, all or stop (or give a file key)')
     with conn.cursor() as cur:
+        db.lock_station(cur, station)
         if key:                        # just this file; its figures stay in use until the new ones come
             cur.execute(f"""UPDATE library SET analyze_wanted = TRUE
                             WHERE station = %s AND key = %s AND present AND {media.supported()}""", (station, key))

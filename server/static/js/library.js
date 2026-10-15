@@ -316,22 +316,24 @@
   // file analyzed (its figures, the queued / failed tags) reloads what is shown; and once a minute anyway
   // (another operator's changes, this hour's ad slots)
   let started = false, loadedAt = 0;
-  // file analysis: progress and the buttons to start / stop it
-  function analysisLine(a) {
+  // file analysis: progress and the buttons to start / stop it; fault: the station's, if the Core faulted it
+  function analysisLine(a, fault) {
     const el = $('lib-analysis');
     el.hidden = !a;
     if (!a) return;
     const btn = (scope, text, title) => R.canOperate ? '<button type="button" class="sm" data-scope="' + scope + '" title="' + title + '">' + text + '</button>' : '';
     const daily = a.at === 'off' ? 'no daily run' : 'daily at ' + esc(a.at);
-    R.setHTML(el, !a.can
-      ? '<span>File analysis needs the players\' mixer: set <b>CFG.MIXER</b> in radio.lua (the Core\'s Debug Output says why it is off).</span>'
-      : a.active
-        ? '<span><b>Analyzing</b> on the off-air deck, between songs: ' + R.num(a.left) + ' file' + (a.left === 1 ? '' : 's') + ' to go.</span>' +
-          btn('stop', 'Stop', 'Stop analyzing (what is done stays)')
-        : '<span><b>File analysis</b>: ' + (a.never ? R.num(a.never) + ' file' + (a.never === 1 ? '' : 's') + ' not analyzed yet' +
-          (a.failed ? ' (' + R.num(a.failed) + ' failed, tried again by the next run)' : '') : 'every file analyzed') +
-          ' · ' + daily + ' (Settings).</span>' + (a.never ? btn('new', 'Analyze now', 'Measure the files not analyzed yet, on the off-air deck') : '') +
-          btn('all', 'Re-analyze all', 'Measure every file again'));
+    R.setHTML(el, fault
+      ? '<span><b>Station fault</b>: ' + esc(fault) + '. File analysis goes on when the Core has built the station again (see the Dashboard).</span>'
+      : !a.can
+        ? '<span>File analysis needs the players\' mixer: set <b>mixer</b> and <b>mix</b> in this station\'s <b>CFG.STATIONS</b> entry in radio.lua (the Core\'s Debug Output says why it is off).</span>'
+        : a.active
+          ? '<span><b>Analyzing</b> on the off-air deck, between songs: ' + R.num(a.left) + ' file' + (a.left === 1 ? '' : 's') + ' to go.</span>' +
+            btn('stop', 'Stop', 'Stop analyzing (what is done stays)')
+          : '<span><b>File analysis</b>: ' + (a.never ? R.num(a.never) + ' file' + (a.never === 1 ? '' : 's') + ' not analyzed yet' +
+            (a.failed ? ' (' + R.num(a.failed) + ' failed, tried again by the next run)' : '') : 'every file analyzed') +
+            ' · ' + daily + ' (Settings).</span>' + (a.never ? btn('new', 'Analyze now', 'Measure the files not analyzed yet, on the off-air deck') : '') +
+            btn('all', 'Re-analyze all', 'Measure every file again'));
   }
   $('lib-analysis').addEventListener('click', async (e) => {
     const b = e.target.closest('button[data-scope]');
@@ -347,7 +349,7 @@
   R.status(3000, 1, (d) => {
     if (!started) { started = true; load(false); }
     const s = d && d.station;
-    analysisLine(s && s.analysis);
+    analysisLine(s && s.analysis, (R.core() || {}).fault);
     if (!s) return;
     const p = d.recent[0] || {}, a = s.analysis || {};
     const now = [s.library_at, p.id, p.ended_at, a.last, a.left].join('|');

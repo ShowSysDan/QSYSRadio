@@ -39,32 +39,33 @@ local function plan()
   return { due = due, mix = { "Ads/mix1.wav", "Ads/mix2.wav" }, next = fill, next_why = fill and "ad", ident = ident,
            no_bumpers = hold or nil }, "p" .. #due .. tostring(fill) .. tostring(ident) .. tostring(hold)
 end
-local fillSeen
-MockCore.at(FILL_FROM + 5, function() fillSeen = Station.snapshot(Timer.Now()).next_up end)
-MockCore.httpHandler = function(req)
-  local body = json.decode(req.Data)
-  if req.Url:match("/core/library$") then
-    libraryPosts[#libraryPosts + 1] = body
-    return 200, json.encode({ ok = true, learned = { ["Test/Tuning/A - Song1.flac"] = { trail = 0.4 } } })
-  end
-  for _, e in ipairs(body.events or {}) do
-    if e.kind == "ad_start" and e.dir .. e.file == HOURLY then hourlyPlays = hourlyPlays + 1 end
-    if e.kind == "bumper_start" and e.at >= IDENT_FROM then identPlays = identPlays + 1 end
-  end
-  revsSeen[body.ads_rev or "?"] = true
-  local p, rev = plan()
-  local resp = { commands = {} }
-  if body.ads_rev ~= rev then resp.ads, resp.ads_rev = p, rev end
-  if MockCore.clock >= 330 and MockCore.clock < 331 then resp.commands = { { id = 1, cmd = "ad_now", args = {} } } end
-  if MockCore.clock >= 445 and MockCore.clock < 446 then
-    resp.commands = { { id = 2, cmd = "play_now", args = { key = "Ads/mix2.wav" } } }
-  end
-  return 200, json.encode(resp)
-end
+local fillSeen, S
+MockCore.at(FILL_FROM + 5, function() fillSeen = S:snapshot(Timer.Now()).next_up end)
+MockCore.serve{
+  library = function(station, items, body)
+    libraryPosts[#libraryPosts + 1] = { items = items, ads_dir = body.ads_dir }
+    return { ["Test/Tuning/A - Song1.flac"] = { trail = 0.4 } }
+  end,
+  sync = function(part)
+    for _, e in ipairs(part.events or {}) do
+      if e.kind == "ad_start" and e.dir .. e.file == HOURLY then hourlyPlays = hourlyPlays + 1 end
+      if e.kind == "bumper_start" and e.at >= IDENT_FROM then identPlays = identPlays + 1 end
+    end
+    revsSeen[part.ads_rev or "?"] = true
+    local p, rev = plan()
+    local resp = { commands = {} }
+    if part.ads_rev ~= rev then resp.ads, resp.ads_rev = p, rev end
+    if MockCore.clock >= 330 and MockCore.clock < 331 then resp.commands = { { id = 1, cmd = "ad_now", args = {} } } end
+    if MockCore.clock >= 445 and MockCore.clock < 446 then
+      resp.commands = { { id = 2, cmd = "play_now", args = { key = "Ads/mix2.wav" } } }
+    end
+    return resp
+  end,
+}
 
-dofile("qsys/radio/radio.lua")
-CFG.SERVER_URL = "http://radio-server:5410"
-Server.applySettings({ ads_dir = "Ads", ad_every_n_tracks = 3, ads_per_break = 2, bumper_every_n_tracks = 6 }, "r1")
+MockCore.loadRadio{ SERVER_URL = "http://radio-server:5410" }
+S = Radio.stations[1]
+S:applySettings({ ads_dir = "Ads", ad_every_n_tracks = 3, ads_per_break = 2, bumper_every_n_tracks = 6 }, "r1")
 MockCore.run(620)
 
 local fails = 0
@@ -86,7 +87,7 @@ local lib = libraryPosts[#libraryPosts]
 local adItems = 0
 for _, it in ipairs(lib and lib.items or {}) do if it.kind == "ad" then adItems = adItems + 1 end end
 check(lib and lib.ads_dir == "Ads/" and adItems == 4, "library upload carries the ads folder and 4 ads")
-check(LEARNED["Test/Tuning/A - Song1.flac"] and LEARNED["Test/Tuning/A - Song1.flac"].trail <= 0.4,
+check(S.learned["Test/Tuning/A - Song1.flac"] and S.learned["Test/Tuning/A - Song1.flac"].trail <= 0.4,
   "per-file figures from the server's reply are used")
 
 local offPlayed, overlap = false, false
@@ -148,7 +149,7 @@ check(id and #idStarts == 1 and id.e.file == "id.wav" and seq[id.i - 1].k == "S"
 
 local paired = #ads == #adEnds or #ads == #adEnds + 1
 check(paired, string.format("every ad start has an end (%d/%d)", #ads, #adEnds))
-check(Station.snapshot(Timer.Now()).library.ad == 4, "state reports the number of ads")
+check(S:snapshot(Timer.Now()).library.ad == 4, "state reports the number of ads")
 
 print("")
 print(fails == 0 and "ALL CHECKS PASSED" or (fails .. " CHECK(S) FAILED"))

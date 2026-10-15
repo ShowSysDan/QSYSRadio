@@ -8,10 +8,12 @@ so they never touch the real qsysradio or shared schemas. Skipped when no
 database is configured.
 """
 import json
+import logging
 import math
 import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -211,6 +213,109 @@ def test_commands_never_skipped_by_commit_order(app):
     assert [c['id'] for c in sync(app, station='S6', ack=0).json['commands']] == [held, later]
 
 
+# every web write to a station's rows: (who, path, body)
+WRITERS = {
+    'command': ('operator', '/api/v1/control', {'cmd': 'skip'}),
+    'hold': ('operator', '/api/v1/hold', {'what': 'ads', 'until': None}),
+    'ident': ('operator', '/api/v1/library/ident', {'key': 'I/id.wav', 'ident': True}),
+    'ad_rule': ('operator', '/api/v1/ads', {'key': 'Ads/a.wav', 'mode': 'hourly', 'per_hour': 2}),
+    'station_settings': ('admin', '/api/v1/settings', {'settings': {'crossfade_s': 6}, 'scope': 'station'}),
+    'all_settings': ('admin', '/api/v1/settings', {'settings': {'crossfade_s': 6}}),
+    'analysis_stop': ('operator', '/api/v1/analyze', {'scope': 'stop'}),
+    'analyze_file': ('operator', '/api/v1/analyze', {'key': 'M/a.mp3'}),
+    'trim': ('operator', '/api/v1/library/trim', {'key': 'M/a.mp3', 'lead': 1.0, 'trail': None}),
+    'forget': ('operator', '/api/v1/library/forget', {'kind': 'music'}),
+}
+
+
+def lock_waits(thread, timeout=5):
+    """What the other backends wait for (pg_stat_activity), as soon as one waits for a lock (or the thread is done)."""
+    end = time.monotonic() + timeout
+    while True:
+        got = [r[0] for r in sql("""SELECT wait_event FROM pg_stat_activity WHERE wait_event_type = 'Lock'
+                                    AND pid <> pg_backend_pid() AND datname = current_database()""", fetch=True)]
+        if got or not thread.is_alive() or time.monotonic() > end:
+            return got
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize('writer', list(WRITERS))
+def test_web_writes_take_the_station_lock_first(app, writer):
+    """Every web write to a station's rows takes the station's lock before it touches any row. The Core's sync
+    holds the lock, then the station's stations row, then its library and figures rows (its events): a write
+    that locked them the other way round (set_ident did: library, then stations) deadlocked with it."""
+    st = f'LK{list(WRITERS).index(writer)}'
+    items = [{'key': 'I/id.wav', 'dir': 'I/', 'file': 'id.wav', 'kind': 'imaging'},
+             {'key': 'Ads/a.wav', 'dir': 'Ads/', 'file': 'a.wav', 'kind': 'ad'},
+             {'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music'}]
+    assert library_post(app, st, items, ads_dir='Ads/').status_code == 200
+    sync(app, station=st, state=STATE, analyze_rev='')
+    sql("""UPDATE qsr_test.media_files SET lead_in_s = 1.5 WHERE id IN (SELECT file_id FROM qsr_test.library WHERE station = %s);
+           UPDATE qsr_test.library SET analyze_wanted = TRUE WHERE station = %s""", (st, st))
+    who, path, body = WRITERS[writer]
+    client, out = signed_in(app, who), {}
+    core = db.connect()                       # the Core's sync of the station, held open
+    try:
+        with core.cursor() as cur:
+            cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (f'qsysradio:station:{st}',))
+            cur.execute('UPDATE stations SET last_seen = NOW() WHERE station = %s', (st,))
+        t = threading.Thread(target=lambda: out.update(r=client.post(path, json=dict(body, station=st), headers=WEB)))
+        t.start()
+        assert lock_waits(t) == ['advisory']   # the write waits for the station's lock ...
+        with core.cursor() as cur:             # ... having locked none of its rows: the sync's own writes go on
+            cur.execute("SET LOCAL lock_timeout = '3s'")
+            cur.execute('UPDATE library SET last_played = NOW(), analyze_wanted = FALSE WHERE station = %s', (st,))
+            cur.execute('UPDATE media_files SET duration_s = 200 WHERE id IN (SELECT file_id FROM library WHERE station = %s)', (st,))
+            cur.execute('UPDATE stations SET plan_at = NOW() WHERE station = %s', (st,))
+        core.commit()
+        t.join(10)
+        assert not t.is_alive() and out['r'].status_code == 200, out['r'].get_data(as_text=True)
+    finally:
+        core.close()
+        if writer == 'all_settings':
+            signed_in(app, 'admin').post('/api/v1/settings', json={'settings': {'crossfade_s': None}}, headers=WEB)
+
+
+def test_a_change_to_shared_files_cancelled_by_a_deadlock_answers_409(app):
+    """A file's figures are shared by every station that has it, which the station lock does not cover: Forget
+    measured for a whole kind of station DA can meet station DB's sync writing the same files in the other order
+    (its events, one file after the other). PostgreSQL cancels one; when it is the web change, it answers 409
+    (nothing changed, try again), never a server error, and the next try goes through."""
+    items = [{'key': f'M/dl{i}.mp3', 'dir': 'M/', 'file': f'dl{i}.mp3', 'kind': 'music', 'size': 7000 + i} for i in (1, 2)]
+    for st in ('DA', 'DB'):
+        assert library_post(app, st, items).status_code == 200
+    ids = [r[0] for r in sql("SELECT file_id FROM qsr_test.library WHERE station = 'DA' ORDER BY key", fetch=True)]
+    assert ids == [r[0] for r in sql("SELECT file_id FROM qsr_test.library WHERE station = 'DB' ORDER BY key", fetch=True)]
+    op, out, codes = signed_in(app, 'operator'), {}, []
+    forget = lambda: out.update(r=op.post('/api/v1/library/forget', json={'station': 'DA', 'kind': 'music'}, headers=WEB))
+    for first, second in (ids, ids[::-1]) * 2:          # whichever file the Forget locks first, one round deadlocks
+        sql('UPDATE qsr_test.media_files SET lead_in_s = 1.5, trail_s = NULL WHERE id = ANY(%s)', (ids,))
+        core = db.connect()                             # DB's sync: its lock, then one file's figures ...
+        try:
+            with core.cursor() as cur:
+                cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('qsysradio:station:DB',))
+                cur.execute('UPDATE media_files SET trail_s = 2 WHERE id = %s', (first,))
+            t = threading.Thread(target=forget)
+            t.start()
+            assert lock_waits(t) == ['transactionid']   # the Forget waits for that file (holding the other, or not)
+            with core.cursor() as cur:                  # ... then the other's
+                cur.execute("SET LOCAL lock_timeout = '5s'")
+                cur.execute('UPDATE media_files SET trail_s = 2 WHERE id = %s', (second,))
+            core.commit()
+            t.join(10)
+        finally:
+            core.close()
+        codes.append(out['r'].status_code)
+        if codes[-1] != 200:
+            break
+    assert codes[-1] == 409 and set(codes[:-1]) <= {200}, codes
+    assert out['r'].json['error'].startswith('Another station was saving the same files')
+    rows = sql('SELECT lead_in_s, trail_s FROM qsr_test.media_files WHERE id = ANY(%s)', (ids,), fetch=True)
+    assert sorted(tuple(r) for r in rows) == [(1.5, 2.0), (1.5, 2.0)]    # the sync's writes kept, nothing forgotten
+    forget()
+    assert out['r'].status_code == 200 and out['r'].json['files'] == 2     # tried again: done
+
+
 def test_core_restart_does_not_rerun_commands(app):
     """No command state on the Core: a restarted Core asks from ack 0."""
     sync(app, station='S8', boot='B1', state=STATE)
@@ -358,6 +463,22 @@ def test_next_song_least_recently_played_and_ad_fit(app):
         conn.close()
 
 
+def radio_lua_for(station):
+    """radio.lua's source with its CFG pointed at this server (http://radio-server, token tok) and its
+    (first) station named `station`: the Core's own setup, nothing of its internals."""
+    import re
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'qsys', 'radio', 'radio.lua'), encoding='utf-8').read()
+    cfg = re.search(r'^CFG = \{.*?^\}', src, re.S | re.M)
+    block = cfg.group(0).replace('SERVER_URL = ""', 'SERVER_URL = "http://radio-server"', 1)
+    block = block.replace('SERVER_TOKEN = ""', 'SERVER_TOKEN = "tok"', 1)
+    if 'STATIONS' in block:          # 2.x: CFG.STATIONS[1].id
+        block = re.sub(r'\bid = "[^"]*"', f'id = "{station}"', block, count=1)
+    else:                            # 1.x: CFG.STATION_ID
+        block = block.replace('STATION_ID = ""', f'STATION_ID = "{station}"', 1)
+    assert 'radio-server' in block and 'tok' in block and f'"{station}"' in block, block
+    return src[:cfg.start()] + block + src[cfg.end():]
+
+
 def test_every_song_gets_played_end_to_end(app, tmp_path, monkeypatch):
     """radio.lua (MockCore) against this server, with a rescan every few songs
     (each one used to reset the Core's shuffle bag): every song airs."""
@@ -377,15 +498,82 @@ def test_every_song_gets_played_end_to_end(app, tmp_path, monkeypatch):
         r = client.post(req.Url.split('radio-server', 1)[1], data=req.Data,
                         headers=dict(req.Headers.items()), content_type='application/json')
         return r.status_code, r.get_data(as_text=True)
+
+    def rescan():                    # what the panel's Rescan does: a command the Core picks up on its sync
+        conn = db.connect()
+        try:
+            control.add_command(conn, 'E2E', 'rescan', {}, {'username': 'e2e'})
+        finally:
+            conn.close()
     L.globals().MockCore.httpHandler = handler
-    L.execute('dofile("qsys/radio/radio.lua")')
-    L.execute("""CFG.SERVER_URL, CFG.SERVER_TOKEN, CFG.STATION_ID = "http://radio-server", "tok", "E2E"
-                 Server.queue(EVENTS[#EVENTS]); Server.libraryDirty = true
-                 for t = 60, 1200, 75 do MockCore.at(t, function() Library.scan() end) end""")
+    src = radio_lua_for('E2E')
+    L.execute(src)
+    for t in range(60, 1201, 75):
+        L.eval('MockCore.at')(t, rescan)
     L.eval('MockCore.run')(1260)
     played = {r[0] for r in sql("SELECT DISTINCT file FROM qsr_test.play_log WHERE station = 'E2E'", fetch=True)}
     starts = sql("SELECT count(*) FROM qsr_test.play_log WHERE station = 'E2E'", fetch=True)[0][0]
     assert len(played) == 24, f'{24 - len(played)} of 24 songs never played in {starts} plays'
+    done = sql("SELECT count(*) FILTER (WHERE ok) FROM qsr_test.commands WHERE station = 'E2E' AND cmd = 'rescan'", fetch=True)[0][0]
+    assert done >= 10, f'only {done} of 16 rescans done'
+    if 'STATIONS' in src:            # 2.x: the batched sync (the Core named) and the library in parts (scan ids)
+        core, scan = sql("SELECT core, scan FROM qsr_test.stations WHERE station = 'E2E'", fetch=True)[0]
+        assert core and scan and not scan.startswith('whole-'), (core, scan)
+        assert sql('SELECT mem_kb > 0 FROM qsr_test.cores WHERE core = %s', (core,), fetch=True)[0][0]
+
+
+def test_three_stations_on_one_core_end_to_end(app, tmp_path, monkeypatch):
+    """radio.lua running three stations (MockCore) against this server: each plays its own folder with its own
+    settings, the library of 1,100 files arrives in parts, and the station whose player is missing is faulted
+    (the panel shows why) while the others play on."""
+    lupa = pytest.importorskip('lupa.lua53')
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    os.symlink(os.path.join(repo, 'qsys'), tmp_path / 'qsys')
+    monkeypatch.chdir(tmp_path)
+    client = app.test_client()
+    L = lupa.LuaRuntime(unpack_returned_tuples=True)
+    L.execute('dofile("qsys/test/mock_core.lua")')
+    if L.eval('MockCore.stations') is None:
+        pytest.skip('this MockCore has no multi-station wiring')
+    L.execute("""local wiring, cfg = MockCore.stations(3, { prefix = "ME" })
+                 cfg[3].players[2] = "Missing_Player"
+                 local dirs = { ["Test/Tuning/"] = {}, ["Test/Imaging/"] = {} }
+                 for s, n in ipairs({ 1100, 30, 30 }) do
+                   local songs = {}
+                   for i = 1, n do songs[i] = { name = string.format("ME%d Artist%d - Song%04d.mp3", s, i % 9, i),
+                                                duration = 20 + (i * 7) % 15, level = -10 } end
+                   dirs["Zone" .. s .. "/"] = songs
+                 end
+                 MockCore.setup{ seed = 5, players = wiring, dirs = dirs }
+                 ME_CFG = cfg""")
+
+    def handler(req):
+        r = client.post(req.Url.split('radio-server', 1)[1], data=req.Data,
+                        headers=dict(req.Headers.items()), content_type='application/json')
+        return r.status_code, r.get_data(as_text=True)
+    L.globals().MockCore.httpHandler = handler
+    admin = signed_in(app, 'admin')
+    for i in (1, 2, 3):                  # each station's folder and crossfade, set before its Core connects
+        sync(app, station=f'ME{i}', boot='before')
+        assert admin.post('/api/v1/settings', headers=WEB, json={'settings': {'music_dir': f'Zone{i}/', 'crossfade_s': 2 + i},
+                                                                 'scope': 'station', 'station': f'ME{i}'}).status_code == 200
+    L.execute("""MockCore.loadRadio(function(C) C.SERVER_URL, C.SERVER_TOKEN, C.CORE_ID, C.STATIONS = "http://radio-server", "tok",
+                                                  "E2ECORE", ME_CFG end)""")
+    L.eval('MockCore.run')(600)
+    plays = {st: [r[0] for r in sql("SELECT file FROM qsr_test.play_log WHERE station = %s AND boot <> 'before'", (st,), fetch=True)]
+             for st in ('ME1', 'ME2', 'ME3')}
+    assert len(plays['ME1']) >= 10 and len(plays['ME2']) >= 10 and plays['ME3'] == [], {k: len(v) for k, v in plays.items()}
+    assert all(f.startswith('ME1 ') for f in plays['ME1']) and all(f.startswith('ME2 ') for f in plays['ME2'])
+    rows = {r[0]: tuple(r[1:]) for r in sql("""SELECT station, core, state->'settings'->>'crossfade_s', state->>'fault', scan_parts
+                                        FROM qsr_test.stations WHERE station LIKE 'ME_'""", fetch=True)}
+    assert rows['ME1'][:3] == ('E2ECORE', '3', None) and rows['ME1'][3] == [1, 2]          # 1,100 files: two parts
+    assert rows['ME2'][:3] == ('E2ECORE', '4', None)
+    assert 'Missing_Player' in rows['ME3'][2]
+    assert sql("SELECT count(*) FROM qsr_test.library WHERE station = 'ME1' AND present", fetch=True)[0][0] == 1100
+    now = signed_in(app, 'viewer').get('/api/v1/now?station=ME3').json
+    assert 'Missing_Player' in now['station']['state']['fault'] and now['station']['online']
+    assert now['station']['analysis']['can'] is True        # its mixer is in its CFG entry: the fault is the reason, not the CFG
+    assert sql("SELECT mem_kb > 0 FROM qsr_test.cores WHERE core = 'E2ECORE'", fetch=True)[0][0]
 
 
 def test_coming_up_forecast(app):
@@ -856,6 +1044,352 @@ def test_ads_plan_rules_and_play_log(app):
     assert post('ad_now', key='Ads/m1.wav').status_code == 200 and post('ad_now').status_code == 200
     assert post('bumper_now', key='Ads/m1.wav').status_code == 400 and post('queue_add', key='Ads/m1.wav').status_code == 400
     assert post('play_now', key='Ads/m1.wav').status_code == 200
+
+
+# ── One Core, many stations (2.0): batched sync, library in parts ────────────
+
+def batch(app, *parts, core='CORE1', boot='B1', **body):
+    """A 2.x Core's sync: every station of the Core in one body."""
+    body.setdefault('version', config.version())
+    return app.test_client().post('/api/v1/core/sync', json=dict(core=core, boot=boot, stations=list(parts), **body),
+                                  headers=CORE)
+
+
+@contextmanager
+def logged():
+    """The app log lines ((level, message)) written meanwhile."""
+    class Catch(logging.Handler):
+        def emit(self, record):
+            lines.append((record.levelno, record.getMessage()))
+    lines, h, lg = [], Catch(logging.DEBUG), logging.getLogger('qsysradio')
+    lg.addHandler(h)
+    try:
+        yield lines
+    finally:
+        lg.removeHandler(h)
+
+
+def test_batched_sync_many_stations_in_one_body(app):
+    """One request for all the Core's stations: each gets its own reply (commands, acks, settings, events)."""
+    first = batch(app, {'station': 'BA1', 'state': STATE}, {'station': 'BA2'}, {'station': 'BA3', 'settings_rev': ''})
+    assert first.status_code == 200 and set(first.json) == {'stations'}
+    assert set(first.json['stations']) == {'BA1', 'BA2', 'BA3'} and 'settings' in first.json['stations']['BA3']
+    op, admin = signed_in(app, 'operator'), signed_in(app, 'admin')
+    cmd = lambda st, c: op.post('/api/v1/control', json={'station': st, 'cmd': c}, headers=WEB).json['id']
+    c1, c3 = cmd('BA1', 'skip'), cmd('BA3', 'rescan')
+    assert admin.post('/api/v1/settings', json={'settings': {'crossfade_s': 7}, 'scope': 'station', 'station': 'BA2'},
+                      headers=WEB).status_code == 200
+    revs = {st: first.json['stations']['BA3']['settings_rev'] for st in ('BA1', 'BA2', 'BA3')}
+    with logged() as lines:          # each event names its station, as the 2.x Core sends it
+        r = batch(app, {'station': 'BA1', 'ack': 0, 'settings_rev': revs['BA1'],
+                        'events': [ev(1, 'track_start', deck='A', file='one.mp3', dir='M/', duration=100.0, station='BA1')]},
+                  {'station': 'BA2', 'ack': 0, 'settings_rev': revs['BA2'],
+                   'events': [ev(2, 'track_start', deck='B', file='two.mp3', dir='M/', duration=90.0, station='BA2')], 'dropped': 3},
+                  {'station': 'BA3', 'ack': 0, 'settings_rev': revs['BA3'], 'events': {},
+                   'meters': {'A': {'peak': 1.0, 'rms': -3.0, 'gain': -2.0}}}, mem_kb=900.5).json['stations']
+    play = [msg for _, msg in lines if msg.startswith('PLAY music "one.mp3"')]
+    assert len(play) == 1 and play[0].count('station=') == 1, play                  # the part's station, once
+    assert not sql("SELECT bool_or(data ? 'station') FROM qsr_test.core_events WHERE station LIKE 'BA%%'", fetch=True)[0][0]
+    assert [c['id'] for c in r['BA1']['commands']] == [c1] and [c['id'] for c in r['BA3']['commands']] == [c3]
+    assert r['BA2']['commands'] == [] and r['BA2']['settings']['crossfade_s'] == 7 and r['BA2']['settings_rev'] != revs['BA2']
+    assert 'settings' not in r['BA1'] and 'settings' not in r['BA3']
+    assert (r['BA1']['accepted'], r['BA2']['accepted'], r['BA3']['accepted']) == (1, 1, 0)
+    assert 'ads' in r['BA1'] and r['BA1']['ads_rev']
+    plays = sql("SELECT station, file FROM qsr_test.play_log WHERE station LIKE 'BA%%' ORDER BY station", fetch=True)
+    assert [tuple(p) for p in plays] == [('BA1', 'one.mp3'), ('BA2', 'two.mp3')]
+    rows = sql("SELECT station, core, radio_version, meters IS NOT NULL FROM qsr_test.stations WHERE station LIKE 'BA%%' ORDER BY 1",
+               fetch=True)
+    assert [tuple(x) for x in rows] == [('BA1', 'CORE1', config.version(), False), ('BA2', 'CORE1', config.version(), False),
+                                        ('BA3', 'CORE1', config.version(), True)]
+    assert tuple(sql("SELECT boot, version, mem_kb FROM qsr_test.cores WHERE core = 'CORE1'", fetch=True)[0]) == (
+        'B1', config.version(), 900.5)
+    # acked: not sent again; a reset database: each station is told on its own
+    r = batch(app, {'station': 'BA1', 'ack': c1}, {'station': 'BA3', 'ack': 10 ** 9}).json['stations']
+    assert r['BA1']['commands'] == [] and 'ack_reset' not in r['BA1'] and r['BA3']['ack_reset'] == c3
+    assert op.get('/api/v1/now?station=BA1').json['station']['core'] == 'CORE1'
+    assert {s['station']: s['core'] for s in op.get('/api/v1/now').json['stations']}['BA2'] == 'CORE1'
+    # empty and odd bodies
+    assert batch(app).json == {'stations': {}}
+    assert app.test_client().post('/api/v1/core/sync', json={'stations': {}, 'core': 'CORE1'}, headers=CORE).json == {'stations': {}}
+    assert app.test_client().post('/api/v1/core/sync', json={'stations': 'x'}, headers=CORE).status_code == 400
+    r = batch(app, 'junk', {'station': None}, {'events': []}, {'station': 'BA1'}, {'station': 'BA1', 'ack': 'x'}).json['stations']
+    assert set(r) == {'BA1'}                                                       # no name: no part; a repeat: once
+
+
+def test_one_stations_bad_part_does_not_fail_the_others(app, monkeypatch):
+    """A station whose part fails is rolled back on its own (its events come again); the others are committed."""
+    evs = lambda st, seq: [ev(seq, 'track_start', deck='A', file=f'{st}.mp3', dir='M/', duration=60.0)]
+    good = lambda: ({'station': 'BB1', 'events': evs('BB1', 1)}, {'station': 'BB3', 'events': evs('BB3', 3)})
+    with logged() as lines:
+        r = batch(app, good()[0], {'station': 'BB2', 'events': 'junk'}, good()[1]).json['stations']
+    assert r['BB2'] == {'error': 'events must be a list'}
+    assert r['BB1']['accepted'] == 1 and r['BB3']['accepted'] == 1 and 'commands' in r['BB3']
+    assert any(lvl == 30 and 'station=BB2 sync failed' in msg and 'events must be a list' in msg for lvl, msg in lines)
+    # a database error in the middle of one station's work (its transaction aborted): the others go on, on the same connection
+    real = control.analysis.sync
+
+    def failing(cur, station, rev):
+        if station == 'BB2':
+            cur.execute('SELECT 1 / 0')
+        return real(cur, station, rev)
+    monkeypatch.setattr(control.analysis, 'sync', failing)
+    with logged() as lines:
+        r = batch(app, {'station': 'BB1', 'events': evs('BB1', 11)}, {'station': 'BB2', 'events': evs('BB2', 12), 'state': STATE},
+                  {'station': 'BB3', 'events': evs('BB3', 13)}).json['stations']
+    assert 'division by zero' in r['BB2']['error'] and set(r['BB2']) == {'error'}
+    assert r['BB1']['accepted'] == 1 and r['BB3']['accepted'] == 1
+    assert not any('station=BB2' in msg for _, msg in lines)              # logged at most once a minute
+    played = lambda st: sql('SELECT count(*) FROM qsr_test.play_log WHERE station = %s', (st,), fetch=True)[0][0]
+    assert (played('BB1'), played('BB2'), played('BB3')) == (2, 0, 2)        # BB2's events rolled back
+    assert sql("SELECT count(*) FROM qsr_test.stations WHERE station = 'BB2'", fetch=True)[0][0] == 0
+    monkeypatch.setattr(control.analysis, 'sync', real)
+    r = batch(app, {'station': 'BB2', 'events': evs('BB2', 12)}).json['stations']
+    assert r['BB2']['accepted'] == 1 and played('BB2') == 1                 # sent again: stored now, once
+    # the database itself gone: the whole request is 503 and the Core backs off
+    def lost(cur, station, rev):
+        raise db.psycopg2.OperationalError('server closed the connection unexpectedly')
+    monkeypatch.setattr(control.analysis, 'sync', lost)
+    assert batch(app, {'station': 'BB1'}, {'station': 'BB3'}).status_code == 503
+
+
+def test_legacy_core_body_and_the_upgrade(app):
+    """A 1.x Core (one station, no 'stations') gets today's reply; the same station then synced by a 2.x Core
+    (a new boot) carries on: its unreported command does not run twice, and it is now on that Core."""
+    old = sync(app, station='UP1', boot='old', state=STATE, events=[ev(1, 'boot')])
+    assert old.status_code == 200 and 'stations' not in old.json and 'commands' in old.json and old.json['accepted'] == 1
+    op = signed_in(app, 'operator')
+    cid = op.post('/api/v1/control', json={'station': 'UP1', 'cmd': 'skip'}, headers=WEB).json['id']
+    assert [c['id'] for c in sync(app, station='UP1', boot='old').json['commands']] == [cid]           # delivered, no result
+    assert sql("SELECT core FROM qsr_test.stations WHERE station = 'UP1'", fetch=True)[0][0] is None
+    r = batch(app, {'station': 'UP1', 'ack': 0, 'state': STATE}, core='NEWCORE', boot='new').json['stations']['UP1']
+    assert r['commands'] == []
+    assert sql('SELECT ok, note FROM qsr_test.commands WHERE id = %s', (cid,), fetch=True)[0][1] == 'the Core restarted before reporting'
+    assert sql("SELECT core FROM qsr_test.stations WHERE station = 'UP1'", fetch=True)[0][0] == 'NEWCORE'
+    assert 'commands' in sync(app, station='UP1', boot='new').json                  # and back (a rollback): still fine
+
+
+def test_library_upload_in_parts(app):
+    """A scan in parts is staged: only its last part, with every part in, marks the files not in it gone."""
+    item = lambda n: {'key': f'M/{n}.mp3', 'dir': 'M/', 'file': f'{n}.mp3', 'kind': 'music', 'size': 9000 + ord(n)}
+    send = lambda scan, part, parts, names, **kw: app.test_client().post('/api/v1/core/library', headers=CORE, json=dict(
+        station='LP1', boot='B1', scan=scan, part=part, parts=parts, music_dir='M/', items=[item(n) for n in names], **kw))
+    present = lambda: sorted(r[0][2] for r in sql("SELECT key FROM qsr_test.library WHERE station = 'LP1' AND present",
+                                                   fetch=True))
+    assert library_post(app, 'LP1', [item(n) for n in 'abc']).json['items'] == 3                   # 1.x: whole
+    assert present() == ['a', 'b', 'c']
+    assert send('s1', 1, 3, 'ad').json == {'ok': True, 'scan': 's1', 'part': 1, 'parts': 3}
+    assert send('s1', 2, 3, 'b').json == {'ok': True, 'scan': 's1', 'part': 2, 'parts': 3}
+    assert present() == ['a', 'b', 'c', 'd']                       # staged: nothing gone before the scan is complete
+    last = send('s1', 3, 3, 'e')
+    assert last.status_code == 200 and last.json['ok'] is True and last.json['items'] == 4 and last.json['learned'] == {}
+    assert present() == ['a', 'b', 'd', 'e']
+    assert send('s1', 3, 3, 'e').status_code == 200 and present() == ['a', 'b', 'd', 'e']          # the last part again: the same
+    # a part lost on the way: the last part is refused and nothing shrinks
+    assert send('s2', 1, 3, 'a').status_code == 200
+    with logged() as lines:
+        r = send('s2', 3, 3, 'b')
+    assert r.status_code == 409 and r.json['ok'] is False and 'part(s) 2 of 3' in r.json['error']
+    assert any(lvl == 30 and 'LIBRARY' in msg and 's2' in msg for lvl, msg in lines)
+    assert present() == ['a', 'b', 'd', 'e']
+    # sent again (a new scan id): complete
+    for i, names in enumerate(('a', 'bf'), 1):
+        assert send('s3', i, 2, names).status_code == 200
+    assert present() == ['a', 'b', 'f']
+    # a newer scan supersedes an unfinished one: the old one's last part is refused
+    assert send('s4', 1, 2, 'a').status_code == 200
+    assert send('s5', 1, 1, 'ag').status_code == 200 and present() == ['a', 'g']
+    assert send('s4', 2, 2, 'b').status_code == 409 and present() == ['a', 'g']
+    # figures in the last part's reply; the folders and the scan recorded on the station
+    sync(app, station='LP1', events=[ev(1, 'track_end', deck='A', file='g.mp3', dir='M/', reason='end', lead_in=0.5, trail=1.5)])
+    assert send('s6', 1, 2, 'a').json.get('learned') is None
+    assert send('s6', 2, 2, 'g').json['learned'] == {'M/g.mp3': {'trail': 1.5, 'lead': 0.5}}
+    assert tuple(sql("SELECT music_dir, scan, scan_parts FROM qsr_test.stations WHERE station = 'LP1'", fetch=True)[0]) == (
+        'M/', 's6', [1, 2])
+    for bad in ({'part': 0}, {'part': 3}, {'parts': 'two'}, {'part': None}):
+        body = dict({'station': 'LP1', 'scan': 's7', 'part': 1, 'parts': 2, 'items': []}, **bad)
+        assert app.test_client().post('/api/v1/core/library', json=body, headers=CORE).status_code == 400, bad
+
+
+def test_ads_plan_is_cached(app, monkeypatch):
+    """The plan is made again when the station's events come in, when anything it is made from changes, or
+    every 30 s; not on every sync."""
+    items = [{'key': 'Ads/x.wav', 'dir': 'Ads/', 'file': 'x.wav', 'kind': 'ad'},
+             {'key': 'I/id.wav', 'dir': 'I/', 'file': 'id.wav', 'kind': 'imaging'},
+             {'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music'}]
+    for st in ('PC1', 'PC2'):
+        library_post(app, st, items, ads_dir='Ads/')
+    made = []
+    real = ads.plan
+    monkeypatch.setattr(ads, 'plan', lambda cur, station: made.append(station) or real(cur, station))
+    count = lambda: made.count('PC1')
+    rev = batch(app, {'station': 'PC1', 'ads_rev': '', 'state': STATE}).json['stations']['PC1']['ads_rev']
+    assert count() == 1
+    for _ in range(3):
+        assert 'ads' not in batch(app, {'station': 'PC1', 'ads_rev': rev}).json['stations']['PC1']
+    assert count() == 1
+    again = batch(app, {'station': 'PC1', 'ads_rev': ''}).json['stations']['PC1']          # the Core asks: the cached plan
+    assert again['ads_rev'] == rev and again['ads']['mix'] == ['Ads/x.wav'] and count() == 1
+    e = [ev(1, 'transition', reason='end')]
+    batch(app, {'station': 'PC1', 'ads_rev': rev, 'events': e})                            # events accepted: made again
+    batch(app, {'station': 'PC1', 'ads_rev': rev, 'events': e})                            # only duplicates: not
+    assert count() == 2
+    op, admin = signed_in(app, 'operator'), signed_in(app, 'admin')
+    changes = [
+        lambda: op.post('/api/v1/hold', json={'station': 'PC1', 'what': 'bumpers', 'until': None}, headers=WEB),
+        lambda: op.post('/api/v1/ads', json={'station': 'PC1', 'key': 'Ads/x.wav', 'mode': 'off'}, headers=WEB),
+        lambda: op.post('/api/v1/library/ident', json={'station': 'PC1', 'key': 'I/id.wav', 'ident': True}, headers=WEB),
+        lambda: admin.post('/api/v1/settings', json={'settings': {'artist_separation': 3}, 'scope': 'station', 'station': 'PC1'},
+                           headers=WEB),
+        lambda: admin.post('/api/v1/settings', json={'settings': {'ad_fit_tolerance_s': 120}}, headers=WEB),   # All stations
+        lambda: library_post(app, 'PC1', items),
+        lambda: op.post('/api/v1/control', json={'station': 'PC1', 'cmd': 'skip'}, headers=WEB),
+        lambda: sql("UPDATE qsr_test.stations SET plan_at = NOW() - INTERVAL '31 seconds' WHERE station = 'PC1'"),
+        lambda: sql("UPDATE qsr_test.stations SET plan_until = NOW() - INTERVAL '1 second' WHERE station = 'PC1'"),
+    ]
+    try:
+        for i, change in enumerate(changes):
+            n = count()
+            r = change()
+            assert r is None or r.status_code == 200, i
+            batch(app, {'station': 'PC1', 'ads_rev': rev})
+            batch(app, {'station': 'PC1', 'ads_rev': rev})
+            assert count() == n + 1, i
+        assert made.count('PC2') == 0
+        rev2 = sync(app, station='PC2', ads_rev='').json['ads_rev']            # a 1.x Core's sync is cached the same
+        sync(app, station='PC2', ads_rev=rev2)
+        assert made.count('PC2') == 1
+        op.post('/api/v1/hold', json={'station': 'PC1', 'what': 'bumpers', 'until': 'off'}, headers=WEB)
+        sync(app, station='PC2', ads_rev=rev2)
+        assert made.count('PC2') == 1                                          # another station's change: not this one
+        plan = batch(app, {'station': 'PC1', 'ads_rev': ''}).json['stations']['PC1']['ads']
+        assert plan['mix'] == [] and 'no_bumpers' not in plan                  # the rule (off) and the resume are in it
+        # it also changes by the clock: cached until the next slot opens (or a due one's window closes, or the hour turns)
+        op.post('/api/v1/ads', json={'station': 'PC1', 'key': 'Ads/x.wav', 'mode': 'hourly', 'per_hour': 4}, headers=WEB)
+        batch(app, {'station': 'PC1', 'ads_rev': rev})
+        until, at = sql("SELECT plan_until, plan_at FROM qsr_test.stations WHERE station = 'PC1'", fetch=True)[0]
+        hour = at.replace(minute=0, second=0, microsecond=0)
+        times = [hour + timedelta(minutes=m + w) for m in ads.slot_minutes(4, 0.5) for w in (0, ads.window_minutes(4))]
+        assert until == min(t for t in times + [hour + timedelta(hours=1)] if t > at)
+    finally:
+        admin.post('/api/v1/settings', json={'settings': {'ad_fit_tolerance_s': None}}, headers=WEB)
+
+
+def test_core_memory_warning(app):
+    """Per Core, on the lowest Lua memory of each 10-minute window (one sample includes garbage not yet
+    collected, so it saws up and down): the settled low is the lowest window low after the first 10 minutes
+    of a boot; one warning (at most once an hour) when a whole window's low is more than twice that and over
+    32 MB. A new boot starts over."""
+    def mem(*kbs, boot='M1'):
+        for kb in kbs:
+            assert batch(app, {'station': 'MW1'}, core='MEMCORE', boot=boot, mem_kb=kb).status_code == 200
+
+    def window(*kbs, boot='M1', minutes=10):
+        """The clock moves on (every time on the row moves back), then a window's samples: the first closes
+        the window before."""
+        sql(f"""UPDATE qsr_test.cores SET booted_at = booted_at - INTERVAL '{minutes} minutes',
+                       win_at = win_at - INTERVAL '{minutes} minutes', mem_low_at = mem_low_at - INTERVAL '{minutes} minutes',
+                       mem_warned_at = mem_warned_at - INTERVAL '{minutes} minutes' WHERE core = 'MEMCORE'""")
+        mem(*kbs, boot=boot)
+    row = lambda: tuple(sql("SELECT mem_kb, win_low_kb, mem_low_kb FROM qsr_test.cores WHERE core = 'MEMCORE'", fetch=True)[0])
+    warned = lambda lines: [msg for lvl, msg in lines if lvl == 30 and 'MEMCORE' in msg]
+    with logged() as lines:
+        mem(20000, 5000, 9000)
+        assert row() == (9000.0, 5000.0, None)                   # starting up: no low kept yet
+        # healthy: garbage piles up to 4.5 x the live memory between collections, and never grows
+        for _ in range(12):                                      # two hours
+            window(20000, 90000, 60000, 'lots', 20500, 75000)
+        assert row() == (75000.0, 20000.0, 20000.0)               # 'lots': no sample, the window goes on
+        assert not warned(lines)
+        # a leak: each window's lowest sample climbs; one warning when one is over twice the settled low
+        window(30000, 80000)
+        window(41000, 90000, 45000)
+        assert not warned(lines)                                 # the window is not over yet
+        window(50000)
+        assert warned(lines) == ['core=MEMCORE Lua memory 40.0 MB at its lowest in 10 min, was 19.5 MB after start: possible leak']
+        for kb in (60000, 70000, 80000, 90000):                  # within the hour: no more
+            window(kb)
+        assert len(warned(lines)) == 1
+        window(100000, minutes=30)                               # an hour after the warning: again
+        assert len(warned(lines)) == 2 and warned(lines)[-1].startswith('core=MEMCORE Lua memory 87.9 MB')
+        assert tuple(sql("SELECT mem_low_kb, mem_low_at < NOW() - INTERVAL '2 hours' FROM qsr_test.cores WHERE core = 'MEMCORE'",
+                         fetch=True)[0]) == (20000.0, True)
+        # restarted: starts over, the last boot's low forgotten
+        mem(60000, boot='M2')
+        assert row() == (60000.0, 60000.0, None)
+        assert sql("SELECT booted_at > NOW() - INTERVAL '1 minute' FROM qsr_test.cores WHERE core = 'MEMCORE'", fetch=True)[0][0]
+        window(61000, 150000, boot='M2')
+        window(62000, 150000, boot='M2')
+        window(63000, boot='M2')
+        assert row()[2] == 61000.0 and len(warned(lines)) == 2
+    # under 32 MB never warns, however it grows
+    with logged() as lines:
+        mem(2000, boot='M3')
+        window(2000, boot='M3')
+        window(30000, boot='M3')
+        window(31000, boot='M3')
+        window(32000, boot='M3')
+    assert row()[2] == 2000.0 and not warned(lines)
+
+
+def test_faulted_station_shows_on_the_panel(app):
+    """A station the Core could not build still syncs: its fault reaches the dashboard and the station list,
+    and its station_fault event the log as a warning."""
+    with logged() as lines:
+        batch(app, {'station': 'FT1', 'state': {'automation': False, 'state': 'off', 'fault': 'player "Audio_Player99" not found'},
+                    'events': [ev(1, 'station_fault', error='player "Audio_Player99" not found', retry_s=30)]},
+              {'station': 'FT2', 'state': dict(STATE, fault={'x': 1})})
+    assert any(lvl == 30 and msg.startswith('STATION_FAULT station=FT1 error=player') for lvl, msg in lines), lines
+    v = signed_in(app, 'viewer')
+    st = v.get('/api/v1/now?station=FT1').json
+    assert st['station']['state']['fault'] == 'player "Audio_Player99" not found' and st['station']['online']
+    assert {s['station']: s['fault'] for s in st['stations']}['FT1'] == 'player "Audio_Player99" not found'
+    assert v.get('/api/v1/now?station=FT2').json['station']['state']['fault'] is None
+    assert b'id="fault-banner"' in v.get('/').data
+    # the state exactly as radio.lua sends it for a faulted station (Lua's empty tables arrive as {}): the dashboard's poll
+    core_state = {'fault': "player 'X' not found", 'automation': False, 'state': 'fault', 'retry_s': 30, 'decks': {}, 'queue': {},
+                  'library': {'music': 0, 'imaging': 0, 'ad': 0}, 'settings': {'crossfade_s': 4},
+                  'analyze': {'can': True, 'left': 0}, 'uptime': 12, 'outbox': 0}
+    batch(app, {'station': 'FT3', 'ack': 0, 'settings_rev': '', 'ads_rev': '', 'state': core_state})
+    r = v.get('/api/v1/now?station=FT3&plays=10&ahead=10')
+    assert r.status_code == 200 and r.json['station']['state']['queue'] == [] and r.json['station']['state']['retry_s'] == 30
+    # its CFG names a mixer: the Music page does not send the operator to the CFG for it (it names the fault)
+    assert r.json['station']['analysis']['can'] is True
+
+
+def test_batched_sync_of_14_stations_is_quick(app):
+    """14 stations of 3,000 files each (uploaded in parts) synced in one request: well within the second."""
+    n_st, n_files = 14, 3000
+    names = [f'Q{i:02d}' for i in range(n_st)]
+    client = app.test_client()
+    for i, st in enumerate(names):
+        items = [{'key': f'M/{st}-{j:04d}.mp3', 'dir': 'M/', 'file': f'{st}-{j:04d}.mp3', 'kind': 'music',
+                  'artist': f'Artist {j % 300}', 'size': 10 ** 6 + j} for j in range(n_files - 50)]
+        items += [{'key': f'I/{st}-{j}.wav', 'dir': 'I/', 'file': f'{st}-{j}.wav', 'kind': 'imaging', 'size': 5000 + j} for j in range(30)]
+        items += [{'key': f'Ads/{st}-{j}.wav', 'dir': 'Ads/', 'file': f'{st}-{j}.wav', 'kind': 'ad', 'size': 7000 + j} for j in range(20)]
+        for p in range(3):
+            r = client.post('/api/v1/core/library', headers=CORE, json={
+                'station': st, 'boot': 'B1', 'scan': f'q{i}', 'part': p + 1, 'parts': 3, 'music_dir': 'M/', 'ads_dir': 'Ads/',
+                'imaging_dir': 'I/', 'items': items[p * 1000:(p + 1) * 1000]})
+            assert r.status_code == 200, r.get_data(as_text=True)
+        sql("INSERT INTO qsr_test.ad_rules (station, key, mode, per_hour) VALUES (%s, %s, 'hourly', 4)", (st, f'Ads/{st}-0.wav'))
+    t0 = datetime.now(timezone.utc) - timedelta(seconds=30)
+    part = lambda i, st, seq: {'station': st, 'ack': 0, 'settings_rev': '', 'ads_rev': '', 'analyze_rev': '',
+                               'meters': {'A': {'peak': -3, 'rms': -12, 'gain': 0}, 'B': {'peak': -120, 'rms': -120, 'gain': -100}},
+                               'state': STATE, 'events': [ev(seq + i * 10, 'track_start', t=t0.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                                                             deck='A', file=f'{st}-0001.mp3', dir='M/', duration=200.0)]}
+    timings = []
+    for seq in (1, 2, 3):
+        start = time.monotonic()
+        r = batch(app, *[part(i, st, seq) for i, st in enumerate(names)], core='BIGCORE', mem_kb=4000)
+        timings.append(time.monotonic() - start)
+        assert r.status_code == 200 and all('error' not in x for x in r.json['stations'].values())
+        assert len(r.json['stations']) == n_st and all(x['ads']['next'] for x in r.json['stations'].values())
+    start = time.monotonic()
+    r = batch(app, *[{'station': st, 'ack': 0, 'settings_rev': x['settings_rev'], 'ads_rev': x['ads_rev'], 'analyze_rev': '',
+                      'meters': {}} for st, x in r.json['stations'].items()], core='BIGCORE', mem_kb=4000)
+    timings.append(time.monotonic() - start)                 # the usual second: nothing new, plans cached
+    assert r.status_code == 200 and not any('ads' in x or 'settings' in x for x in r.json['stations'].values())
+    assert max(timings[:3]) < 1.5 and timings[3] < 0.5, timings          # measured: about 0.2 s and 0.05 s
 
 
 # ── Sign-in and permissions ──────────────────────────────────────────────────
@@ -1337,6 +1871,26 @@ def test_settings_spec_matches_radio_lua():
             continue
         default = spec[7]
         assert (lua[name] == default) if isinstance(default, str) else float(lua[name]) == float(default), name
+
+
+def test_panel_and_help_name_the_stations_cfg_entry():
+    """2.0 sets each station's players, meter and mixer in its CFG.STATIONS entry: no page, script, help text
+    or server message names the 1.x keys (CFG.MIXER, MIX_A, ...) or a fixed RadioOut mixer."""
+    import re
+    old = re.compile(r'CFG\.(MIXER|METER|PLAYER_A|PLAYER_B|STATION_ID)\b|\bMIX_[AB]\b|\bMETER_[AB]\b|RadioOut')
+    root = os.path.join(os.path.dirname(__file__), '..', 'server')
+    hits = []
+    for folder, _, names in os.walk(root):
+        for name in names:
+            if name.endswith(('.py', '.js', '.html')):
+                with open(os.path.join(folder, name), encoding='utf-8') as f:
+                    hits += [f'{name}:{n}: {line.strip()}' for n, line in enumerate(f, 1) if old.search(line)]
+    assert not hits
+    with open(os.path.join(root, 'static', 'js', 'library.js'), encoding='utf-8') as f:
+        src = f.read()
+    assert 'station\\\'s <b>CFG.STATIONS</b> entry' in src        # file analysis off: says where to set it
+    # a faulted station: the fault is named before the CFG hint (2.0.0 dev blamed a correct CFG mixer)
+    assert src.index("'<span><b>Station fault</b>: ' + esc(fault)") < src.index('<b>CFG.STATIONS</b> entry')
 
 
 def test_version_matches_everywhere():

@@ -1,7 +1,7 @@
 --[[---------------------------------------------------------------------------
   MockCore :: an offline stand-in for the Q-SYS Lua runtime
   File:    qsys/test/mock_core.lua
-  Version: 0.3.0
+  Version: 0.4.0
 
   Enough of Component / Timer / dir / Design / Network / Controls / json / io
   to run radio.lua (and probe.lua) under plain Lua 5.3 with a simulated
@@ -13,17 +13,19 @@
     - the meter is post-gain, floors at -120, releases at ~60 dB/s; rms.N reads
       the file's crest (default 3 dB) under peak.N
     - `playing` goes false at end of file (and `stopped` true)
+  Any number of players, meters and mixers by name (spec.players: the wiring),
+  and a fake server for the 2.x Core protocol (batched sync, library in parts).
 
   Usage (see run_mock.py / scenario_basic.lua):
     dofile("qsys/test/mock_core.lua")
     MockCore.setup{ dirs = { ["Test/Tuning/"] = { {name="a.flac", duration=30, lead=1, trail=0.5, level=-10, fade=0, crest=3}, ... } },
                     controls = { inputs = 3, outputs = 6 } }
-    dofile("qsys/radio/radio.lua")
+    MockCore.loadRadio{ SERVER_URL = "http://radio-server:5410" }   -- radio.lua, CFG changed before it boots
     MockCore.at(120, function() MockCore.press(1) end)   -- operator skip at t=120
     MockCore.run(600)
 -----------------------------------------------------------------------------]]
 
-MockCore = { clock = 0, timers = {}, pending = {}, actions = {}, players = {}, dirs = {}, log = {} }
+MockCore = { clock = 0, timers = {}, pending = {}, actions = {}, players = {}, meters = {}, mixers = {}, dirs = {}, log = {} }
 
 -------------------------------------------------------------------------------
 -- minimal JSON (objects, arrays, strings, numbers, booleans, null)
@@ -292,6 +294,51 @@ function MockCore.lookup(dirRel, fname)
   return nil
 end
 
+-- the classic design: two players on PlayerMeter 1 / 2 and RadioOut inputs 1 / 2 (radio.lua's CFG.STATIONS[1])
+local function classicWiring(noMixer)
+  local mixer = not noMixer and "RadioOut" or nil
+  return { { name = "Audio_Player23", label = "A", meter = "PlayerMeter", channel = 1, mixer = mixer, input = 1 },
+           { name = "Audio_Player24", label = "B", meter = "PlayerMeter", channel = 2, mixer = mixer, input = 2 } }
+end
+
+-- n two-player stations: ids <prefix>1.. (or opts.ids), players <id>_A / <id>_B on meter <id>_Meter 1 / 2 and
+-- mixer <id>_Mix inputs 1 / 2 (opts.noMixer: none). Returns the wiring (spec.players) and the CFG.STATIONS entries.
+function MockCore.stations(n, opts)
+  opts = opts or {}
+  local wiring, cfg = {}, {}
+  for i = 1, n do
+    local id = opts.ids and opts.ids[i] or ((opts.prefix or "S") .. i)
+    local mixer = not opts.noMixer and (id .. "_Mix") or nil
+    for k, deck in ipairs({ "A", "B" }) do
+      wiring[#wiring + 1] = { name = id .. "_" .. deck, label = id .. deck, meter = id .. "_Meter", channel = k, mixer = mixer, input = k }
+    end
+    cfg[i] = { id = id, players = { id .. "_A", id .. "_B" }, meter = id .. "_Meter", meters = { 1, 2 }, mixer = mixer or "", mix = { 1, 2 } }
+  end
+  return wiring, cfg
+end
+
+-- one player: it feeds a meter channel (meter.N / peak.N / rms.N follow it) and, optionally, a mixer input
+-- (input.N.mute.1 / gain.1 / delay.1); w = { name, label, meter, channel, mixer, input }
+function MockCore.wire(w)
+  local meter = MockCore.meters[w.meter]
+  if not meter then
+    meter = { ["response.time"] = mkctl{ v = 0.3 }, ["select"] = mkctl{ s = "Peak" } }
+    MockCore.meters[w.meter] = meter
+  end
+  local set = {}
+  for _, k in ipairs({ "meter." .. w.channel, "peak." .. w.channel, "rms." .. w.channel }) do
+    meter[k] = mkctl{ v = -120 }
+    set[#set + 1] = meter[k]
+  end
+  MockCore.players[w.name] = mkPlayer(w.label or w.name, set)
+  if w.mixer then
+    local mixer = MockCore.mixers[w.mixer] or {}
+    MockCore.mixers[w.mixer] = mixer
+    local i = w.input
+    mixer["input." .. i .. ".mute.1"], mixer["input." .. i .. ".gain.1"], mixer["input." .. i .. ".delay.1"] = mkctl{ b = false }, mkctl{}, mkctl{}
+  end
+end
+
 function MockCore.setup(spec)
   MockCore.dirs = spec.dirs or {}
   MockCore.clock = 0
@@ -304,40 +351,24 @@ function MockCore.setup(spec)
     math.randomseed = function() reseed(seed) end
   end
 
-  -- meter: meter.N / peak.N / rms.N follow the deck's level
-  local meter = {}
-  local function meterSet(n)
-    local set = {}
-    for _, k in ipairs({ "meter." .. n, "peak." .. n, "rms." .. n }) do
-      meter[k] = mkctl{ v = -120 }
-      set[#set + 1] = meter[k]
-    end
-    return set
-  end
-  meter["response.time"] = mkctl{ v = 0.3 }
-  meter["select"] = mkctl{ s = "Peak" }
-  MockCore.players = {
-    ["Audio_Player23"] = mkPlayer("A", meterSet(1)),
-    ["Audio_Player24"] = mkPlayer("B", meterSet(2)),
-  }
-  MockCore.meter = meter
-  -- the players' mixer (RadioOut): input.N.mute.1 / gain.1 / delay.1; spec.noMixer = a design without one
-  local mixer = {}
-  for i = 1, 2 do
-    mixer["input." .. i .. ".mute.1"], mixer["input." .. i .. ".gain.1"], mixer["input." .. i .. ".delay.1"] = mkctl{ b = false }, mkctl{}, mkctl{}
-  end
-  MockCore.mixer = not spec.noMixer and mixer or nil
+  MockCore.players, MockCore.meters, MockCore.mixers = {}, {}, {}
+  for _, w in ipairs(spec.players or classicWiring(spec.noMixer)) do MockCore.wire(w) end
+  MockCore.meter, MockCore.mixer = MockCore.meters["PlayerMeter"], MockCore.mixers["RadioOut"]
 
   Component = {
     New = function(n)
       if MockCore.players[n] then return MockCore.players[n].comp end
-      if n == "PlayerMeter" then return meter end
-      if n == "RadioOut" and MockCore.mixer then return MockCore.mixer end
+      if MockCore.meters[n] then return MockCore.meters[n] end
+      if MockCore.mixers[n] then return MockCore.mixers[n] end
       error("component '" .. tostring(n) .. "' not found")
     end,
     GetComponents = function()
-      return { { Name = "Audio_Player23", Type = "audio_file_player" }, { Name = "Audio_Player24", Type = "audio_file_player" },
-               { Name = "PlayerMeter", Type = "meter2" } }
+      local out = {}
+      for n in pairs(MockCore.players) do out[#out + 1] = { Name = n, Type = "audio_file_player" } end
+      for n in pairs(MockCore.meters) do out[#out + 1] = { Name = n, Type = "meter2" } end
+      for n in pairs(MockCore.mixers) do out[#out + 1] = { Name = n, Type = "mixer" } end
+      table.sort(out, function(a, b) return a.Name < b.Name end)
+      return out
     end,
     GetControls = function() return {} end,
   }
@@ -358,10 +389,10 @@ function MockCore.setup(spec)
     return t
   end
   function Timer.CallAfter(fn, s) MockCore.at(MockCore.clock + s, fn) end
-  -- HttpClient: requests are answered after 50 ms by MockCore.httpHandler(req)
-  -- (default: 200), and every request is recorded in MockCore.http.
+  -- HttpClient: requests are answered after 50 ms by MockCore.httpHandler(req) (default: the fake
+  -- server, MockCore.serve), and every request is recorded in MockCore.http.
   MockCore.http = {}
-  MockCore.httpHandler = function() return 200, '{"ok":true}' end
+  MockCore.serve()
   HttpClient = {
     Upload = function(req)
       MockCore.http[#MockCore.http + 1] = { at = MockCore.clock, req = req }
@@ -402,6 +433,68 @@ function MockCore.setup(spec)
   if ctrls.outputs then
     Controls.Outputs = {}
     for i = 1, ctrls.outputs do Controls.Outputs[i] = mkctl{} end
+  end
+end
+
+-- radio.lua with CFG changed before it boots: patch = { KEY = value, ... } or function(CFG)
+function MockCore.loadRadio(patch, path)
+  local f = assert(io.open(path or "qsys/radio/radio.lua", "r"))
+  local src = f:read("*a")
+  f:close()
+  local body, n = src:gsub("\nboot%(%)%s*$", "\nreturn boot\n")
+  assert(n == 1, "radio.lua must end with boot()")
+  local boot = assert(load(body, "@qsys/radio/radio.lua"))()
+  if type(patch) == "function" then patch(CFG)
+  elseif patch then for k, v in pairs(patch) do CFG[k] = v end end
+  boot()
+end
+
+-------------------------------------------------------------------------------
+-- a fake QSYSRadio server speaking the 2.x Core protocol
+--   h.sync(part, body, req) -> that station's reply entry (nil = { commands = {} })
+--   h.library(station, items, body) -> the learned figures for a complete scan (nil = none sent)
+--   h.down(req) -> code, body, err: fail the whole request (an outage), or nil
+--   h.lose(body) -> true: this library part is lost (answered, not staged: its last part gets 409)
+-- MockCore.libraries[station] = { items (the last complete scan), uploads, parts, conflicts, last (part body) }
+-------------------------------------------------------------------------------
+function MockCore.serve(h)
+  h = h or {}
+  MockCore.libraries = {}
+  MockCore.httpHandler = function(req)
+    if h.down then
+      local code, body, err = h.down(req)
+      if code then return code, body, err end
+    end
+    local body = json.decode(req.Data)
+    if req.Url:match("/api/v1/core/sync$") then
+      local out = {}
+      for _, part in ipairs(body.stations or {}) do out[part.station] = (h.sync and h.sync(part, body, req)) or { commands = {} } end
+      return 200, json.encode({ stations = out })
+    elseif req.Url:match("/api/v1/core/library$") then
+      local lib = MockCore.libraries[body.station] or { items = {}, uploads = 0, parts = 0, conflicts = 0 }
+      MockCore.libraries[body.station] = lib
+      lib.parts, lib.last = lib.parts + 1, body
+      local items = body.items or {}
+      if body.scan ~= nil then
+        if body.part == 1 or lib.scan ~= body.scan then lib.scan, lib.got, lib.staged = body.scan, {}, {} end
+        local partReply = json.encode({ ok = true, scan = body.scan, part = body.part, parts = body.parts })
+        if h.lose and h.lose(body) then return 200, partReply end
+        lib.got[body.part] = true
+        for _, it in ipairs(items) do lib.staged[#lib.staged + 1] = it end
+        if body.part < body.parts then return 200, partReply end
+        for p = 1, body.parts do
+          if not lib.got[p] then
+            lib.conflicts = lib.conflicts + 1
+            return 409, json.encode({ error = "scan " .. body.scan .. ": part " .. p .. " of " .. body.parts .. " missing" })
+          end
+        end
+        items = lib.staged
+      end
+      lib.items, lib.uploads, lib.staged, lib.got = items, lib.uploads + 1, nil, nil
+      local learned = h.library and h.library(body.station, items, body)
+      return 200, json.encode({ ok = true, items = #items, learned = learned })
+    end
+    return 404, ""
   end
 end
 

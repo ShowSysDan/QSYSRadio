@@ -71,6 +71,23 @@ def _bad_request(exc):
     return jsonify(ok=False, error=str(exc)), 400
 
 
+@app.errorhandler(control.ScanIncomplete)
+def _scan_incomplete(exc):
+    log.warning('LIBRARY %s', exc)
+    return jsonify(ok=False, error=str(exc)), 409
+
+
+@app.errorhandler(db.psycopg2.extensions.TransactionRollbackError)
+def _cancelled(exc):
+    """PostgreSQL cancelled this request's transaction (a deadlock): a file's figures are shared by every station
+    that has it, so a change to many files can meet another station's sync writing the same rows. Nothing was
+    changed (rolled back when the connection goes back to the pool)."""
+    log.warning('%s %s cancelled by the database, nothing changed (409): %s', request.method, request.path,
+                (str(exc).strip().splitlines() or [type(exc).__name__])[0])
+    return _error(409, 'Try again', 'Another station was saving the same files at that moment, so nothing was '
+                                    'changed. Try again.')
+
+
 @app.errorhandler(403)
 def _forbidden(_exc):
     return _error(403, 'Not allowed', g.get('deny_message') or 'Your account does not have permission for that.')
@@ -238,29 +255,36 @@ def health():
                    schema=db.schemas()[0], schema_version=schema_version, schema_expected=expected)
 
 
+def _note_version(station, version):
+    """Each station's radio.lua version, once per (station, version): a warning when it is not the server's."""
+    seen = (station, version)
+    if isinstance(version, str) and seen not in _versions_seen:
+        if len(_versions_seen) > 1000:
+            _versions_seen.clear()
+        _versions_seen.add(seen)
+        if version != VERSION:
+            log.warning('station=%s runs radio.lua %s, server is %s', station, version, VERSION)
+
+
 @app.post('/api/v1/core/sync')
 @core_endpoint
 def core_sync():
-    """The Core's once-a-second request: events in, commands and settings out."""
+    """The Core's once-a-second request for all its stations: events in, commands and settings out
+    (a 1.x Core's single-station body too)."""
     payload = _json_body()
-    reply, lines = control.core_sync(dbconn(), payload, datetime.now(timezone.utc))
-    write_logs(lines)
-    seen = (payload.get('station'), payload.get('version'))
-    if isinstance(seen[1], str) and seen not in _versions_seen:
-        if len(_versions_seen) > 100:
-            _versions_seen.clear()
-        _versions_seen.add(seen)
-        if seen[1] != VERSION:
-            log.warning('station=%s runs radio.lua %s, server is %s', seen[0], seen[1], VERSION)
+    reply = control.core_sync(dbconn(), payload, datetime.now(timezone.utc), write_logs)
+    for station in reply['stations'] if 'stations' in payload else [payload.get('station')]:
+        _note_version(station, payload.get('version'))
     return jsonify(reply)
 
 
 @app.post('/api/v1/core/library')
 @core_endpoint
 def core_library():
-    count, learned, line = control.core_library(dbconn(), _json_body())
+    """A station's file list after a scan, in parts (a 1.x Core: whole)."""
+    reply, line = control.core_library(dbconn(), _json_body())
     write_logs([line])
-    return jsonify(ok=True, items=count, learned=learned)
+    return jsonify(reply)
 
 
 # ── Web API (signed in) ──────────────────────────────────────────────────────

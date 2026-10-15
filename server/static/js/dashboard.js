@@ -222,7 +222,7 @@
       $('air-rem').textContent = '-:--';
       $('air-meter').style.width = '0';
       $('air-sub').textContent = !s ? 'No Core has connected yet' : (!s.online ? 'Core offline · last seen ' + R.ago(s.last_seen)
-        : (st && !st.automation ? 'Automation stopped' : 'Between tracks'));
+        : (st && st.fault ? 'Station fault (see above)' : st && !st.automation ? 'Automation stopped' : 'Between tracks'));
     }
     const n = nextItem(st), stopping = st && st.stop_after;
     R.marquee($('next-title'), stopping ? 'Nothing (stopping)' : (n ? R.who(n).title : '–'));
@@ -272,12 +272,12 @@
       ['bump', 'ad', 'lib'].forEach((k) => { $(k + '-big').textContent = '–'; R.marquee($(k + '-sub'), ' '); });
       $('core-meter').style.width = '0';
     }
-    $('core-info').textContent = s ? '· ' + s.station + ' · radio.lua ' + (s.version || '?') + (s.online ? '' : ' · offline')
+    $('core-info').textContent = s ? '· ' + s.station + (s.core ? ' on ' + s.core : '') + ' · radio.lua ' + (s.version || '?') + (s.online ? '' : ' · offline')
       : '· no Core connected (set CFG.SERVER_URL in radio.lua)';
   }
 
   function renderTransport() {
-    const st = core(), op = R.canOperate, auto = !!(st && st.automation);
+    const st = core(), op = R.canOperate && !(st && st.fault), auto = !!(st && st.automation);   // faulted: the Core rebuilds it
     const b = (c) => document.querySelector('#transport [data-cmd="' + c + '"]');
     b('skip').disabled = !(op && auto && st.state === 'playing');
     const inBreak = st && (st.state === 'bumper' || st.state === 'ad');
@@ -323,10 +323,19 @@
       esc(R.timeOf(x.created_at)) + '</span></li>').join('') : '<li class="dim" style="grid-template-columns:1fr">No commands yet.</li>');
   }
 
+  // a station the Core could not build or keep running: its decks are stopped and the Core rebuilds it by itself
+  function renderFault() {
+    const st = core(), f = st && st.fault, el = $('fault-banner'), retry = num(st && st.retry_s);
+    el.hidden = !f;
+    R.setHTML(el, f ? '<b>Station fault</b><span>' + esc(last.station.station) + ': ' + esc(f) + '. Its decks are stopped; the Core ' +
+      'builds it again by itself (' + (retry != null ? 'next try in about ' + R.clock(Math.max(0, retry - age()))
+        : 'after 30 s, then less often, up to every 5 min') + '). The other stations on the Core play on.</span>' : '');
+  }
+
   function render(d) {
     if (!d) return;
     last = d;
-    renderKpis(); renderTransport(); renderDecks(); renderMeters(); renderNext(); renderActivity(); tick();
+    renderFault(); renderKpis(); renderTransport(); renderDecks(); renderMeters(); renderNext(); renderActivity(); tick();
     R.setHTML($('recent'), d.recent.map((p) => R.playRow(p, false)).join('') || '<tr><td colspan="6" class="empty-state">No plays logged yet.</td></tr>');
   }
 

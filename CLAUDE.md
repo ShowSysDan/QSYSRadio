@@ -1,6 +1,7 @@
 # QSYSRadio: notes for Claude
 
-Two-deck radio automation: Lua on the Q-SYS Core (`qsys/`) does real time;
+Radio automation, two decks per station: ONE radio.lua on the Q-SYS Core
+(`qsys/`) runs every station in `CFG.STATIONS` and does real time;
 a Flask + PostgreSQL server (`server/`) does everything else (play log, web
 control panel, settings, library, sign-in, syslog). README.md has the design.
 
@@ -15,10 +16,14 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 - Tell the user what to redeploy: the Core (paste radio.lua), the server
   (`git pull && sudo systemctl restart qsysradio`), both, or neither.
 - No duplicated code: reuse the helpers (Lua: `push`, `shuffled`, `set`/`trigger`,
-  `readJson`/`writeJson`, `timer`, `post`, `emit`; Python: `db.text`,
-  `db.number`, `db.clean_json`, `db.like`, `db.iso`, `dbconn()`,
-  `write_logs`, `core_settings.effective`, `media.file_of` / `media.supported` (per-file
-  figures live in `media_files`; read them through the view `library_figures`); JS: `Radio.api/post/command/setHTML/esc/num/status`).
+  `readJson`/`writeJson`, `timer`, `post`, `emit(st, kind, data)`, `guard`;
+  Python: `db.text`, `db.number`, `db.clean_json`, `db.like`, `db.iso`,
+  `db.lock_station`, `dbconn()`, `write_logs`, `core_settings.effective`, `media.file_of` /
+  `media.supported` (per-file figures live in `media_files`; read them
+  through the view `library_figures`), `ads.stale` (call it in the
+  transaction of any change a station's ads plan is made from, which took
+  `db.lock_station` first),
+  `cores.seen`; JS: `Radio.api/post/command/setHTML/esc/num/status`).
 
 ## radio.lua: keep it slim and light
 - Real time only. Anything that can live on the server does.
@@ -28,19 +33,33 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   drift. Internals (timer rates, timeouts, paths) are constants in `K` /
   `FILES`, not settings.
 - No header essays; one-line comments only where the line needs one.
-- Overhead budget: one 250 ms timer; the 50 ms `Fast` timer only while a deck
-  fades or loads (`Engine.wake()`); one HTTP request per second; control
-  objects cached in `Deck.new`; panel writes only on change; files written
-  only from `Chores` (every 30 s) or when settings change. Never add per-tick allocation, polling of the server,
-  or whole-file writes on every event.
+- Overhead budget, for every station together: one 250 ms timer (`Tick`
+  loops over the prebuilt `Radio.stations`); the 50 ms `Fast` timer only
+  while a deck fades or loads (`Engine.wake()`, loops over `Radio.decks`);
+  one sync request per second for all stations (plus one library part at a
+  time after a scan); control objects cached in `Deck.new`; panel writes
+  only on change; files written only from `Chores` (every 30 s) or once per
+  sync reply that changed any station's settings. Never add per-tick
+  allocation (no closures, tables or string building in `Tick` / `Fast`),
+  polling of the server, or whole-file writes on every event.
+- Stations are objects (`Station.new(cfg)`): per-station state lives on the
+  station, never in a global. Each station's tick, deck handlers, commands
+  and reply part run under `guard` (pcall); a station failing 5 ticks in a
+  row or failing to build is faulted (decks stopped, `station_fault`,
+  rebuilt from its CFG entry after a back-off); the others never notice.
+- Every list has a cap (`K.outbox_max`, `events_max`, `history_max`,
+  `queue_max`, `analyze_max`); nothing may grow with uptime. The Core
+  reports `mem_kb` every sync; `scenario_multi.lua` checks memory is flat.
 - Use the documented Q-SYS APIs (HttpClient.Upload, Timer, Component, dir,
   io on media/, rapidjson). Keep `Tick`, `Fast`, `Sync`, `Chores` timers
   global (a local timer can be garbage-collected).
 - After any change run every MockCore scenario (`for s in
   qsys/test/scenario_*.lua; do python3 qsys/test/run_mock.py $s; done`); add a
   case to `scenario_regressions.lua` for every bug fixed.
-- The Core's only files are `settings.json` and `outbox.json` (both for when
-  the server is unreachable). Per-file data (learned figures, unsupported)
+- The Core's only files are `settings.json` (`{stations: {id: {rev,
+  settings}}}`) and `outbox.json` (every station's events), both for when
+  the server is unreachable (the outbox also while a station's part is
+  answered `{error}`). Per-file data (learned figures, unsupported)
   and command state live on the server; don't add Core files.
 
 ## PostgreSQL: its own schema, PostgreSQL only
@@ -66,25 +85,51 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   (own throw-away schemas). PG 16 is installed in the cloud sandbox.
 
 ## Core <-> server protocol
-- `POST /api/v1/core/sync` (≈1/s, X-Radio-Token): events (station, boot,
-  seq unique; stored once, each in a savepoint), optional state, command ack,
-  `meters` (each deck's gain, peak, rms; kept on `stations` for the panel);
-  reply: commands with id > ack, settings when the rev differs, ack_reset.
-  One advisory lock per station serialises sync and `add_command`.
-- `POST /api/v1/core/library` after every scan (bulk `execute_values`);
-  reply: `learned` {key: {trail, lead, level, peak} | {unsupported}} for the Core.
+- `POST /api/v1/core/sync` (≈1/s, X-Radio-Token), ONE request for all the
+  Core's stations: `{version, boot, core, mem_kb, stations: [{station, ack,
+  settings_rev, ads_rev, analyze_rev?, meters, state?, events?, dropped?}]}`;
+  reply `{stations: {id: {commands, settings, settings_rev, ads, ads_rev,
+  analyze, analyze_rev, ack_reset, accepted, duplicates, rejected} |
+  {error}}}`. Events (station, boot, seq unique; stored once, each in a
+  savepoint; at most `K.sync_batch` per request, shared round-robin);
+  optional state (with `fault` when faulted); command ack; `meters` (each
+  deck's gain, peak, rms; kept on `stations` for the panel). Server: one
+  pooled connection, each station's part its own transaction (its advisory
+  lock for its own work only, committed before the next, logs after each
+  commit); a failing part is rolled back alone and answered `{error}` (the
+  Core keeps that station's events); `DatabaseUnavailable` / connection
+  loss = 503 for all. The 1.x body (no `stations`) is still accepted and
+  answered as before (one version of overlap). `cores.seen` keeps each
+  Core's boot / memory (lowest sample per 10-minute window) and logs the
+  leak warning. One advisory lock per station (`db.lock_station`)
+  serialises the sync and EVERY web write to that station's rows (commands,
+  holds, IDs, ad rules, settings, analysis, figures): take it first, before
+  touching any row (All stations: every station's, in name order). Lua
+  sends `{}` for an empty table: accept `{}` where a list is expected.
+- `POST /api/v1/core/library` after every scan, in parts of at most
+  `K.library_chunk` (1000) items: `{station, boot, scan, part, parts,
+  music_dir, imaging_dir, ads_dir, items}`, one upload in flight per Core.
+  Each part is upserted (bulk `execute_values`) and marked with the scan id
+  (`library.scan`, `stations.scan` / `scan_parts`); only the last part with
+  every part in marks the rest gone (an upload never shrinks the library);
+  a missing part = 409 and the Core sends the whole scan again. Reply:
+  `{ok, scan, part, parts}`, the last `{ok, items, learned}`, `learned`
+  {key: {trail, lead, level, peak} | {unsupported}} for the Core. A 1.x
+  upload (no scan) is one complete scan.
 - Level matching: `*_end` and `analysis` events carry `level` / `level_s` (rms
   average at unity, seconds heard) and `peak`; the server keeps their
   seconds-weighted energy average (`events.LEVEL_SET`) and the highest peak.
   The Core plays each item at its kind's gain + `levelTrim`; fades start from
   the deck's current gain, never from 0 dB.
 - File analysis (`analysis.py`): the server sends `analyze` [keys] when `analyze_rev` differs
-  (only to a Core that sends `analyze_rev`, i.e. has the RadioOut mixer); the Core measures
+  (only for a station that sends `analyze_rev`, i.e. has a `mixer` in its CFG entry); the Core measures
   them on the off-air deck (its mixer input muted; every on-air `Deck:play` unmutes) and
   reports `analysis` events. Analyzed figures are final (plays don't learn over them); a failure is
   retried by the next run, never the same one; one file (`analyze_wanted`) goes without a run.
 - Ads: the server sends `ads` {due, mix, next, next_why, ident, no_bumpers} when `ads_rev` differs
-  (`ads.py`); the Core only plays the plan (without one, every ad is a mix-in).
+  (`ads.py`); the Core only plays the plan (without one, every ad is a mix-in). The plan
+  is cached per station (`ads.cached_plan`: made again when the station's events were
+  accepted, when stale (`ads.stale`), at its own `plan_until` or after 30 s).
   `next` is the song to play next, picked on the server (`next_song`: least
   recently played, or by length to land the break on an ad slot); the Core
   takes it after the operator queue, once, and uses its own shuffle only when

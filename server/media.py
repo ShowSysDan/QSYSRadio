@@ -36,16 +36,15 @@ def supported(table='library'):
     return f'{table}.file_id NOT IN (SELECT id FROM media_files WHERE unsupported)'
 
 
-def link(cur, station, rows):
-    """The Core's files after a scan into the station's library (inside the caller's transaction, under its
-    station lock), each pointed at its file's figures: the row of its name and size, made when new; a file
-    of unknown size keeps its own row (a new one when it has none). Files not in the list are gone
-    (present = FALSE). A few bulk statements, whatever the number of files. rows: {key: (kind, directory,
-    file, artist, title, size, duration, lead, trail, peak)}; the last four only come from old Cores, which
-    sent what they had measured with the list (it still counts)."""
+def link(cur, station, rows, scan):
+    """Files of a scan (all of them, or one part) into the station's library (inside the caller's
+    transaction, under its station lock), present and marked with the scan id, each pointed at its file's
+    figures: the row of its name and size, made when new; a file of unknown size keeps its own row (a new
+    one when it has none). Files not in the scan stay as they are until it is complete (gone()). A few bulk
+    statements, whatever the number of files. rows: {key: (kind, directory, file, artist, title, size,
+    duration, lead, trail, peak)}; the last four only come from old Cores, which sent what they had
+    measured with the list (it still counts)."""
     keys = list(rows)
-    cur.execute('UPDATE library SET present = FALSE WHERE station = %s AND present AND key NOT IN (SELECT unnest(%s::text[]))',
-                (station, keys))
     known = sorted({(r[2], r[5]) for r in rows.values() if r[5] is not None})
     if known:
         # one statement in a fixed order: two stations adding the same new files at once wait, never deadlock
@@ -65,15 +64,15 @@ def link(cur, station, rows):
                         SELECT key, id FROM had WHERE id IS NOT NULL UNION ALL SELECT key, id FROM fresh""",
                     (unknown, [rows[k][2] for k in unknown], station))
         own = dict(cur.fetchall())
-    execute_values(cur, """INSERT INTO library (station, key, kind, directory, file, artist, title, size, file_id)
-                           SELECT v.station, v.key, v.kind, v.directory, v.file, v.artist, v.title, v.size, COALESCE(v.own, m.id)
-                           FROM (VALUES %s) AS v (station, key, kind, directory, file, artist, title, size, own)
+    execute_values(cur, """INSERT INTO library (station, key, kind, directory, file, artist, title, size, file_id, scan)
+                           SELECT v.station, v.key, v.kind, v.directory, v.file, v.artist, v.title, v.size, COALESCE(v.own, m.id), v.scan
+                           FROM (VALUES %s) AS v (station, key, kind, directory, file, artist, title, size, own, scan)
                            LEFT JOIN media_files m ON m.file = v.file AND m.size = v.size
                            ON CONFLICT (station, key) DO UPDATE SET kind = EXCLUDED.kind, directory = EXCLUDED.directory,
                                file = EXCLUDED.file, artist = EXCLUDED.artist, title = EXCLUDED.title, size = EXCLUDED.size,
-                               file_id = EXCLUDED.file_id, present = TRUE, last_seen = NOW()""",
-                   [(station, k) + rows[k][:6] + (own.get(k),) for k in keys],
-                   template='(%s, %s, %s, %s, %s, %s, %s, %s::bigint, %s::bigint)', page_size=1000)
+                               file_id = EXCLUDED.file_id, present = TRUE, last_seen = NOW(), scan = EXCLUDED.scan""",
+                   [(station, k) + rows[k][:6] + (own.get(k), scan) for k in keys],
+                   template='(%s, %s, %s, %s, %s, %s, %s, %s::bigint, %s::bigint, %s)', page_size=1000)
     # a file whose size is known now leaves the row of its unknown size behind: nothing else can use it
     # (found through index media_files_unknown_size: normally none)
     cur.execute("""DELETE FROM media_files m WHERE m.size IS NULL
@@ -89,3 +88,8 @@ def link(cur, station, rows):
                                      (COALESCE(v.duration, m.duration_s), COALESCE(v.lead, m.lead_in_s),
                                       COALESCE(v.trail, m.trail_s), COALESCE(v.peak, m.peak_dbfs))""",
                        legacy, template='(%s, %s, %s::float8, %s::float8, %s::float8, %s::float8)', page_size=1000)
+
+
+def gone(cur, station, scan):
+    """A complete scan: the station's files not in it are gone (present = FALSE; kept for the history)."""
+    cur.execute('UPDATE library SET present = FALSE WHERE station = %s AND present AND scan IS DISTINCT FROM %s', (station, scan))

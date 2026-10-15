@@ -14,7 +14,7 @@ ident_window_min of its time is skipped. Bumper holds do not stop IDs.
 import hashlib
 from datetime import datetime, timedelta, timezone
 
-from . import core_settings, media
+from . import ads, core_settings, db, media
 from .db import iso
 from .events import BadRequest
 
@@ -43,6 +43,7 @@ def set_hold(conn, station, what, until, user):
     if what not in WHAT:
         raise BadRequest('what must be ads or bumpers')
     with conn.cursor() as cur:
+        db.lock_station(cur, station)
         if until == 'off':
             cur.execute('DELETE FROM station_holds WHERE station = %s AND what = %s', (station, what))
             line = f'HOLD station={station} {what} resumed by={user.get("username")}'
@@ -59,22 +60,26 @@ def set_hold(conn, station, what, until, user):
                            ON CONFLICT (station, what) DO UPDATE SET until = EXCLUDED.until, set_by = EXCLUDED.set_by,
                                set_at = NOW()""", (station, what, when, user.get('username')))
             line = f'HOLD station={station} {what} until={iso(when) if when else "resumed"} by={user.get("username")}'
+        ads.stale(cur, station)
     conn.commit()
     return 20, line
 
 
 def set_ident(conn, station, key, ident):
     with conn.cursor() as cur:
+        db.lock_station(cur, station)
         cur.execute("""UPDATE library SET ident = %s WHERE station = %s AND key = %s AND kind = 'imaging' AND present""",
                     (bool(ident), station, key or ''))
         if not cur.rowcount:
             raise BadRequest('that imaging file is not in the library')
+        ads.stale(cur, station)
     conn.commit()
 
 
 def idents(cur, station, now=None):
     """The ID schedule: {'due': key | None, 'next_at': datetime | None, 'window_s', 'keys': [...]}.
-    due = the ID to play at the next song change (its slot is open and no ID played since it opened)."""
+    due = the ID to play at the next song change (its slot is open and no ID played since it opened),
+    then also due_until: when its slot's window closes."""
     s = core_settings.effective(cur, station)
     every = EVERY_MIN.get(s['ident_schedule'], 0)
     window = int(s['ident_window_min']) * 60
@@ -100,4 +105,5 @@ def idents(cur, station, now=None):
         return out                     # this slot's ID has played
     choices = [k for k in keys if not last or k != last['key']] or keys
     out['due'] = min(choices, key=lambda k: hashlib.md5((k + slot.isoformat()).encode()).hexdigest())
+    out['due_until'] = slot + timedelta(seconds=window)
     return out

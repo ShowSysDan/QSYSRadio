@@ -112,7 +112,7 @@
     sel.hidden = list.length < 2;
     const cur = R.station || (list[0] && list[0].station) || '';
     R.setHTML(sel, list.map((s) => '<option value="' + R.esc(s.station) + '"' + (s.station === cur ? ' selected' : '') + '>' +
-      R.esc(s.station) + (s.online ? '' : ' (offline)') + '</option>').join(''));
+      R.esc(s.station) + (s.online ? (s.fault ? ' (fault)' : '') : ' (offline)') + '</option>').join(''));
   }
   R.$('station-select')?.addEventListener('change', (e) => {
     R.station = e.target.value;
@@ -131,6 +131,7 @@
     if (!s) return setPill('wait', 'no core yet');
     const st = s.state || {};
     if (!s.online) return setPill('stopped', 'core offline');
+    if (st.fault) return setPill('stopped', 'fault · ' + s.station);
     if (st.automation && st.stop_after) return setPill('wait', 'stopping · ' + s.station);
     if (st.automation) return setPill('', 'on air · ' + s.station);
     return setPill('stopped', 'stopped · ' + s.station);

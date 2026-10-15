@@ -1,14 +1,28 @@
 """Station control: the Core's sync + library upload, operator commands, live
 status for the web page, library search, station settings. Ad schedules: ads.py.
 
-One advisory lock per station serialises the Core's sync with operators'
-commands, so command ids are committed in order and none can be skipped by
-the Core's "everything after my last ack" request.
+One radio.lua runs every station of its Core: one sync request a second
+carries all of them, each station handled in its own transaction (a 1.x
+Core's single-station body is still accepted). One advisory lock per station
+(db.lock_station, taken before any of the station's rows is touched) serialises
+the Core's sync with every web write to the station: so command ids are
+committed in order and none can be skipped by the Core's "everything after my
+last ack" request, and no web write can deadlock with that station's sync. A
+file's figures (media_files) are shared by every station that has it, so a
+change to many files at once (Forget measured for a kind) can still meet
+another station's sync writing the same rows; PostgreSQL then cancels one of
+the two: the sync part is answered {error} (the Core sends it again), the web
+write 409 (app.py; nothing changed, try again).
 """
 import json
+import time
+import uuid
 from datetime import timedelta
 
-from . import ads, analysis, breaks, clock, core_settings, events, logs, media
+import psycopg2
+import psycopg2.extensions
+
+from . import ads, analysis, breaks, clock, core_settings, cores, db, events, logs, media
 from .db import clean_json, iso, like, number, text
 from .events import BadRequest
 
@@ -32,10 +46,6 @@ COMMANDS = {
     'queue_clear': ('Clear queue', False),
     'rescan': ('Rescan library', False),
 }
-
-
-def _lock_station(cur, station):
-    cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (f'qsysradio:station:{station}',))
 
 
 def _station_name(payload):
@@ -66,6 +76,8 @@ def _clean_state(state):
             s[key] = {}
     for key in ('automation', 'stop_after', 'bumper_requested', 'ad_requested'):
         s[key] = s.get(key) is True
+    if 'fault' in s:                # the Core could not build or run the station: why (it retries by itself)
+        s['fault'] = text(s['fault'], 300)
     return s
 
 
@@ -84,81 +96,164 @@ def _clean_meters(meters):
 
 
 # ── Core side ────────────────────────────────────────────────────────────────
+SYNC_STATIONS_MAX = 100     # stations in one sync body (any more are left out)
+LIBRARY_PARTS_MAX = 1000    # parts in one library scan
+FAIL_LOG_S = 60             # a station whose sync keeps failing is logged at most this often
 
-def core_sync(conn, payload, now):
-    """The Core's once-a-second request: events, optional state, command ack.
-    Returns (reply, log_lines)."""
+
+class ScanIncomplete(BadRequest):
+    """The last part of a library scan came without every other part: 409, the Core sends the scan again."""
+
+
+def _station_sync(cur, station, part, core, version, boot, now):
+    """One station's part of the Core's sync, in its own transaction under its station lock: events,
+    optional state, command ack and meters in; commands, settings, ads plan and files to analyze out.
+    core None: a 1.x Core (stations.core unchanged). Returns (reply, log_lines)."""
+    ack = _int(part.get('ack'), 0, 2 ** 62, 0)
+    state = _clean_state(part.get('state'))
+    reply, lines = {}, []
+    db.lock_station(cur, station)
+    cur.execute('SELECT boot FROM stations WHERE station = %s', (station,))
+    prev = cur.fetchone()
+    if prev and prev['boot'] != boot:
+        # the Core restarted (it starts again from ack 0): a command it picked up
+        # but never reported must not run twice; undelivered ones still go
+        cur.execute("""UPDATE commands SET done_at = NOW(), ok = FALSE, note = 'the Core restarted before reporting'
+                       WHERE station = %s AND done_at IS NULL AND delivered_at IS NOT NULL""", (station,))
+    meters = _clean_meters(part.get('meters'))
+    settings_rev = text(part.get('settings_rev'), 50) or ''
+    cur.execute("""INSERT INTO stations (station, radio_version, boot, settings_rev, last_seen, meters, core)
+                   VALUES (%s, %s, %s, %s, NOW(), %s, %s)
+                   ON CONFLICT (station) DO UPDATE SET radio_version = EXCLUDED.radio_version,
+                       boot = EXCLUDED.boot, settings_rev = EXCLUDED.settings_rev, last_seen = NOW(),
+                       meters = EXCLUDED.meters, core = COALESCE(EXCLUDED.core, stations.core)""",
+                (station, version, boot, settings_rev, json.dumps(meters) if meters else None, core))
+    if state is not None:
+        cur.execute('UPDATE stations SET state = %s, state_at = NOW() WHERE station = %s', (json.dumps(state), station))
+    accepted = 0
+    evs = [] if part.get('events') == {} else part.get('events')       # Lua encodes an empty table as {}
+    if evs is not None:
+        accepted, dupes, rejected, lines = events.ingest(cur, station, version, evs, now)
+        reply.update(accepted=accepted, duplicates=dupes, rejected=rejected)
+    dropped = part.get('dropped')
+    if isinstance(dropped, int) and not isinstance(dropped, bool) and dropped > 0:
+        lines.append((30, f'station={station} outbox overflowed: {dropped} event(s) lost on the Core'))
+    cur.execute(f"""UPDATE commands SET done_at = NOW(), ok = FALSE,
+                       note = CASE WHEN delivered_at IS NULL THEN 'expired: the Core did not pick it up'
+                                   ELSE 'no result from the Core' END
+                    WHERE station = %s AND done_at IS NULL
+                      AND ((delivered_at IS NULL AND created_at < NOW() - INTERVAL '{COMMAND_TTL_S} seconds')
+                        OR delivered_at < NOW() - INTERVAL '{RESULT_TTL_S} seconds')""", (station,))
+    cur.execute(f"""SELECT id, cmd, args, requested_by FROM commands
+                    WHERE station = %s AND id > %s AND done_at IS NULL
+                      AND created_at > NOW() - INTERVAL '{COMMAND_TTL_S} seconds'
+                    ORDER BY id LIMIT 20""", (station, ack))
+    rows = cur.fetchall()
+    if rows:
+        cur.execute('UPDATE commands SET delivered_at = NOW() WHERE id = ANY(%s) AND delivered_at IS NULL',
+                    ([r['id'] for r in rows],))
+    reply['commands'] = [{'id': r['id'], 'cmd': r['cmd'], 'args': r['args'], 'by': r['requested_by']} for r in rows]
+    cur.execute('SELECT COALESCE(MAX(id), 0) FROM commands WHERE station = %s', (station,))
+    newest = cur.fetchone()[0]
+    if ack > newest:            # server DB was reset: tell the Core to start over
+        reply['ack_reset'] = newest
+    values = core_settings.for_core(core_settings.merged(cur, station))
+    rev = core_settings.rev(values)
+    if settings_rev != rev:
+        reply['settings'], reply['settings_rev'] = values, rev
+    plan, rev = ads.cached_plan(cur, station, fresh=accepted > 0)
+    if (text(part.get('ads_rev'), 50) or '') != rev:
+        reply['ads'], reply['ads_rev'] = plan, rev
+    more, done = analysis.sync(cur, station, (text(part.get('analyze_rev'), 50) or '') if 'analyze_rev' in part else None)
+    reply.update(more)
+    return reply, lines + done
+
+
+_failed_logged = {}         # station (or core:<id>) -> monotonic time its failure was last logged
+
+
+def _part_failed(conn, name, exc):
+    """One station's part (or the Core's own bookkeeping, name core:<id>) failed: roll it back so the rest
+    goes on, and say so (to the Core: {error}; in the log at most every FAIL_LOG_S). The database itself
+    gone is everyone's: DatabaseUnavailable, 503 for the whole request."""
+    lost = isinstance(exc, db.DatabaseUnavailable) or (
+        isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError))
+        and not isinstance(exc, psycopg2.extensions.TransactionRollbackError))     # a deadlock is one station's
+    if not lost:
+        try:
+            conn.rollback()
+        except psycopg2.Error:
+            lost = True
+    if lost or conn.closed:
+        if isinstance(exc, db.DatabaseUnavailable):
+            raise exc
+        raise db.DatabaseUnavailable(f'database lost during the Core sync: {exc}'.strip()) from exc
+    error = text(str(exc).strip() or type(exc).__name__, 300)
+    t, lines = time.monotonic(), []
+    if t - _failed_logged.get(name, -1e9) >= FAIL_LOG_S:
+        if len(_failed_logged) > 1000:
+            _failed_logged.clear()
+        _failed_logged[name] = t
+        lines.append((30 if isinstance(exc, BadRequest) else 40,
+                      f'{name if name.startswith("core:") else "station=" + name} sync failed, rolled back '
+                      f'(the other stations go on): {type(exc).__name__}: {error}'))
+    return {'error': error}, lines
+
+
+def core_sync(conn, payload, now, log):
+    """The Core's once-a-second request. Returns the reply; log(lines) is called after each commit.
+    2.x: {version, boot, core, mem_kb, stations: [{station, ack, settings_rev, ads_rev, analyze_rev?, meters,
+    state?, events?, dropped?}]} -> {stations: {id: reply | {error}}}; each station is its own transaction
+    (its lock held for its work only, committed before the next): one station's failure rolls back that
+    station alone, which gets {error} and sends its events again. 1.x: one station's part at the top level
+    ({station, version, boot, ack, ...}) -> that station's reply, as before 2.0."""
     if not isinstance(payload, dict):
         raise BadRequest('expected a JSON object')
-    station = _station_name(payload)
-    ack = _int(payload.get('ack'), 0, 2 ** 62, 0)
-    state = _clean_state(payload.get('state'))
-    reply, lines = {}, []
-    boot = text(payload.get('boot'), 100)
-    with conn.cursor() as cur:
-        _lock_station(cur, station)
-        cur.execute('SELECT boot FROM stations WHERE station = %s', (station,))
-        prev = cur.fetchone()
-        if prev and prev['boot'] != boot:
-            # the Core restarted (it starts again from ack 0): a command it picked up
-            # but never reported must not run twice; undelivered ones still go
-            cur.execute("""UPDATE commands SET done_at = NOW(), ok = FALSE, note = 'the Core restarted before reporting'
-                           WHERE station = %s AND done_at IS NULL AND delivered_at IS NOT NULL""", (station,))
-        meters = _clean_meters(payload.get('meters'))
-        cur.execute("""INSERT INTO stations (station, radio_version, boot, settings_rev, last_seen, meters)
-                       VALUES (%s, %s, %s, %s, NOW(), %s)
-                       ON CONFLICT (station) DO UPDATE SET radio_version = EXCLUDED.radio_version,
-                           boot = EXCLUDED.boot, settings_rev = EXCLUDED.settings_rev, last_seen = NOW(),
-                           meters = EXCLUDED.meters""",
-                    (station, text(payload.get('version'), 50), boot, text(payload.get('settings_rev'), 50) or '',
-                     json.dumps(meters) if meters else None))
-        if state is not None:
-            cur.execute('UPDATE stations SET state = %s, state_at = NOW() WHERE station = %s',
-                        (json.dumps(state), station))
-        if payload.get('events') is not None:
-            accepted, dupes, rejected, lines = events.ingest(
-                cur, station, text(payload.get('version'), 50), payload['events'], now)
-            reply.update(accepted=accepted, duplicates=dupes, rejected=rejected)
-            dropped = payload.get('dropped')
-            if isinstance(dropped, int) and dropped > 0:
-                lines.append((30, f'station={station} outbox overflowed: {dropped} event(s) lost on the Core'))
-        cur.execute(f"""UPDATE commands SET done_at = NOW(), ok = FALSE,
-                           note = CASE WHEN delivered_at IS NULL THEN 'expired: the Core did not pick it up'
-                                       ELSE 'no result from the Core' END
-                        WHERE station = %s AND done_at IS NULL
-                          AND ((delivered_at IS NULL AND created_at < NOW() - INTERVAL '{COMMAND_TTL_S} seconds')
-                            OR delivered_at < NOW() - INTERVAL '{RESULT_TTL_S} seconds')""", (station,))
-        cur.execute(f"""SELECT id, cmd, args, requested_by FROM commands
-                        WHERE station = %s AND id > %s AND done_at IS NULL
-                          AND created_at > NOW() - INTERVAL '{COMMAND_TTL_S} seconds'
-                        ORDER BY id LIMIT 20""", (station, ack))
-        rows = cur.fetchall()
-        if rows:
-            cur.execute('UPDATE commands SET delivered_at = NOW() WHERE id = ANY(%s) AND delivered_at IS NULL',
-                        ([r['id'] for r in rows],))
-        reply['commands'] = [{'id': r['id'], 'cmd': r['cmd'], 'args': r['args'], 'by': r['requested_by']}
-                             for r in rows]
-        cur.execute('SELECT COALESCE(MAX(id), 0) FROM commands WHERE station = %s', (station,))
-        newest = cur.fetchone()[0]
-        if ack > newest:            # server DB was reset: tell the Core to start over
-            reply['ack_reset'] = newest
-        values = core_settings.for_core(core_settings.merged(cur, station))
-        rev = core_settings.rev(values)
-        if (text(payload.get('settings_rev'), 50) or '') != rev:
-            reply['settings'], reply['settings_rev'] = values, rev
-        plan, rev = ads.plan(cur, station)
-        if (text(payload.get('ads_rev'), 50) or '') != rev:
-            reply['ads'], reply['ads_rev'] = plan, rev
-        more, done = analysis.sync(cur, station, (text(payload.get('analyze_rev'), 50) or '') if 'analyze_rev' in payload else None)
-        reply.update(more)
-        lines += done
-    conn.commit()
-    return reply, lines
+    version, boot = text(payload.get('version'), 50), text(payload.get('boot'), 100)
+    if 'stations' not in payload:
+        station = _station_name(payload)
+        with conn.cursor() as cur:
+            reply, lines = _station_sync(cur, station, payload, None, version, boot, now)
+        conn.commit()
+        log(lines)
+        return reply
+    parts = [] if payload['stations'] == {} else payload['stations']
+    if not isinstance(parts, list):
+        raise BadRequest('stations must be a list')
+    core = text(payload.get('core'), 200)
+    if core:
+        mem = number(payload.get('mem_kb'))
+        try:
+            with conn.cursor() as cur:
+                lines = cores.seen(cur, core, boot, version, mem if mem is not None and 0 <= mem < 2 ** 40 else None)
+            conn.commit()
+        except Exception as exc:          # noqa: BLE001 (the stations' work goes on)
+            lines = _part_failed(conn, 'core:' + core, exc)[1]
+        log(lines)
+    replies = {}
+    for part in parts[:SYNC_STATIONS_MAX]:
+        station = text(part.get('station'), 200) if isinstance(part, dict) else None
+        if not station or station in replies:
+            continue
+        try:
+            with conn.cursor() as cur:
+                reply, lines = _station_sync(cur, station, part, core, version, boot, now)
+            conn.commit()
+        except Exception as exc:          # noqa: BLE001 (one station's failure is that station's alone)
+            reply, lines = _part_failed(conn, station, exc)
+        replies[station] = reply
+        log(lines)
+    return {'stations': replies}
 
 
 def core_library(conn, payload):
-    """The Core's file list after a scan. Returns (count, per-file figures the
-    Core uses: {key: {trail, lead, level, peak} | {unsupported}}, log_line).
+    """The Core's file list after a scan. 2.x: in parts ({station, boot, scan, part, parts, music_dir,
+    imaging_dir, ads_dir, items}, at most 1000 items each, one at a time); 1.x: whole (no scan): one complete
+    scan. Each part's files are upserted and marked with the scan id; only the last part, with every part of
+    the scan in, marks the station's files not in it gone, so an interrupted or partial upload never shrinks
+    the library (its last part without the others: ScanIncomplete, 409; the Core sends the scan again).
+    Returns (reply, log line or None): before the last part {ok, scan, part, parts}; the last {ok, items (in
+    the scan), learned: the per-file figures the Core uses, {key: {trail, lead, level, peak} | {unsupported}}}.
     The figures are the file's, shared by every station that has it (media.py)."""
     station = _station_name(payload)
     items = payload.get('items')
@@ -166,6 +261,13 @@ def core_library(conn, payload):
         items = []
     if not isinstance(items, list):
         raise BadRequest('items must be a list')
+    scan = text(payload.get('scan'), 100)
+    if scan is None:                # 1.x: the whole list at once
+        scan, part, parts = 'whole-' + uuid.uuid4().hex, 1, 1
+    else:
+        part, parts = _int(payload.get('part'), 1, LIBRARY_PARTS_MAX), _int(payload.get('parts'), 1, LIBRARY_PARTS_MAX)
+        if part is None or parts is None or part > parts:
+            raise BadRequest(f'part and parts must be whole numbers, 1 <= part <= parts <= {LIBRARY_PARTS_MAX}')
     rows = {}
     for it in items[:100000]:
         if not isinstance(it, dict) or it.get('kind') not in KINDS or not text(it.get('key'), 1000):
@@ -177,14 +279,31 @@ def core_library(conn, payload):
             size if isinstance(size, int) and not isinstance(size, bool) and 0 < size < 2 ** 62 else None,
             number(it.get('duration')), number(it.get('lead_in')), number(it.get('trail')), number(it.get('peak')))
     with conn.cursor() as cur:
-        _lock_station(cur, station)
-        media.link(cur, station, rows)
-        cur.execute("""INSERT INTO stations (station, library_at, music_dir, imaging_dir, ads_dir)
-                       VALUES (%s, NOW(), %s, %s, %s)
+        db.lock_station(cur, station)
+        cur.execute('SELECT scan, scan_parts FROM stations WHERE station = %s', (station,))
+        had = cur.fetchone()
+        got = sorted(set(had['scan_parts'] if had and had['scan'] == scan else []) | {part})
+        missing = sorted(set(range(1, parts + 1)) - set(got)) if part == parts else None
+        if missing:
+            conn.rollback()           # nothing written; the handler logs it outside the transaction
+            raise ScanIncomplete(f'library scan {scan} of station {station}: part(s) {", ".join(map(str, missing[:10]))} '
+                                 f'of {parts} not received; send the whole scan again')
+        media.link(cur, station, rows, scan)
+        if part < parts:
+            cur.execute("""INSERT INTO stations (station, scan, scan_parts) VALUES (%s, %s, %s)
+                           ON CONFLICT (station) DO UPDATE SET scan = EXCLUDED.scan, scan_parts = EXCLUDED.scan_parts""",
+                        (station, scan, got))
+            conn.commit()
+            return {'ok': True, 'scan': scan, 'part': part, 'parts': parts}, None
+        media.gone(cur, station, scan)
+        cur.execute("""INSERT INTO stations (station, library_at, music_dir, imaging_dir, ads_dir, scan, scan_parts)
+                       VALUES (%s, NOW(), %s, %s, %s, %s, %s)
                        ON CONFLICT (station) DO UPDATE SET library_at = NOW(), music_dir = EXCLUDED.music_dir,
-                           imaging_dir = EXCLUDED.imaging_dir, ads_dir = EXCLUDED.ads_dir""",
+                           imaging_dir = EXCLUDED.imaging_dir, ads_dir = EXCLUDED.ads_dir, scan = EXCLUDED.scan,
+                           scan_parts = EXCLUDED.scan_parts""",
                     (station, text(payload.get('music_dir'), 500), text(payload.get('imaging_dir'), 500),
-                     text(payload.get('ads_dir'), 500)))
+                     text(payload.get('ads_dir'), 500), scan, got))
+        ads.stale(cur, station)
         # what the Core uses: unsupported files, the quiet start / end (where to start, when to hand over) and
         # the average level with its peak (level matching); fixed = the operator set a figure, analyzed =
         # measured off air: the Core does not learn over either
@@ -200,22 +319,26 @@ def core_library(conn, payload):
                         **{k: round(r[k], 1) for k in ('level', 'peak') if r[k] is not None},
                         **{k: True for k in ('fixed', 'analyzed') if r[k]})
                    for r in cur.fetchall()}
+        cur.execute('SELECT kind, count(*) FROM library WHERE station = %s AND present GROUP BY kind', (station,))
+        counts = dict(cur.fetchall())
     conn.commit()
-    counts = ' '.join(f'{k}={sum(1 for r in rows.values() if r[0] == k)}' for k in KINDS)
-    return len(rows), learned, (20, f'LIBRARY station={station} {counts}')
+    return ({'ok': True, 'items': sum(counts.values()), 'learned': learned},
+            (20, f'LIBRARY station={station} ' + ' '.join(f'{k}={counts.get(k, 0)}' for k in KINDS)
+                 + (f' parts={parts}' if parts > 1 else '')))
 
 
 # ── Web side ─────────────────────────────────────────────────────────────────
 
 def stations(conn):
     with conn.cursor() as cur:
-        cur.execute(f"""SELECT station, last_seen, radio_version,
+        cur.execute(f"""SELECT station, last_seen, radio_version, core,
                                last_seen > NOW() - INTERVAL '{ONLINE_S} seconds' AS online,
                                state->'automation' = 'true'::jsonb AS automation,
-                               state->'stop_after' = 'true'::jsonb AS stop_after
+                               state->'stop_after' = 'true'::jsonb AS stop_after,
+                               left(state->>'fault', 300) AS fault
                         FROM stations ORDER BY last_seen DESC""")
-        return [{'station': r['station'], 'online': r['online'], 'version': r['radio_version'],
-                 'automation': bool(r['automation']), 'stop_after': bool(r['stop_after']),
+        return [{'station': r['station'], 'online': r['online'], 'version': r['radio_version'], 'core': r['core'],
+                 'automation': bool(r['automation']), 'stop_after': bool(r['stop_after']), 'fault': r['fault'],
                  'last_seen': iso(r['last_seen'])} for r in cur.fetchall()]
 
 
@@ -234,7 +357,7 @@ def status(conn, station):
     """Live Core state + recent commands for the dashboard. state_age_s says
     how old the Core's elapsed/remaining figures are."""
     with conn.cursor() as cur:
-        cur.execute("""SELECT station, state, radio_version, boot, last_seen, library_at, meters,
+        cur.execute("""SELECT station, state, radio_version, boot, core, last_seen, library_at, meters,
                               EXTRACT(EPOCH FROM NOW() - last_seen) AS age,
                               EXTRACT(EPOCH FROM NOW() - state_at) AS state_age
                        FROM stations WHERE station = %s""", (station,))
@@ -256,7 +379,7 @@ def status(conn, station):
     age = float(r['age'])
     return {'station': r['station'], 'online': age < ONLINE_S, 'age_s': round(age, 1),
             'state_age_s': round(float(r['state_age']), 2) if r['state_age'] is not None else None,
-            'version': r['radio_version'], 'boot': r['boot'], 'last_seen': iso(r['last_seen']),
+            'version': r['radio_version'], 'boot': r['boot'], 'core': r['core'], 'last_seen': iso(r['last_seen']),
             'library_at': iso(r['library_at']), 'state': state, 'meters': r['meters'], 'commands': cmds, 'next_ad': next_ad,
             'holds': holds, 'ident': {'due': ids['due'], 'next_at': iso(ids['next_at']), 'count': len(ids['keys'])},
             'analysis': analyze}
@@ -320,11 +443,12 @@ def add_command(conn, station, cmd, args, user):
                     raise BadRequest('to must be a queue position')
             if key:
                 clean['key'] = key
-        _lock_station(cur, station)
+        db.lock_station(cur, station)
         cur.execute("""INSERT INTO commands (station, cmd, args, label, requested_by, requested_by_id)
                        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
                     (station, cmd, json.dumps(clean), label, user.get('username'), user.get('user_id')))
         cid = cur.fetchone()['id']
+        ads.stale(cur, station)
     conn.commit()
     return cid, (20, f'COMMAND station={station} id={cid} {label} by={user.get("username")}')
 
@@ -340,6 +464,7 @@ def set_trim(conn, station, key, lead, trail, user):
             raise BadRequest(f'{name} must be 0–600 seconds, or empty to use the measured one')
         vals.append(None if n is None else round(n, 2))
     with conn.cursor() as cur:
+        db.lock_station(cur, station)
         cur.execute(f"""UPDATE media_files SET lead_set_s = %(lead)s, trail_set_s = %(trail)s
                         WHERE {media.file_of(present=True)} RETURNING id""",
                     dict(lead=vals[0], trail=vals[1], station=station, key=key or ''))
@@ -360,6 +485,7 @@ def forget_measured(conn, station, key, kind, user):
     if not key and kind not in KINDS:
         raise BadRequest('give a file (key) or a kind')
     with conn.cursor() as cur:
+        db.lock_station(cur, station)
         cur.execute("""UPDATE media_files SET lead_in_s = NULL, trail_s = NULL, analyzed_at = NULL, analyze_failed_at = NULL,
                               level_db = NULL, level_s = NULL, peak_dbfs = NULL
                        WHERE (lead_in_s IS NOT NULL OR trail_s IS NOT NULL OR analyzed_at IS NOT NULL
@@ -504,9 +630,13 @@ def _save(conn, form, user, spec, what, prefix=core_settings.PREFIX, station=Non
         except ValueError as exc:
             raise BadRequest(str(exc))
     with conn.cursor() as cur:
+        if prefix == core_settings.PREFIX:
+            db.lock_station(cur, station)        # All stations: every station's lock (their plans go stale)
         before = core_settings.layer(cur, station) if station else core_settings.load(cur, prefix, by_name)
         changed = {k: v for k, v in changes.items() if before.get(k) != v}
         core_settings.save(cur, changed, prefix, station)
+        if changed and prefix == core_settings.PREFIX:
+            ads.stale(cur, station)              # All stations: every station's plan
     conn.commit()
     below = lambda k: 'all-stations' if station and k not in core_settings.STATION_ONLY else 'default'
     line = None

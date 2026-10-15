@@ -21,7 +21,7 @@ from .db import clean_json, number, text
 
 START_KINDS = {'track_start': 'music', 'bumper_start': 'imaging', 'ad_start': 'ad'}
 END_KINDS = {'track_end': 'music', 'bumper_end': 'imaging', 'ad_end': 'ad'}
-WARN_KINDS = {'file_unsupported', 'file_failed', 'dead_air_guard', 'library_empty'}
+WARN_KINDS = {'file_unsupported', 'file_failed', 'dead_air_guard', 'library_empty', 'station_fault'}
 _META = ('kind', 't', 'at', 'boot', 'seq')
 SEQ_MAX = 2 ** 31 - 1
 # one measurement's level figures (%(level)s dB over %(level_s)s seconds, %(peak)s): a file's average level is the
@@ -55,6 +55,7 @@ def clean(ev):
     if not kind or not boot or not isinstance(seq, int) or isinstance(seq, bool) or not 0 <= seq <= SEQ_MAX or not at:
         return None
     data = clean_json(ev)
+    data.pop('station', None)          # 2.x: the station whose sync part carried it is the station
     data.update(kind=kind, boot=boot, seq=seq)
     data['_at'] = at
     return data

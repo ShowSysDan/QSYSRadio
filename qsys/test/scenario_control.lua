@@ -47,38 +47,37 @@ local SETTINGS_AT, SETTINGS_REV = 40, "r1"
 local SERVER_SETTINGS_VALUES = { crossfade_s = 2, bumper_every_n_tracks = 0 }
 
 local libraryPosts, snapshots, delivered, syncs = {}, {}, {}, 0
-MockCore.httpHandler = function(req)
-  local body = json.decode(req.Data)
-  if req.Url:match("/core/library$") then libraryPosts[#libraryPosts + 1] = body; return 200, '{"ok":true}' end
-  if req.Url:match("/core/sync$") then
+MockCore.serve{
+  library = function(station, items, body)
+    libraryPosts[#libraryPosts + 1] = { station = station, items = items, music_dir = body.music_dir }
+  end,
+  sync = function(part)
     syncs = syncs + 1
-    if body.state then snapshots[#snapshots + 1] = { t = MockCore.clock, state = body.state } end
+    if part.state then snapshots[#snapshots + 1] = { t = MockCore.clock, state = part.state } end
     local out = {}
     for _, c in ipairs(COMMANDS) do
-      if c.at <= MockCore.clock and c.id > (body.ack or 0) then
+      if c.at <= MockCore.clock and c.id > (part.ack or 0) then
         out[#out + 1] = { id = c.id, cmd = c.cmd, args = c.args, by = "tester" }
         delivered[c.id] = (delivered[c.id] or 0) + 1
       end
     end
     local resp = { commands = out }
-    if MockCore.clock >= SETTINGS_AT and body.settings_rev ~= SETTINGS_REV then
+    if MockCore.clock >= SETTINGS_AT and part.settings_rev ~= SETTINGS_REV then
       resp.settings, resp.settings_rev = SERVER_SETTINGS_VALUES, SETTINGS_REV
     end
-    return 200, json.encode(resp)
-  end
-  return 200, '{"ok":true}'
-end
+    return resp
+  end,
+}
 
-dofile("qsys/radio/radio.lua")
-CFG.SERVER_URL = "http://radio-server:5410"
-SETTINGS.bumper_every_n_tracks = 0
-Server.libraryDirty = true   -- boot scanned before SERVER_URL was set
+MockCore.loadRadio{ SERVER_URL = "http://radio-server:5410" }
+local S = Radio.stations[1]
+S.settings.bumper_every_n_tracks = 0
 
 local stateAt = {}
-for _, t in ipairs({ 11, 13, 60 }) do MockCore.at(t, function() stateAt[t] = Station.snapshot(MockCore.clock) end) end
+for _, t in ipairs({ 11, 13, 60 }) do MockCore.at(t, function() stateAt[t] = S:snapshot(MockCore.clock) end) end
 MockCore.run(200)
 local offAt200 = nil
-MockCore.at(208, function() offAt200 = { automation = Station.automation, state = Station.state, busy = DeckA:isBusy() or DeckB:isBusy() } end)
+MockCore.at(208, function() offAt200 = { automation = S.automation, state = S.state, busy = S:busy() } end)
 MockCore.run(70)
 
 local fails = 0
@@ -87,7 +86,7 @@ local function evs(kind) local o = {} for _, e in ipairs(EVENTS) do if e.kind ==
 local function firstAfter(kind, t) for _, e in ipairs(EVENTS) do if e.kind == kind and e.at >= t then return e end end end
 
 local lib = libraryPosts[1]
-check(lib and #lib.items == 8 and lib.items[1].key and lib.music_dir == "Test/Tuning/", "library uploaded (8 items with keys)")
+check(lib and lib.station == "Main" and #lib.items == 8 and lib.items[1].key and lib.music_dir == "Test/Tuning/", "library uploaded (8 items with keys)")
 check(syncs > 200 and #snapshots > 20 and #snapshots < syncs / 2 and snapshots[#snapshots].state.decks.A
   and snapshots[#snapshots].state.library.music == 6,
   string.format("synced every second (%d); full state only on change or every 10 s (%d times)", syncs, #snapshots))
@@ -115,11 +114,12 @@ check(pn and pn.file == "Delta - Four.wav" and pn.at < 73 and tr and tr.reason =
 local b = firstAfter("bumper_start", 80)
 check(b and b.file == "bumper_02.wav" and b.at < 83, "bumper_now with a chosen bumper")
 
-check(SETTINGS.crossfade_s == 2 and SETTINGS.bumper_every_n_tracks == 0 and Server.settingsRev == "r1"
+check(S.settings.crossfade_s == 2 and S.settings.bumper_every_n_tracks == 0 and S.settingsRev == "r1"
   and #evs("settings_applied") == 1, "server settings applied once (rev r1)")
 local f = io.open(FILES.settings, "r")
 local saved = f and json.decode(f:read("*a")); if f then f:close() end
-check(saved and saved.rev == "r1" and saved.settings.crossfade_s == 2, "settings saved on the Core")
+saved = saved and saved.stations and saved.stations.Main
+check(saved and saved.rev == "r1" and saved.settings.crossfade_s == 2, "settings saved on the Core (per station)")
 check(stateAt[60].settings.crossfade_s == 2, "state reports the applied settings")
 
 local off = nil

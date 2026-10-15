@@ -84,7 +84,7 @@ SPEC = [
     ('analyze_at', 'Analyze new files daily at', 'Silence detection', 'choice',
      ('off',) + tuple(f'{h:02d}:00' for h in range(24)), None, None, '04:00',
      'Each day at this time (server time) the Core measures the quiet start, end and average level of every file not analyzed yet, '
-     'on the deck that is off air (its RadioOut input muted), between songs. An analyzed quiet start and end are final: '
+     'on the deck that is off air (its input on the station\'s mixer muted), between songs. An analyzed quiet start and end are final: '
      'plays no longer learn over them (the level keeps learning). The library pages can also start a run.'),
 
     ('artist_separation', 'Artist separation', 'Rotation', 'int', 0, 20, 1, 2,
