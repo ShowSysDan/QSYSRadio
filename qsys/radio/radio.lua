@@ -2,7 +2,7 @@
 -- background-music zone) and its file analysis players. Docs: README.md.
 -- Station settings are edited on the server's web page and pushed here; SETTINGS below are only the
 -- fallback until the server has been reached once.
-RADIO_VERSION = "2.2.0"
+RADIO_VERSION = "2.3.0"
 
 CFG = {
   SERVER_URL = "",     -- e.g. "http://10.0.0.20:5410"; "" = run standalone

@@ -40,6 +40,18 @@ def clean_analyzers(value):
     return out
 
 
+def view(cur):
+    """Every Core for the Stations page: {core: {online, version, mem_kb, mem_warning}}. mem_warning: the leak
+    warning was given in the last WARN_EVERY_MIN minutes of this boot (a leak that goes on warns again, so it
+    stays on; a restart clears it)."""
+    cur.execute(f"""SELECT core, version, mem_kb, last_seen > NOW() - INTERVAL '{ONLINE_S} seconds' AS online,
+                           COALESCE(mem_warned_at > NOW() - INTERVAL '{WARN_EVERY_MIN} minutes'
+                                    AND mem_warned_at >= booted_at, FALSE) AS mem_warning
+                    FROM cores""")
+    return {r['core']: {'online': r['online'], 'version': r['version'], 'mem_kb': r['mem_kb'],
+                        'mem_warning': r['mem_warning']} for r in cur.fetchall()}
+
+
 def seen(cur, core, boot, version, mem_kb, analyzers=None):
     """Record one sync of this Core (inside the caller's transaction). mem_kb: its Lua memory (KB) or None;
     analyzers: clean_analyzers() of its report, None = not sent (the last one stays, a new boot forgets it).

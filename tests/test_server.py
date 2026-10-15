@@ -1263,6 +1263,10 @@ def test_holds_and_station_ids(app):
     assert 'ident' not in plan()                                                           # schedule off
     settings = lambda **v: admin.post('/api/v1/settings', json={'settings': v}, headers=WEB)
     assert settings(ident_schedule='often').status_code == 400
+    now = datetime.now(timezone.utc)
+    to_quarter = 900 - (now.minute % 15 * 60 + now.second + now.microsecond / 1e6)
+    if to_quarter < 90:                    # a new slot opening mid-test would owe an ID again: start after it
+        time.sleep(to_quarter + 1)
     assert settings(ident_schedule='quarter-hourly', ident_window_min=15).status_code == 200
     try:
         owed = plan().get('ident')
@@ -1701,6 +1705,100 @@ def test_faulted_station_shows_on_the_panel(app):
     assert r.status_code == 200 and r.json['station']['state']['queue'] == [] and r.json['station']['state']['retry_s'] == 30
     # its Core has an analysis player: the Music page names the fault, and the players, not the CFG
     assert r.json['station']['analysis']['can'] is True
+
+
+@contextmanager
+def queries():
+    """The SQL statements run meanwhile (every cursor of the app's connections)."""
+    import psycopg2.extras
+    seen, real = [], psycopg2.extras.DictCursor.execute
+
+    def counting(cur, query, args=None):
+        seen.append(query)
+        return real(cur, query, args)
+    psycopg2.extras.DictCursor.execute = counting
+    try:
+        yield seen
+    finally:
+        psycopg2.extras.DictCursor.execute = real
+
+
+def test_stations_overview(app):
+    """The Stations page: every station by name in one poll: on air with its live deck, meter and what is next; a
+    fault and why; a one-player zone; an offline station with what the play log last had on air; each Core's memory
+    warning and radio.lua version; the commands the page waits on. A fixed number of queries however many
+    stations there are. Viewers read it, only operators command."""
+    deck = {'state': 'playing', 'live': True, 'kind': 'music', 'artist': '<b>A</b>', 'title': 'Song', 'file': 'a.mp3', 'key': 'M/a.mp3',
+            'elapsed': 20, 'remaining': 180, 'duration': 200, 'trim': -2, 'gain': 0}
+    on = dict(STATE, players=2, decks={'A': deck, 'B': {'state': 'idle'}},
+              next_up={'key': 'M/n.mp3', 'artist': 'N', 'title': 'Next', 'file': 'n.mp3', 'queued': True, 'pick': 'queue'})
+    meters = {'A': {'peak': -3, 'rms': -14, 'gain': -2}, 'B': {'peak': -120, 'rms': -120, 'gain': -100}}
+    fault = {'fault': "player 'X' not found", 'automation': False, 'state': 'fault', 'retry_s': 30, 'decks': {}, 'queue': {},
+             'library': {'music': 0, 'imaging': 0, 'ad': 0}}
+    r = batch(app, {'station': 'OV-Radio', 'state': on, 'meters': meters}, {'station': 'OV-Fault', 'state': fault},
+              {'station': 'OV-Zone', 'state': dict(on, players=1, decks={'A': deck}), 'meters': {'A': meters['A']}},
+              core='OVCORE', version='2.2.0', mem_kb=4000)
+    assert r.status_code == 200 and all('error' not in x for x in r.json['stations'].values())
+    batch(app, {'station': 'OV-Gone', 'state': dict(STATE, decks={}), 'events': [
+        ev(1, 'track_start', deck='A', file='gone.mp3', dir='M/', artist='G', title='Gone', duration=200.0)]}, core='OVCORE2', mem_kb=50000)
+    sql("UPDATE qsr_test.stations SET last_seen = NOW() - INTERVAL '5 minutes' WHERE station = 'OV-Gone'")
+    sql("UPDATE qsr_test.cores SET mem_warned_at = NOW() WHERE core = 'OVCORE2'")
+
+    viewer, op = signed_in(app, 'viewer'), signed_in(app, 'operator')
+    got = viewer.get('/api/v1/stations-overview?station=OV-Zone')
+    assert got.status_code == 200, got.get_data(as_text=True)
+    d = got.json
+    names = [s['station'] for s in d['stations']]
+    assert names == sorted(names) and d['version'] == config.version() and d['clock']['server_ms']
+    by = {s['station']: s for s in d['stations']}
+    radio, bad, zone, gone = by['OV-Radio'], by['OV-Fault'], by['OV-Zone'], by['OV-Gone']
+    assert radio['online'] and radio['players'] == 2 and radio['core'] == 'OVCORE' and radio['fault'] is None
+    assert radio['state']['automation'] is True and radio['state']['state'] == 'playing'
+    assert radio['state']['decks']['A'] == {k: v for k, v in deck.items() if k not in ('key', 'trim', 'gain')}   # only what the page shows
+    assert radio['state']['next_up'] == {'artist': 'N', 'title': 'Next', 'file': 'n.mp3', 'queued': True}
+    assert radio['meters']['A'] == {'peak': -3.0, 'rms': -14.0, 'gain': -2.0} and radio['state']['library']['music'] == 2
+    assert set(radio['state']) == {'automation', 'stop_after', 'state', 'fault', 'retry_s', 'decks', 'next_up', 'library'}
+    assert bad['online'] and bad['fault'] == "player 'X' not found" and bad['state']['retry_s'] == 30 and bad['state']['decks'] == {}
+    assert zone['players'] == 1 and list(zone['state']['decks']) == ['A']
+    assert not gone['online'] and gone['core'] == 'OVCORE2' and gone['playing'] == {'artist': 'G', 'title': 'Gone', 'file': 'gone.mp3'}
+    assert d['station']['station'] == 'OV-Zone' and d['station']['state_age_s'] is not None     # the header's station
+    assert d['cores']['OVCORE'] == {'online': True, 'version': '2.2.0', 'mem_kb': 4000.0, 'mem_warning': False}
+    assert d['cores']['OVCORE2']['mem_warning'] is True and d['cores']['OVCORE2']['version'] == config.version()
+    assert viewer.get('/api/v1/stations-overview?station=nope').json['station'] is None
+    newest = viewer.get('/api/v1/stations-overview').json['station']['station']                 # none asked: the most recent
+    assert newest == sql('SELECT station FROM qsr_test.stations ORDER BY last_seen DESC LIMIT 1', fetch=True)[0][0]
+
+    # viewers read, operators command; the page hears back about the commands it sent (even another station's)
+    assert viewer.post('/api/v1/control', json={'station': 'OV-Radio', 'cmd': 'skip'}, headers=WEB).status_code == 403
+    cid = op.post('/api/v1/control', json={'station': 'OV-Radio', 'cmd': 'skip'}, headers=WEB).json['id']
+    zid = op.post('/api/v1/control', json={'station': 'OV-Zone', 'cmd': 'stop_now'}, headers=WEB).json['id']
+    cmds = op.get(f'/api/v1/stations-overview?station=OV-Zone&cmds={cid},{zid},x,99999999999').json['commands']
+    assert sorted((c['id'], c['station'], c['state']) for c in cmds) == [(cid, 'OV-Radio', 'pending'), (zid, 'OV-Zone', 'pending')]
+    batch(app, {'station': 'OV-Radio', 'ack': 0, 'events': [ev(2, 'command', id=cid, cmd='skip', ok=True)]}, core='OVCORE')
+    cmds = op.get(f'/api/v1/stations-overview?cmds={cid}').json['commands']
+    assert cmds == [{'id': cid, 'station': 'OV-Radio', 'state': 'done', 'note': None}]
+    assert app.test_client().get('/api/v1/stations-overview').status_code == 401
+
+    # the same few queries for 4 stations more (and for every station in this test database)
+    conn = db.connect()
+    try:
+        with queries() as before:
+            out = control.overview(conn, 'OV-Radio', [cid, zid])
+        n = len(out['stations'])
+        batch(app, *[{'station': f'OV-More{i}', 'state': on, 'meters': meters} for i in range(4)], core='OVCORE3')
+        with queries() as after:
+            more = control.overview(conn, 'OV-Radio', [cid, zid])
+    finally:
+        conn.close()
+    assert len(more['stations']) == n + 4 and len(before) == len(after) <= 8, (len(before), len(after))
+    assert 'analysis' in more['station'] and 'analysis' not in more['stations'][0]       # the header's chip, one station only
+    assert op.get('/api/v1/stations-overview?cmds=\u00b2,1').status_code == 200          # '²' is a digit to isdigit(), not to int()
+
+    # the page itself, and its tab in the rail
+    page = viewer.get('/stations')
+    assert page.status_code == 200 and b'id="st-grid"' in page.data and b'js/stations.js' in page.data
+    assert b'href="/stations"' in viewer.get('/').data
+    assert app.test_client().get('/stations').status_code == 302
 
 
 def test_batched_sync_of_14_stations_is_quick(app):

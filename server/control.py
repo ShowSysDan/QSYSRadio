@@ -403,9 +403,7 @@ def status(conn, station):
         cur.execute("""SELECT id, cmd, label, requested_by, created_at, delivered_at, done_at, ok, note
                        FROM commands WHERE station = %s ORDER BY id DESC LIMIT 12""", (station,))
         cmds = [{'id': c['id'], 'cmd': c['cmd'], 'label': c['label'], 'by': c['requested_by'],
-                 'created_at': iso(c['created_at']),
-                 'state': ('done' if c['ok'] else 'failed') if c['done_at'] else ('sent' if c['delivered_at'] else 'pending'),
-                 'note': c['note']} for c in cur.fetchall()]
+                 'created_at': iso(c['created_at']), 'state': _command_state(c), 'note': c['note']} for c in cur.fetchall()]
         state = _clean_state(r['state']) or {}
         _fill_durations(cur, station, state)
         single = r['players'] == 1
@@ -421,6 +419,69 @@ def status(conn, station):
             'library_at': iso(r['library_at']), 'state': state, 'meters': r['meters'], 'commands': cmds, 'next_ad': next_ad,
             'holds': holds, 'ident': {'due': ids['due'], 'next_at': iso(ids['next_at']), 'count': len(ids['keys'])},
             'analysis': analyze}
+
+
+def _command_state(c):
+    """A command row's progress as the panel shows it: pending, sent (the Core has it), done or failed."""
+    return ('done' if c['ok'] else 'failed') if c['done_at'] else ('sent' if c['delivered_at'] else 'pending')
+
+
+OVERVIEW_DECK = ('state', 'live', 'kind', 'artist', 'title', 'file', 'elapsed', 'remaining', 'duration')
+OVERVIEW_NEXT = ('kind', 'artist', 'title', 'file', 'queued')
+OVERVIEW_COMMANDS_MAX = 50
+
+
+def overview(conn, station=None, command_ids=()):
+    """Every station at a glance (the Stations page), by name, in a fixed number of queries however many stations
+    there are: the stations, the open play of each (from the play log: what was on air when its Core went quiet),
+    the Cores (cores.view) and the commands the page is waiting on (command_ids). Each station's row has the
+    shape of status() for what the header needs (online, state, state_age_s, players), so `station` (the
+    requested one, else the most recently seen; None when the requested one does not exist) serves the header.
+    Only what the page shows: the Core's state cut to its decks, what is next and the library counts."""
+    with conn.cursor() as cur:
+        cur.execute("""SELECT station, core, players, radio_version, last_seen, meters,
+                              EXTRACT(EPOCH FROM NOW() - last_seen) AS age,
+                              EXTRACT(EPOCH FROM NOW() - state_at) AS state_age,
+                              jsonb_build_object('automation', state->'automation', 'state', state->'state',
+                                                 'stop_after', state->'stop_after', 'fault', state->'fault',
+                                                 'retry_s', state->'retry_s', 'decks', state->'decks',
+                                                 'next_up', state->'next_up', 'library', state->'library') AS state
+                       FROM stations ORDER BY station""")
+        rows = cur.fetchall()
+        cur.execute("""SELECT DISTINCT ON (station) station, artist, title, file
+                       FROM play_log WHERE ended_at IS NULL AND started_at > NOW() - INTERVAL '1 day'
+                       ORDER BY station, started_at DESC, id DESC""")
+        playing = {p['station']: {'artist': p['artist'], 'title': p['title'], 'file': p['file']} for p in cur.fetchall()}
+        machines = cores.view(cur)
+        ids = [i for i in command_ids if type(i) is int and 0 < i < 2 ** 31][:OVERVIEW_COMMANDS_MAX]
+        commands = []
+        if ids:
+            cur.execute('SELECT id, station, delivered_at, done_at, ok, note FROM commands WHERE id = ANY(%s)', (ids,))
+            commands = [{'id': c['id'], 'station': c['station'], 'state': _command_state(c), 'note': c['note']}
+                        for c in cur.fetchall()]
+    out = []
+    for r in rows:
+        state = _clean_state(r['state']) or {}
+        decks = {d: {k: v[k] for k in OVERVIEW_DECK if k in v} for d, v in state['decks'].items() if isinstance(v, dict)}
+        nxt = state.get('next_up')
+        age = float(r['age'])
+        out.append({
+            'station': r['station'], 'online': age < cores.ONLINE_S, 'age_s': round(age, 1),
+            'state_age_s': round(float(r['state_age']), 2) if r['state_age'] is not None else None,
+            'last_seen': iso(r['last_seen']), 'core': r['core'], 'version': r['radio_version'], 'players': r['players'],
+            'fault': state.get('fault'), 'meters': r['meters'], 'playing': playing.get(r['station']),
+            'state': {'automation': state['automation'], 'stop_after': state['stop_after'], 'state': text(state.get('state'), 20),
+                      'fault': state.get('fault'), 'retry_s': number(state.get('retry_s')), 'decks': decks,
+                      'next_up': {k: nxt[k] for k in OVERVIEW_NEXT if k in nxt} if isinstance(nxt, dict) else None,
+                      'library': {k: number(state['library'].get(k)) for k in KINDS}}})
+    if station:
+        current = next((s for s in out if s['station'] == station), None)
+    else:
+        current = max(zip(rows, out), key=lambda p: p[0]['last_seen'], default=(None, None))[1]
+    if current:                          # the header's analysis chip, as status() gives it (one station: fixed cost)
+        with conn.cursor() as cur:
+            current = dict(current, analysis=analysis.view(cur, current['station']))
+    return {'stations': out, 'station': current, 'cores': machines, 'commands': commands}
 
 
 def _fill_durations(cur, station, state):

@@ -11,13 +11,7 @@
 
   const core = R.core, age = R.age, playing = R.playing, liveDeck = R.liveDeck;
 
-  // deck meter scale: dB on the player meter -> percent of the height, widest around 0 dB (radio.css colours match it)
-  const STEPS = [[-60, 0], [-40, 12], [-20, 35], [-10, 52], [0, 70], [10, 86], [20, 100]];
-  const meterPct = (v) => {
-    v = Math.max(-60, Math.min(20, num(v) == null ? -120 : v));
-    const i = Math.max(1, STEPS.findIndex(([db]) => v <= db)), [a, pa] = STEPS[i - 1], [b, pb] = STEPS[i];
-    return pa + (v - a) / (b - a) * (pb - pa);
-  };
+  const meterPct = R.meterPct;   // deck meter scale (common.js)
   const pct = (v) => v.toFixed(1) + '%';
   const SCALE = [10, 0, -10, -20, -40];
 
@@ -50,48 +44,22 @@
   }
 
   // the decks' gain and meters from the Core's last sync; hidden while it is offline. The Core reports once a
-  // second (rms now, the loudest peak since its last report): animateMeters glides between reports
+  // second (rms now, the loudest peak since its last report): R.meter glides between reports
   const put = (el, prop, v) => { if (el[prop] !== v) el[prop] = v; };
-  const FLOOR = -60, meters = {};    // deck id -> { bar, pk, rms, peak (reported), base, vel, pkv, pkAt (shown), ph }
-  const clampDb = (v) => Math.max(FLOOR, Math.min(20, num(v) == null ? FLOOR : v));
   function renderMeters() {
     const st = core(), all = st && last.station.meters, target = num(st && st.settings && st.settings.level_target_db);
     document.querySelectorAll('.dk-lvl[data-m]').forEach((el) => {
       const id = el.dataset.m, m = all && all[id];
       put(el, 'hidden', !m);
-      if (!m) { delete meters[id]; return; }
       const mtr = el.querySelector('.mtr');
-      const a = meters[id] = meters[id] || { base: FLOOR, vel: 0, pkv: FLOOR, pkAt: 0, ph: [0, 1, 2].map(() => Math.random() * 6.3) };
-      Object.assign(a, { bar: mtr.querySelector('i'), pk: mtr.querySelector('b'), rms: clampDb(m.rms), peak: clampDb(m.peak) });
+      R.meter('deck:' + id, mtr.querySelector('i'), mtr.querySelector('b'), m);
+      if (!m) return;
       put(mtr.querySelector('s').style, 'bottom', pct(meterPct(target == null ? 0 : target)));
       put(mtr, 'title', 'Player meter after the deck\'s gain: bar = rms, line = peak (' + R.db(m.peak, -120) + ' dB), mark = the Average level. ' +
         'Reported once a second; the bar is smoothed in between.');
       put(el.querySelector('.r'), 'textContent', R.db(m.rms, -120));
       put(el.querySelector('.g'), 'textContent', R.db(m.gain, -100));
     });
-  }
-
-  // ~30 frames a second: the bar follows the reported rms like a damped spring (no corners; quicker up than down)
-  // and sways gently around it while there is sound (wider for music with more dynamics: peak well over rms);
-  // the peak line holds 1 s, then falls
-  let frameAt = 0;
-  function animateMeters(t) {
-    requestAnimationFrame(animateMeters);
-    const dt = Math.min(0.1, (t - frameAt) / 1000), s = t / 1000;
-    if (dt < 0.03) return;
-    frameAt = t;
-    for (const id in meters) {
-      const a = meters[id];
-      const w = a.rms > a.base ? 4.5 : 3.2;
-      a.vel += (w * w * (a.rms - a.base) - 2 * w * a.vel) * dt;
-      a.base += a.vel * dt;
-      const sound = Math.min(1, Math.max(0, (a.base - FLOOR - 5) / 10));
-      const swing = sound * Math.min(2.5, Math.max(1, (a.peak - a.rms) / 5));
-      const v = a.base + swing * (0.55 * Math.sin(1.3 * s + a.ph[0]) + 0.3 * Math.sin(3.1 * s + a.ph[1]) + 0.15 * Math.sin(6.3 * s + a.ph[2]));
-      if (a.peak >= a.pkv) { a.pkv = a.peak; a.pkAt = s; } else if (s - a.pkAt > 1) a.pkv = Math.max(a.peak, a.pkv - 10 * dt);
-      put(a.bar.style, 'height', pct(100 - meterPct(v)));
-      put(a.pk.style, 'bottom', pct(meterPct(Math.max(a.pkv, v))));
-    }
   }
 
   // clocks between polls: extrapolate from the Core's last report
@@ -357,6 +325,5 @@
   });
 
   setInterval(tick, 250);
-  requestAnimationFrame(animateMeters);
   R.status(1000, 12, render, 10);
 })();

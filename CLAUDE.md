@@ -26,7 +26,7 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   transaction of any change a station's ads plan is made from, which took
   `db.lock_station` first), `analysis.stale` (the same for a Core's list
   of files to analyze), `cores.seen`; JS:
-  `Radio.api/post/command/setHTML/esc/num/status`).
+  `Radio.api/post/command/setHTML/esc/num/status/meter/pick`).
 
 ## radio.lua: keep it slim and light
 - Real time only. Anything that can live on the server does.

@@ -230,6 +230,12 @@ def library_kind(which):
     return render_template('library.html', page=kind, kind=kind, title=title)
 
 
+@app.get('/stations')
+@auth.login_required
+def stations_page():
+    return _page('stations.html', 'stations')
+
+
 @app.get('/log')
 @auth.login_required
 def log_page():
@@ -309,6 +315,16 @@ def get_now():
         if n:
             out['on_air'], out['recent'] = plays.recent(conn, station, n)
     return jsonify(out)
+
+
+@app.get('/api/v1/stations-overview')
+@auth.login_required
+def get_stations_overview():
+    """The Stations page's poll: every station at a glance in a fixed number of queries however many there
+    are, the header's station (?station=, else the most recent) among them, the Cores (memory warning,
+    radio.lua version against the server's) and the commands the page is waiting on (?cmds=1,2,3)."""
+    ids = [int(x) for x in (_arg('cmds') or '').split(',') if x.isascii() and x.isdecimal() and len(x) < 10]
+    return jsonify(ok=True, version=VERSION, clock=clock.status(), **control.overview(dbconn(), _arg('station'), ids))
 
 
 @app.post('/api/v1/control')

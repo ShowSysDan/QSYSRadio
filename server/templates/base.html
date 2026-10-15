@@ -37,6 +37,7 @@
   <nav class="nav">
     <div class="tabs">
       <a href="{{ url_for('dashboard') }}" class="tab {{ 'active' if page == 'dashboard' }}"><svg viewBox="0 0 24 24"><path d="M3 3h8v10H3zm10 0h8v6h-8zM3 15h8v6H3zm10-4h8v10h-8z"/></svg><span>Dashboard</span></a>
+      <a href="{{ url_for('stations_page') }}" class="tab {{ 'active' if page == 'stations' }}"><svg viewBox="0 0 24 24"><path d="M3 4h4v4H3zm6 1h12v2H9zM3 10h4v4H3zm6 1h12v2H9zM3 16h4v4H3zm6 1h12v2H9z"/></svg><span>Stations</span></a>
       <a href="{{ url_for('library_kind', which='music') }}" class="tab {{ 'active' if page == 'music' }}"><svg viewBox="0 0 24 24"><path d="M12 3v10.6A4 4 0 1 0 14 17V7h4V3z"/></svg><span>Music</span><b class="tab-n" data-count="music"></b></a>
       <a href="{{ url_for('library_kind', which='imaging') }}" class="tab {{ 'active' if page == 'imaging' }}" data-breaks><svg viewBox="0 0 24 24"><path d="M3 10h2v4H3zm4-3h2v10H7zm4-4h2v18h-2zm4 4h2v10h-2zm4 3h2v4h-2z"/></svg><span>Imaging &amp; IDs</span><b class="tab-n" data-count="imaging"></b></a>
       <a href="{{ url_for('library_kind', which='ads') }}" class="tab {{ 'active' if page == 'ad' }}" data-breaks><svg viewBox="0 0 24 24"><path d="M18 3v18l-6-4H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h6zM6 17h3l1 4H7z"/></svg><span>Advertisements</span><b class="tab-n" data-count="ad"></b></a>

@@ -430,6 +430,44 @@ button.linkbtn:active:not(:disabled) { transform: none; filter: none; box-shadow
   button:hover { transform: none; }
 }
 
+/* ── Stations (every station at a glance; stations.js) ──────────────────── */
+.st-sum { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: var(--text-dim); }
+.st-sum b { font: 700 14px var(--mono); color: var(--text); }
+.st-sum .ok b { color: #4ade80; } .st-sum .warn b { color: var(--warning); } .st-sum .bad, .st-sum .bad b { color: #f87171; }
+.st-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 330px), 1fr)); gap: 14px; }
+.st-grid.stale { opacity: .55; }
+.st-grid > .empty-state { grid-column: 1 / -1; }
+.st-card { padding: 12px 14px; display: flex; flex-direction: column; gap: 7px; min-width: 0; --tint: var(--text-muted); }
+.st-card.onair { --tint: var(--accent); } .st-card.stopping { --tint: var(--warning); } .st-card.fault { --tint: var(--danger); }
+.st-card.fault { border-color: rgba(239,68,68,.45); }
+.st-card.offline { opacity: .75; }
+.st-card.current { border-color: rgba(34,211,238,.35); }
+.st-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+.st-name { font-weight: 600; font-size: 15px; color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-name:hover { color: var(--accent); }
+.st-badge { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.lamp-off.bad { color: #fff; background: var(--danger); border-color: var(--danger); }
+.lamp-off.warn { color: #000; background: var(--warning); border-color: var(--warning); }
+.st-fault { font-size: 12px; color: #fca5a5; }
+.st-now { display: flex; align-items: baseline; gap: 10px; min-width: 0; font-size: 13.5px; }
+.st-title { flex: 1; min-width: 0; }
+.st-card:not(.onair):not(.stopping) .st-title { color: var(--text-dim); }
+.st-rem { font: 700 14px var(--mono); color: #fca5a5; font-variant-numeric: tabular-nums; }
+.st-prog { height: 2px; border-radius: 1px; background: rgba(255,255,255,.06); overflow: hidden; }
+.st-prog i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, rgba(239,68,68,.2), var(--danger)); transition: width 1s linear; }
+.st-next { font-size: 12px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 18px; }
+/* the on-air deck's meter, lying down: the same scale and colours as the Dashboard's (0 dB at 70%, +12 at 88.8%) */
+.st-mtr { position: relative; height: 6px; border-radius: 2px; overflow: hidden;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent) 70%, var(--warning) 70% 88.8%, var(--danger) 88.8%); }
+.st-mtr i { position: absolute; inset: 0 0 0 auto; width: 100%; background: rgba(0,0,0,.8); }    /* animated by common.js R.meter */
+.st-mtr b { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; margin-left: -1px; background: var(--text); }
+.st-card .st-mtr[hidden] { display: block !important; visibility: hidden; }    /* keeps its place: cards stay the same height */
+.st-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
+.st-core { font: 11px var(--mono); color: var(--text-dim); display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.st-core b { color: var(--text); font-weight: 600; }
+.st-warn { color: var(--warning); border: 1px solid rgba(245,158,11,.45); background: rgba(245,158,11,.08); border-radius: 3px; padding: 0 5px; }
+.st-btns { display: inline-flex; gap: 6px; margin-left: auto; }
+
 /* ── Responsive ─────────────────────────────────────────────────────────── */
 @media (max-width: 1180px) { .ov-body { grid-template-columns: 1fr; } .now { flex-basis: 300px; } .tab-n { display: none; } }
 @media (max-width: 1100px) { .bento.five { grid-template-columns: repeat(2, minmax(0, 1fr)); } .bento.five .kpi:first-child { grid-column: 1 / -1; } }

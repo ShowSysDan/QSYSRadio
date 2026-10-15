@@ -5,6 +5,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [2.3.0] - 2026-10-15
+
+**Redeploy the server** (`git pull && sudo systemctl restart qsysradio`; no
+migration). The Core: radio.lua changed only its version number, so paste
+it when convenient (keep your `CFG` values); until then the journal notes
+`runs radio.lua 2.2.0, server is 2.3.0` once per station and the Stations
+page marks each card `radio.lua 2.2.0`.
+
+### Added
+- **The Stations page** (`/stations`, the second tab in the nav rail): every
+  station on one page, a card each, by name, so 14 stations can be watched
+  and run without switching the header's station.
+  - A summary line: stations, on air, stopped, offline, faulted.
+  - Each card: the name (click: it becomes the header's station and its
+    Dashboard opens); ON AIR / STOPPING / STOPPED / OFFLINE / FAULT (red,
+    with the Core's reason and when it tries again); 1 or 2 players; what
+    is on air (artist – title) with its countdown and a thin progress line;
+    what is next (QUEUE / STOP tags); the on-air deck's meter, lying down,
+    with the Dashboard's scale, colours and smoothing; the Core it is on,
+    with an amber mark while that Core's memory warning is on (the hour
+    after each `possible leak` warning, cleared by a restart) or while it
+    runs another radio.lua than the server. An offline station shows when it
+    was last seen and what the play log last had on air.
+  - Operators: Start, Skip and Stop (Stop asks first) on each card, with the
+    Dashboard's pressed / sent / done feedback; the toasts name the station.
+    Viewers see the page without the buttons (the server refuses their
+    commands as before).
+- `GET /api/v1/stations-overview` (signed in): every station's summary in
+  at most four queries however many stations there are (the stations, each one's
+  open play in one `DISTINCT ON`, the Cores, and the commands the page is
+  waiting on, `?cmds=`); only the fields the page shows. It also answers
+  the header's station (`?station=`, else the most recent) and the server
+  clock, so the page's one status loop (a poll a second, 8 s timeout)
+  keeps the header and nav rail live as on every other page.
+
+### Changed
+- The header's station drop-down lists the stations by name (it followed
+  the order the Cores last synced in, so it could reshuffle every second).
+- The Dashboard's smoothed deck meter moved to `common.js` (`Radio.meter`),
+  shared by the Stations page; it looks and moves as before.
+  `Radio.command` takes the station to send to (default: the header's).
+
+### Fixed
+- `test_holds_and_station_ids` failed when the test suite ran across a
+  quarter hour (a new station ID slot opened mid-test); it now starts after
+  a boundary that is less than 90 s away. Tests only.
+
 ## [2.2.0] - 2026-10-15
 
 **Redeploy both: the server first** (`git pull && sudo systemctl restart
