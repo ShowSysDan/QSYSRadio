@@ -106,19 +106,21 @@
   // ── station selection ──────────────────────────────────────────────────
   R.station = (() => { try { return localStorage.getItem('qsysradio.station') || ''; } catch (e) { return ''; } })();
   R.withStation = (url) => R.station ? url + (url.includes('?') ? '&' : '?') + 'station=' + encodeURIComponent(R.station) : url;
-  function fillStations(list) {
+  // the header drop-down, by name; cur: the station shown (the chosen one, else the server's: the most recent)
+  function fillStations(list, cur) {
     const sel = R.$('station-select');
     if (!sel) return;
     sel.hidden = list.length < 2;
-    const cur = R.station || (list[0] && list[0].station) || '';
-    R.setHTML(sel, list.map((s) => '<option value="' + R.esc(s.station) + '"' + (s.station === cur ? ' selected' : '') + '>' +
-      R.esc(s.station) + (s.online ? '' : ' (offline)') + '</option>').join(''));
+    cur = R.station || cur || '';
+    R.setHTML(sel, list.slice().sort((a, b) => (a.station < b.station ? -1 : a.station > b.station ? 1 : 0)).map((s) => '<option value="' + R.esc(s.station) + '"' + (s.station === cur ? ' selected' : '') + '>' +
+      R.esc(s.station) + (s.online ? (s.fault ? ' (fault)' : '') : ' (offline)') + '</option>').join(''));
   }
-  R.$('station-select')?.addEventListener('change', (e) => {
-    R.station = e.target.value;
-    try { localStorage.setItem('qsysradio.station', R.station); } catch (err) { /* private mode */ }
-    location.reload();
-  });
+  // make a station the header's (every page shows it until another is chosen)
+  R.pick = (station) => {
+    R.station = station;
+    try { localStorage.setItem('qsysradio.station', station); } catch (err) { /* private mode */ }
+  };
+  R.$('station-select')?.addEventListener('change', (e) => { R.pick(e.target.value); location.reload(); });
 
   // ── header pill ────────────────────────────────────────────────────────
   function setPill(cls, text) {
@@ -131,6 +133,7 @@
     if (!s) return setPill('wait', 'no core yet');
     const st = s.state || {};
     if (!s.online) return setPill('stopped', 'core offline');
+    if (st.fault) return setPill('stopped', 'fault · ' + s.station);
     if (st.automation && st.stop_after) return setPill('wait', 'stopping · ' + s.station);
     if (st.automation) return setPill('', 'on air · ' + s.station);
     return setPill('stopped', 'stopped · ' + s.station);
@@ -145,11 +148,12 @@
     btn.classList.add(cls);
     setTimeout(() => btn.classList.remove(cls), 900);
   };
-  R.command = async (cmd, args, label, btn) => {
+  // station: another than the header's (the Stations page)
+  R.command = async (cmd, args, label, btn, station) => {
     if (!R.canOperate) { R.toast('Your account is read-only.', 'bad'); return null; }
     btn?.classList.add('busy');
     try {
-      const r = await R.post('/api/v1/control', { station: R.station || undefined, cmd, args: args || {} });
+      const r = await R.post('/api/v1/control', { station: station || R.station || undefined, cmd, args: args || {} });
       watching.set(r.id, { label: label || cmd, t: Date.now(), btn });
       R.toast((label || cmd) + ': sent');
       R.refresh();
@@ -168,13 +172,16 @@
   }
 
   // ── what is on air (the dashboard and the nav rail) ──────────────────────
-  R.playing = (d) => d && !d.analyzing && (d.state === 'playing' || d.state === 'fading');
+  R.playing = (d) => d && (d.state === 'playing' || d.state === 'fading');
+  // a one-player station's only deck stays on air while it fades out (before the next song loads on it)
   R.liveDeck = (st) => {
     if (!st || !st.decks) return null;
     const ds = ['A', 'B'].map((id) => st.decks[id]).filter(R.playing);
-    return ds.find((d) => d.live && d.state === 'playing') || ds.find((d) => d.state === 'playing') || null;
+    return ds.find((d) => d.live && d.state === 'playing') || ds.find((d) => d.state === 'playing') || ds.find((d) => d.live) || null;
   };
   R.core = () => (R.last && R.last.station && R.last.station.online ? R.last.station.state : null);
+  // a one-player station (a background-music zone): songs only; body.one-player hides everything marked data-breaks
+  R.onePlayer = () => !!(R.last && R.last.station && R.last.station.players === 1);
   // seconds since the Core measured elapsed/remaining (server-side age + time since we fetched)
   R.age = () => (R.num(R.last && R.last.station && R.last.station.state_age_s) || 0) + (Date.now() - (R.last ? R.last.receivedAt : Date.now())) / 1000;
 
@@ -195,6 +202,7 @@
   }
   function header(d) {
     const s = d && d.station, st = R.core(), lib = (st && st.library) || {};
+    document.body.classList.toggle('one-player', R.onePlayer());
     document.querySelectorAll('.tab-n[data-count]').forEach((el) => {
       const n = R.num(lib[el.dataset.count]);
       if (el.textContent !== (n == null ? '' : String(n))) el.textContent = n == null ? '' : n;
@@ -209,7 +217,53 @@
   const um = R.$('usermenu');
   if (um) document.addEventListener('click', (e) => { if (um.open && !um.contains(e.target)) um.open = false; });
 
+  // ── deck meters (the Dashboard's decks, the Stations page's rows) ──────
+  // dB on the player meter -> percent of the scale, widest around 0 dB (radio.css colours match it)
+  const STEPS = [[-60, 0], [-40, 12], [-20, 35], [-10, 52], [0, 70], [10, 86], [20, 100]];
+  R.METER_FLOOR = -60;
+  R.meterPct = (v) => {
+    v = Math.max(-60, Math.min(20, R.num(v) == null ? -120 : v));
+    const i = Math.max(1, STEPS.findIndex(([db]) => v <= db)), [a, pa] = STEPS[i - 1], [b, pb] = STEPS[i];
+    return pa + (v - a) / (b - a) * (pb - pa);
+  };
+  const pct = (v) => v.toFixed(1) + '%';
+  const meterDb = (v) => Math.max(R.METER_FLOOR, Math.min(20, R.num(v) == null ? R.METER_FLOOR : v));
+  // R.meter(key, bar, pk, m, across) after each poll: bar = the dark cover over the lit scale, pk = the peak line,
+  // m = the Core's {rms, peak} (null: gone); across = a horizontal meter (else upright)
+  const bars = {};
+  let frameAt = 0, animating = false;
+  R.meter = (key, bar, pk, m, across) => {
+    if (!m || !bar || !pk) { delete bars[key]; return; }
+    const a = bars[key] = bars[key] || { base: R.METER_FLOOR, vel: 0, pkv: R.METER_FLOOR, pkAt: 0, ph: [0, 1, 2].map(() => Math.random() * 6.3) };
+    Object.assign(a, { bar, pk, rms: meterDb(m.rms), peak: meterDb(m.peak), size: across ? 'width' : 'height', pos: across ? 'left' : 'bottom' });
+    if (!animating) { animating = true; requestAnimationFrame(animate); }
+  };
+  // ~30 frames a second: the bar follows the reported rms like a damped spring (no corners; quicker up than down)
+  // and sways gently around it while there is sound (wider for music with more dynamics: peak well over rms);
+  // the peak line holds 1 s, then falls
+  const put = (obj, prop, v) => { if (obj[prop] !== v) obj[prop] = v; };
+  function animate(t) {
+    requestAnimationFrame(animate);
+    const dt = Math.min(0.1, (t - frameAt) / 1000), s = t / 1000;
+    if (dt < 0.03) return;
+    frameAt = t;
+    for (const key in bars) {
+      const a = bars[key];
+      const w = a.rms > a.base ? 4.5 : 3.2;
+      a.vel += (w * w * (a.rms - a.base) - 2 * w * a.vel) * dt;
+      a.base += a.vel * dt;
+      const sound = Math.min(1, Math.max(0, (a.base - R.METER_FLOOR - 5) / 10));
+      const swing = sound * Math.min(2.5, Math.max(1, (a.peak - a.rms) / 5));
+      const v = a.base + swing * (0.55 * Math.sin(1.3 * s + a.ph[0]) + 0.3 * Math.sin(3.1 * s + a.ph[1]) + 0.15 * Math.sin(6.3 * s + a.ph[2]));
+      if (a.peak >= a.pkv) { a.pkv = a.peak; a.pkAt = s; } else if (s - a.pkAt > 1) a.pkv = Math.max(a.peak, a.pkv - 10 * dt);
+      put(a.bar.style, a.size, pct(100 - R.meterPct(v)));
+      put(a.pk.style, a.pos, pct(R.meterPct(Math.max(a.pkv, v))));
+    }
+  }
+
   // ── the status loop (one per page) ─────────────────────────────────────
+  // path: the page's own poll instead of /api/v1/now (the Stations page), answering the same header fields and the
+  // commands it is waiting on (cmds=)
   let loop = { ms: 5000, plays: 0, onData: null, timer: null, busy: false };
   async function tick() {
     clearTimeout(loop.timer);
@@ -217,13 +271,14 @@
     loop.busy = true;
     try {
       const sent = Date.now();
-      const d = await R.api(R.withStation('/api/v1/now?plays=' + loop.plays + (loop.ahead ? '&ahead=' + loop.ahead : '')));
+      const d = await R.api(R.withStation(loop.path ? loop.path + '?cmds=' + [...watching.keys()].join(',')
+        : '/api/v1/now?plays=' + loop.plays + (loop.ahead ? '&ahead=' + loop.ahead : '')));
       d.receivedAt = Date.now();
       R.last = d;
       setClock(d.clock, sent, d.receivedAt);
-      fillStations(d.stations || []);
+      fillStations(d.stations || [], d.station && d.station.station);
       pillFor(d.station);
-      noteCommands(d.station && d.station.commands);
+      noteCommands(((d.station && d.station.commands) || []).concat(d.commands || []));
       header(d);
       if (loop.onData) loop.onData(d);
     } catch (e) {
@@ -234,7 +289,7 @@
       loop.timer = setTimeout(tick, document.hidden ? Math.max(loop.ms, 5000) : loop.ms);
     }
   }
-  R.status = (ms, plays, onData, ahead) => { loop = Object.assign(loop, { ms, plays, onData, ahead }); tick(); };
+  R.status = (ms, plays, onData, ahead, path) => { loop = Object.assign(loop, { ms, plays, onData, ahead, path }); tick(); };
   R.refresh = () => { if (!loop.busy) tick(); };
 
   R.playRow = (p, withDate) => {

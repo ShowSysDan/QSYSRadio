@@ -7,6 +7,7 @@
   const PAGE = 100;
   const kind = $('lib-tile').dataset.kind;
   let offset = 0, seq = 0, timer = null, loading = false, stale = false, seen = null, only = '';
+  let canAnalyze = false;              // the station's Core has an analysis player: the rows offer Analyze
   const byKey = {};                    // the rows shown, for the quiet start / end editor
   const ICON = {
     next: '<svg viewBox="0 0 24 24"><path d="M4 6h10v2H4zm0 5h10v2H4zm0 5h6v2H4zm12-3v-3h2v3h3v2h-3v3h-2v-3h-3v-2z"/></svg>',
@@ -15,6 +16,7 @@
     analyze: '<svg viewBox="0 0 24 24"><path d="M3 11h2v2H3zm4-4h2v10H7zm4-4h2v18h-2zm4 6h2v6h-2zm4-2h2v10h-2z"/></svg>',
   };
   const NOUN = { music: 'songs', imaging: 'imaging files', ad: 'advertisements' };
+  const PLAYER = 'the Core\'s analysis player';      // where files are analyzed (radio.lua CFG.ANALYZERS)
   const FILTERS = {
     music: [['', 'All'], ['never', 'Never played'], ['not_analyzed', 'Not analyzed'], ['adjusted', 'Adjusted'], ['unsupported', 'Unsupported']],
     imaging: [['', 'All'], ['ident', 'Station IDs'], ['never', 'Never played'], ['not_analyzed', 'Not analyzed'], ['adjusted', 'Adjusted'],
@@ -32,8 +34,9 @@
 
   function actions(it) {
     if (!R.canOperate || it.unsupported) return '';
-    return button('analyze', 'analyze', '', it.analyzed_at ? 'Analyze again on the off-air deck (analyzed ' + esc(R.timeOf(it.analyzed_at, true)) + ')'
-      : 'Analyze on the off-air deck (measures its quiet start, end and average level)') + playActions(it);
+    return (canAnalyze ? button('analyze', 'analyze', '', it.analyzed_at ? 'Analyze again on ' + PLAYER + ' (analyzed ' +
+      esc(R.timeOf(it.analyzed_at, true)) + ')' : 'Analyze on ' + PLAYER + ' (measures its quiet start, end and average level)') : '') +
+      playActions(it);
   }
 
   function playActions(it) {
@@ -87,12 +90,12 @@
     return '<td class="num" title="' + esc(tip) + '">' + (lv == null ? '–' : esc(R.db(lv))) + '</td>';
   }
 
-  // analysis state: queued in the run, failed (tried again by the next run), or analyzed
+  // analysis state: queued in the run, failed (tried again by the next run, or a day later), or analyzed
   function analysisTag(it) {
-    if (it.analyze_queued) return ' <span class="tag" title="Waiting for the off-air deck">queued</span>';
+    if (it.analyze_queued) return ' <span class="tag" title="Waiting for ' + PLAYER + '">queued</span>';
     if (!it.analyzed_at && it.analyze_failed_at) {
       return ' <span class="tag bad" title="Analysis failed ' + esc(R.timeOf(it.analyze_failed_at, true)) + ': ' + esc(it.analyze_error || '') +
-        '. Tried again by the next run.">failed</span>';
+        '. Tried again by the next run (new files analyzed right away: a day later).">failed</span>';
     }
     return it.analyzed_at ? ' <span class="tag ok" title="Analyzed ' + esc(R.timeOf(it.analyzed_at, true)) + '">✓</span>' : '';
   }
@@ -115,13 +118,15 @@
       '<button type="button" class="sm primary" data-t="save">Save</button>' +
       '<button type="button" class="sm" data-t="clear" title="Remove the figures set here">Use measured</button>' +
       '<button type="button" class="sm" data-t="forget" title="Forget the measured quiet start, end and level: measured again on the next play">Forget measured</button>' +
-      '<button type="button" class="sm" data-t="analyze" title="Measure it again on the off-air deck">Analyze again</button>' +
+      (canAnalyze ? '<button type="button" class="sm" data-t="analyze" title="Measure it again on ' + PLAYER + '">Analyze again</button>' : '') +
       '<span class="dim small">' + (it.analyzed_at ? 'analyzed ' + esc(R.timeOf(it.analyzed_at, true))
         : it.analyze_failed_at ? 'analysis failed: ' + esc(it.analyze_error || '') : 'measured from plays') + '</span>' +
       '<button type="button" class="linkbtn" data-t="close">close</button>' +
       '<div class="dim small">Quiet start: where the sound begins, in seconds from the start of the file (the Core starts just before it, ' +
       'within Settings → Silence detection). Quiet end: seconds of silence at the end (the next item starts that much early). ' +
-      'Blank = what the Core measures. A figure set here is not measured over.</div></div></td></tr>');
+      'Blank = what the Core measures. A figure set here is not measured over. The figures are the file\'s (its name and size), ' +
+      'shared by every station that has it: a figure set here or Forget measured reaches each one\'s Core at once (a rescan); ' +
+      'an analysis reaches the other stations\' Cores at their next rescan. A new size (edited file) starts afresh.</div></div></td></tr>');
     tr.nextElementSibling.querySelector('input').focus();
   }
 
@@ -136,9 +141,10 @@
         R.toast(label + (t === 'clear' ? ': using the measured figures' : ': saved; the Core picks it up after its rescan'), 'ok');
       } else if (t === 'analyze') {
         await R.post('/api/v1/analyze', body);
-        R.toast(label + ': queued for analysis on the off-air deck', 'ok');
+        R.toast(label + ': queued for analysis on ' + PLAYER, 'ok');
       } else if (t === 'forget') {
-        if (!confirm('Forget the measured quiet start, end and level of “' + label + '”? They are measured again on its next play.')) return;
+        if (!confirm('Forget the measured quiet start, end and level of “' + label + '”, on every station that has it? They are measured again on its ' +
+          'next play, and by file analysis.')) return;
         await R.post('/api/v1/library/forget', body);
         R.toast(label + ': measured figures forgotten', 'ok');
       }
@@ -273,7 +279,7 @@
   $('btn-rescan').addEventListener('click', (e) => R.command('rescan', {}, 'Rescan library', e.currentTarget));
   $('btn-forget').hidden = !R.canOperate;
   $('btn-forget').addEventListener('click', async () => {
-    if (!confirm('Forget the measured quiet start, end and level of every one of the ' + NOUN[kind] + '? Each is measured again on its next play. Figures set by an operator stay.')) return;
+    if (!confirm('Forget the measured quiet start, end and level of every one of the ' + NOUN[kind] + ', on every station that has them? Each is measured again on its next play. Figures set by an operator stay.')) return;
     try {
       const r = await R.post('/api/v1/library/forget', { station: R.station || undefined, kind });
       R.toast('Forgotten for ' + r.files + ' ' + NOUN[kind], 'ok');
@@ -303,7 +309,7 @@
     else if (a === 'trim') trimRow(tr);
     else if (a === 'analyze') {
       R.post('/api/v1/analyze', { station: R.station || undefined, key })
-        .then(() => { R.toast(label + ': queued for analysis on the off-air deck', 'ok'); refresh(); })
+        .then(() => { R.toast(label + ': queued for analysis on ' + PLAYER, 'ok'); refresh(); })
         .catch((err) => R.toast(label + ': ' + err.message, 'bad'));
     }
     else if (a === 'ad' && confirm('Fade to an ad break with “' + label + '” now?')) R.command('play_now', { key }, 'Play now: ' + label, b);
@@ -314,41 +320,57 @@
   // file analyzed (its figures, the queued / failed tags) reloads what is shown; and once a minute anyway
   // (another operator's changes, this hour's ad slots)
   let started = false, loadedAt = 0;
-  // file analysis: progress and the buttons to start / stop it
-  function analysisLine(a) {
+  // file analysis: the Core's analysis players, this station's files to go, and the buttons to start / stop a run on
+  // the station's Core (its analysis players serve every station on it); fault: the station's, if the Core faulted it
+  function analysisLine(a, fault) {
     const el = $('lib-analysis');
     el.hidden = !a;
     if (!a) return;
     const btn = (scope, text, title) => R.canOperate ? '<button type="button" class="sm" data-scope="' + scope + '" title="' + title + '">' + text + '</button>' : '';
-    const daily = a.at === 'off' ? 'no daily run' : 'daily at ' + esc(a.at);
-    R.setHTML(el, !a.can
-      ? '<span>File analysis needs the players\' mixer: set <b>CFG.MIXER</b> in radio.lua (the Core\'s Debug Output says why it is off).</span>'
-      : a.active
-        ? '<span><b>Analyzing</b> on the off-air deck, between songs: ' + R.num(a.left) + ' file' + (a.left === 1 ? '' : 's') + ' to go.</span>' +
-          btn('stop', 'Stop', 'Stop analyzing (what is done stays)')
-        : '<span><b>File analysis</b>: ' + (a.never ? R.num(a.never) + ' file' + (a.never === 1 ? '' : 's') + ' not analyzed yet' +
-          (a.failed ? ' (' + R.num(a.failed) + ' failed, tried again by the next run)' : '') : 'every file analyzed') +
-          ' · ' + daily + ' (Settings).</span>' + (a.never ? btn('new', 'Analyze now', 'Measure the files not analyzed yet, on the off-air deck') : '') +
-          btn('all', 'Re-analyze all', 'Measure every file again'));
+    const files = (n) => R.num(n) + ' file' + (n === 1 ? '' : 's');
+    const now = a.at === 'right away';
+    const when = now ? 'new files right away' : a.at === 'off' ? 'new files only when started here' : 'daily at ' + esc(a.at);
+    const notYet = files(a.never) + ' not analyzed yet' + (a.failed ? ' (' + R.num(a.failed) + ' failed, tried again ' +
+      (now ? 'a day later' : 'by the next run') + ')' : '');
+    const players = (a.players || []).map((p) => '<span><b>' + esc(p.name) + '</b>: ' + (p.key
+      ? 'measuring ' + esc(p.key.split('/').pop()) + (p.station ? ' (' + esc(p.station) + ')' : '') : esc(p.state || 'idle')) + '</span>').join('');
+    R.setHTML(el, (fault ? '<span><b>Station fault</b>: ' + esc(fault) + ' (see the Dashboard).</span>' : '') + (a.gone
+      ? '<span><b>Not on its Core</b>: this station has not synced for over 10 minutes (taken out of CFG.STATIONS, or its Core is off): ' +
+        'its files are analyzed when it syncs again.</span>'
+      : !a.can
+      ? '<span>File analysis needs an analysis player on this station\'s Core: an Audio Player and a peak / rms meter channel of its own, ' +
+        'routed to no output, listed in <b>CFG.ANALYZERS</b> in radio.lua 2.1.0 or later (the Core\'s Debug Output says why it is off).</span>'
+      : (a.online === false ? '<span><b>Core offline</b>: its analysis players measure nothing until it syncs again.</span>' : players) +
+        (a.active ? '<span><b>Analyzing</b>: ' + files(a.left) + ' of this station to go' + (a.never ? '; ' + notYet : '') + '.</span>'
+          : '<span><b>File analysis</b>: ' + (a.never ? notYet : 'every file analyzed') + '.</span>') +
+        '<span>' + when + ' (Settings).</span>' +
+        (a.run ? btn('stop', 'Stop', 'Stop the run and the files asked for, on every station of this Core (what is done stays' +
+          (now ? '; new files are still analyzed right away' : '') + ')') : '') +
+        (a.never && !a.run && (!now || a.failed) ? btn('new', 'Analyze new now', now ? 'Try the files that failed again now, not a day later'
+          : 'Measure the files not analyzed yet now, failed ones too') : '') +
+        btn('all', 'Re-analyze all', 'Measure every file of every station of this Core again')));
   }
   $('lib-analysis').addEventListener('click', async (e) => {
     const b = e.target.closest('button[data-scope]');
     if (!b) return;
     const scope = b.dataset.scope;
-    if (scope === 'all' && !confirm('Measure every file again? It runs on the off-air deck between songs and can take hours for a large library.')) return;
+    if (scope === 'all' && !confirm('Measure every file of every station of this Core again? ' +
+      'Each analysis player takes about 40 seconds a file: hours for a large library.')) return;
     try {
       await R.post('/api/v1/analyze', { station: R.station || undefined, scope });
-      R.toast(scope === 'stop' ? 'Analysis stopped' : 'Analysis started on the off-air deck', 'ok');
+      R.toast(scope === 'stop' ? 'Analysis stopped' : 'Analysis started on ' + PLAYER, 'ok');
     } catch (err) { R.toast('Analysis: ' + err.message, 'bad'); }
   });
 
   R.status(3000, 1, (d) => {
+    const s = d && d.station, a = (s && s.analysis) || {};
+    canAnalyze = !!a.can;
     if (!started) { started = true; load(false); }
-    const s = d && d.station;
-    analysisLine(s && s.analysis);
+    analysisLine(s && s.analysis, (R.core() || {}).fault);
+    if ($('lib-one')) $('lib-one').hidden = !R.onePlayer();       // Imaging / Advertisements of a songs-only station
     if (!s) return;
-    const p = d.recent[0] || {}, a = s.analysis || {};
-    const now = [s.library_at, p.id, p.ended_at, a.last, a.left].join('|');
+    const p = d.recent[0] || {};
+    const now = [s.library_at, p.id, p.ended_at, a.last, a.left, a.can, a.online].join('|');
     if ((seen !== null && now !== seen) || (loadedAt && Date.now() - loadedAt > 60000)) refresh();
     seen = now;
   });

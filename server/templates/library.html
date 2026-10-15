@@ -5,6 +5,9 @@
   <div class="section-title">{{ title }}</div>
   <span id="lib-info" class="dim small"></span>
 </div>
+{% if kind != 'music' %}
+<div class="banner wait" id="lib-one" hidden>This station has one player: it plays songs only, never bumpers, station IDs or advertisements.</div>
+{% endif %}
 {% if kind == 'ad' %}
 <section class="tile amber" id="hour-tile" hidden>
   <div class="t-head"><div class="t-label">This hour</div><span class="dim small">per-hour advertisements in time order · played · owed now · missed (skipped) · to come</span></div>
@@ -24,7 +27,7 @@
       </select>
     </label>
     <button type="button" id="btn-rescan" title="Ask the Core to rescan its folders">Rescan</button>
-    <button type="button" id="btn-forget" title="Forget every measured quiet start, end and level on this page (measured again as each plays)">Forget measured</button>
+    <button type="button" id="btn-forget" title="Forget every measured quiet start, end and level on this page, on every station that has these files (measured again as each plays)">Forget measured</button>
   </form>
   <div id="lib-analysis" class="analysis" hidden></div>
   <div class="table-wrap">

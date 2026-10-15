@@ -20,7 +20,7 @@ if len(sys.argv) < 2:
 scenario = os.path.abspath(sys.argv[1])
 repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# radio.lua writes media/_radio/learned.json relative to cwd; sandbox that in a temp dir
+# radio.lua writes media/_radio/settings.json and outbox.json relative to cwd; sandbox that in a temp dir
 work = tempfile.mkdtemp(prefix="mockcore-")
 os.symlink(os.path.join(repo, "qsys"), os.path.join(work, "qsys"))
 os.chdir(work)

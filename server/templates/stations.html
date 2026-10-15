@@ -1,0 +1,10 @@
+{% extends 'base.html' %}
+{% block title %}Stations · QSYSRadio{% endblock %}
+{% block main %}
+<div class="section-header">
+  <div class="section-title">Stations</div>
+  <div class="st-sum" id="st-sum"></div>
+</div>
+<div class="st-grid" id="st-grid"><div class="empty-state">Loading…</div></div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/stations.js') }}?v={{ version }}"></script>{% endblock %}

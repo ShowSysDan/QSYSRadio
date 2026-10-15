@@ -218,3 +218,22 @@ def like(q):
 
 def iso(value):
     return value.isoformat() if value is not None else None
+
+
+def lock_station(cur, station=None, core=None):
+    """The station's lock until the transaction ends (station None: every station's, or with core every
+    station's of that Core, in name order). It serialises the Core's sync of a station with every web write
+    to that station's rows (commands, holds, IDs, ad rules, settings, analysis, figures). Take it FIRST,
+    before touching any row: the sync and a web write that lock the same rows in opposite orders would
+    deadlock. Hold one station's at a time, or several in name order, never a few in another order. A file's
+    figures (media_files) are shared by every station that has it, which this lock does not cover: a write to
+    many files' figures can still meet another station's sync on the same rows, and PostgreSQL cancels one
+    (a web write answers 409)."""
+    if station is None:
+        cur.execute('SELECT station FROM stations' + (' WHERE core = %s' if core else '') + ' ORDER BY station',
+                    (core,) if core else None)
+        names = [r[0] for r in cur.fetchall()]
+    else:
+        names = [station]
+    for name in names:
+        cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (f'qsysradio:station:{name}',))

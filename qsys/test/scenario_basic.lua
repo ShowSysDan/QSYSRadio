@@ -23,10 +23,10 @@ MockCore.setup{
 }
 
 dofile("qsys/radio/radio.lua")
-SETTINGS.bumper_every_n_tracks = 3
-SETTINGS.heartbeat_s = 60
+local S = Radio.stations[1]
+S.settings.bumper_every_n_tracks = 3
 
-MockCore.at(65, function() print("        >>> operator presses SKIP"); Control.run({ cmd = "skip", by = "test" }) end)
+MockCore.at(65, function() print("        >>> operator presses SKIP"); S:command({ cmd = "skip", by = "test" }) end)
 MockCore.run(260)
 
 -------------------------------------------------------------------------------
@@ -73,10 +73,10 @@ local bravoEnded = false
 for _, ev in ipairs(EVENTS) do
   if ev.kind == "track_end" and ev.file == "Bravo - Three.mp3" and ev.reason ~= "cut" then bravoEnded = true end
 end
-local bravo = LEARNED["Test/Tuning/Bravo - Three.mp3"]
+local bravo = S.learned["Test/Tuning/Bravo - Three.mp3"]
 check(bravoEnded, "'Bravo - Three' played to its end (scenario coverage; pick another seed if not)")
 check(sawSilence or (bravo and bravo.trail and bravo.trail > 5), "silent tail was detected or learned on 'Bravo - Three'")
-check(LEARNED["Test/Tuning/Foxtrot - Seven.mp3"] and LEARNED["Test/Tuning/Foxtrot - Seven.mp3"].unsupported and unsupported == 1, "unsupported file was tried once, learned and excluded")
+check(S.learned["Test/Tuning/Foxtrot - Seven.mp3"] and S.learned["Test/Tuning/Foxtrot - Seven.mp3"].unsupported and unsupported == 1, "unsupported file was tried once, learned and excluded")
 
 local artistRepeat = false
 for i = 2, #starts do
@@ -88,6 +88,6 @@ check(not artistRepeat, "no back-to-back artist repeats")
 
 print("")
 print("----- learned (this boot; the server keeps them per file) -----")
-for k, v in pairs(LEARNED) do print("  " .. k .. "  " .. require("json").encode(v)) end
+for k, v in pairs(S.learned) do print("  " .. k .. "  " .. require("json").encode(v)) end
 print("")
 print(fails == 0 and "ALL CHECKS PASSED" or (fails .. " CHECK(S) FAILED"))

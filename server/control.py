@@ -1,23 +1,34 @@
 """Station control: the Core's sync + library upload, operator commands, live
 status for the web page, library search, station settings. Ad schedules: ads.py.
 
-One advisory lock per station serialises the Core's sync with operators'
-commands, so command ids are committed in order and none can be skipped by
-the Core's "everything after my last ack" request.
+One radio.lua runs every station of its Core: one sync request a second
+carries all of them, each station handled in its own transaction (a 1.x
+Core's single-station body is still accepted). One advisory lock per station
+(db.lock_station, taken before any of the station's rows is touched) serialises
+the Core's sync with every web write to the station: so command ids are
+committed in order and none can be skipped by the Core's "everything after my
+last ack" request, and no web write can deadlock with that station's sync. A
+file's figures (media_files) are shared by every station that has it, so a
+change to many files at once (Forget measured for a kind) can still meet
+another station's sync writing the same rows; PostgreSQL then cancels one of
+the two: the sync part is answered {error} (the Core sends it again), the web
+write 409 (app.py; nothing changed, try again).
 """
 import json
+import time
+import uuid
 from datetime import timedelta
 
-from psycopg2.extras import execute_values
+import psycopg2
+import psycopg2.extensions
 
-from . import ads, analysis, breaks, clock, core_settings, events, logs
+from . import ads, analysis, breaks, clock, core_settings, cores, db, events, fingerprints, logs, media
 from .db import clean_json, iso, like, number, text
 from .events import BadRequest
 
 KINDS = ('music', 'imaging', 'ad')
 COMMAND_TTL_S = 60          # a command the Core has not picked up by then expires
 RESULT_TTL_S = 300          # a picked-up command with no result by then is marked failed
-ONLINE_S = 10               # a Core not heard from for this long shows as offline
 
 # command -> (label, needs a library key)
 COMMANDS = {
@@ -34,10 +45,6 @@ COMMANDS = {
     'queue_clear': ('Clear queue', False),
     'rescan': ('Rescan library', False),
 }
-
-
-def _lock_station(cur, station):
-    cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (f'qsysradio:station:{station}',))
 
 
 def _station_name(payload):
@@ -68,6 +75,11 @@ def _clean_state(state):
             s[key] = {}
     for key in ('automation', 'stop_after', 'bumper_requested', 'ad_requested'):
         s[key] = s.get(key) is True
+    players = s.pop('players', None)  # one or two (radio.lua 2.2.0); missing before it: two
+    if type(players) is int and players in (1, 2):
+        s['players'] = players
+    if 'fault' in s:                # the Core could not build or run the station: why (it retries by itself)
+        s['fault'] = text(s['fault'], 300)
     return s
 
 
@@ -86,131 +98,261 @@ def _clean_meters(meters):
 
 
 # ── Core side ────────────────────────────────────────────────────────────────
+SYNC_STATIONS_MAX = 100     # stations in one sync body (any more are left out)
+LIBRARY_PARTS_MAX = 1000    # parts in one library scan
+FAIL_LOG_S = 60             # a station whose sync keeps failing is logged at most this often
 
-def core_sync(conn, payload, now):
-    """The Core's once-a-second request: events, optional state, command ack.
-    Returns (reply, log_lines)."""
-    if not isinstance(payload, dict):
-        raise BadRequest('expected a JSON object')
-    station = _station_name(payload)
-    ack = _int(payload.get('ack'), 0, 2 ** 62, 0)
-    state = _clean_state(payload.get('state'))
+
+class ScanIncomplete(BadRequest):
+    """The last part of a library scan came without every other part: 409, the Core sends the scan again."""
+
+
+def _station_sync(cur, station, part, core, version, boot, now):
+    """One station's part of the Core's sync, in its own transaction under its station lock: events,
+    optional state, command ack and meters in; commands, settings and ads plan out (files to analyze are the
+    Core's: analysis.sync; a run the station had on a 1.x Core becomes its Core's: analysis.adopt). core None:
+    a 1.x Core (stations.core unchanged). Returns (reply, log_lines)."""
+    ack = _int(part.get('ack'), 0, 2 ** 62, 0)
+    state = _clean_state(part.get('state'))
     reply, lines = {}, []
-    boot = text(payload.get('boot'), 100)
-    with conn.cursor() as cur:
-        _lock_station(cur, station)
-        cur.execute('SELECT boot FROM stations WHERE station = %s', (station,))
-        prev = cur.fetchone()
-        if prev and prev['boot'] != boot:
-            # the Core restarted (it starts again from ack 0): a command it picked up
-            # but never reported must not run twice; undelivered ones still go
-            cur.execute("""UPDATE commands SET done_at = NOW(), ok = FALSE, note = 'the Core restarted before reporting'
-                           WHERE station = %s AND done_at IS NULL AND delivered_at IS NOT NULL""", (station,))
-        meters = _clean_meters(payload.get('meters'))
-        cur.execute("""INSERT INTO stations (station, radio_version, boot, settings_rev, last_seen, meters)
-                       VALUES (%s, %s, %s, %s, NOW(), %s)
-                       ON CONFLICT (station) DO UPDATE SET radio_version = EXCLUDED.radio_version,
-                           boot = EXCLUDED.boot, settings_rev = EXCLUDED.settings_rev, last_seen = NOW(),
-                           meters = EXCLUDED.meters""",
-                    (station, text(payload.get('version'), 50), boot, text(payload.get('settings_rev'), 50) or '',
-                     json.dumps(meters) if meters else None))
-        if state is not None:
-            cur.execute('UPDATE stations SET state = %s, state_at = NOW() WHERE station = %s',
-                        (json.dumps(state), station))
-        if payload.get('events') is not None:
-            accepted, dupes, rejected, lines = events.ingest(
-                cur, station, text(payload.get('version'), 50), payload['events'], now)
-            reply.update(accepted=accepted, duplicates=dupes, rejected=rejected)
-            dropped = payload.get('dropped')
-            if isinstance(dropped, int) and dropped > 0:
-                lines.append((30, f'station={station} outbox overflowed: {dropped} event(s) lost on the Core'))
-        cur.execute(f"""UPDATE commands SET done_at = NOW(), ok = FALSE,
-                           note = CASE WHEN delivered_at IS NULL THEN 'expired: the Core did not pick it up'
-                                       ELSE 'no result from the Core' END
-                        WHERE station = %s AND done_at IS NULL
-                          AND ((delivered_at IS NULL AND created_at < NOW() - INTERVAL '{COMMAND_TTL_S} seconds')
-                            OR delivered_at < NOW() - INTERVAL '{RESULT_TTL_S} seconds')""", (station,))
-        cur.execute(f"""SELECT id, cmd, args, requested_by FROM commands
-                        WHERE station = %s AND id > %s AND done_at IS NULL
-                          AND created_at > NOW() - INTERVAL '{COMMAND_TTL_S} seconds'
-                        ORDER BY id LIMIT 20""", (station, ack))
-        rows = cur.fetchall()
-        if rows:
-            cur.execute('UPDATE commands SET delivered_at = NOW() WHERE id = ANY(%s) AND delivered_at IS NULL',
-                        ([r['id'] for r in rows],))
-        reply['commands'] = [{'id': r['id'], 'cmd': r['cmd'], 'args': r['args'], 'by': r['requested_by']}
-                             for r in rows]
-        cur.execute('SELECT COALESCE(MAX(id), 0) FROM commands WHERE station = %s', (station,))
-        newest = cur.fetchone()[0]
-        if ack > newest:            # server DB was reset: tell the Core to start over
-            reply['ack_reset'] = newest
-        overrides = core_settings.for_core(core_settings.load(cur))
-        rev = core_settings.rev(overrides)
-        if (text(payload.get('settings_rev'), 50) or '') != rev:
-            reply['settings'], reply['settings_rev'] = overrides, rev
-        plan, rev = ads.plan(cur, station)
-        if (text(payload.get('ads_rev'), 50) or '') != rev:
-            reply['ads'], reply['ads_rev'] = plan, rev
-        more, done = analysis.sync(cur, station, (text(payload.get('analyze_rev'), 50) or '') if 'analyze_rev' in payload else None)
-        reply.update(more)
-        lines += done
-    conn.commit()
+    db.lock_station(cur, station)
+    cur.execute("""SELECT boot, players, COALESCE(analyze_from, analyze_run_at, analyze_auto_at) IS NOT NULL AS job
+                   FROM stations WHERE station = %s""", (station,))
+    prev = cur.fetchone()
+    if prev and prev['boot'] != boot:
+        # the Core restarted (it starts again from ack 0): a command it picked up
+        # but never reported must not run twice; undelivered ones still go
+        cur.execute("""UPDATE commands SET done_at = NOW(), ok = FALSE, note = 'the Core restarted before reporting'
+                       WHERE station = %s AND done_at IS NULL AND delivered_at IS NOT NULL""", (station,))
+    meters = _clean_meters(part.get('meters'))
+    settings_rev = text(part.get('settings_rev'), 50) or ''
+    cur.execute("""INSERT INTO stations (station, radio_version, boot, settings_rev, last_seen, meters, core)
+                   VALUES (%s, %s, %s, %s, NOW(), %s, %s)
+                   ON CONFLICT (station) DO UPDATE SET radio_version = EXCLUDED.radio_version,
+                       boot = EXCLUDED.boot, settings_rev = EXCLUDED.settings_rev, last_seen = NOW(),
+                       meters = EXCLUDED.meters, core = COALESCE(EXCLUDED.core, stations.core)""",
+                (station, version, boot, settings_rev, json.dumps(meters) if meters else None, core))
+    if state is not None:
+        players = state.get('players')       # a fault state has none: the count stays
+        cur.execute('UPDATE stations SET state = %s, state_at = NOW(), players = COALESCE(%s, players) WHERE station = %s',
+                    (json.dumps(state), players, station))
+        if players and prev and prev['players'] != players:
+            ads.stale(cur, station)           # one player: no breaks in its plan (or breaks again)
+    accepted = 0
+    evs = [] if part.get('events') == {} else part.get('events')       # Lua encodes an empty table as {}
+    if evs is not None:
+        accepted, dupes, rejected, lines = events.ingest(cur, station, version, evs, now)
+        reply.update(accepted=accepted, duplicates=dupes, rejected=rejected)
+    dropped = part.get('dropped')
+    if isinstance(dropped, int) and not isinstance(dropped, bool) and dropped > 0:
+        lines.append((30, f'station={station} outbox overflowed: {dropped} event(s) lost on the Core'))
+    cur.execute(f"""UPDATE commands SET done_at = NOW(), ok = FALSE,
+                       note = CASE WHEN delivered_at IS NULL THEN 'expired: the Core did not pick it up'
+                                   ELSE 'no result from the Core' END
+                    WHERE station = %s AND done_at IS NULL
+                      AND ((delivered_at IS NULL AND created_at < NOW() - INTERVAL '{COMMAND_TTL_S} seconds')
+                        OR delivered_at < NOW() - INTERVAL '{RESULT_TTL_S} seconds')""", (station,))
+    cur.execute(f"""SELECT id, cmd, args, requested_by FROM commands
+                    WHERE station = %s AND id > %s AND done_at IS NULL
+                      AND created_at > NOW() - INTERVAL '{COMMAND_TTL_S} seconds'
+                    ORDER BY id LIMIT 20""", (station, ack))
+    rows = cur.fetchall()
+    if rows:
+        cur.execute('UPDATE commands SET delivered_at = NOW() WHERE id = ANY(%s) AND delivered_at IS NULL',
+                    ([r['id'] for r in rows],))
+    reply['commands'] = [{'id': r['id'], 'cmd': r['cmd'], 'args': r['args'], 'by': r['requested_by']} for r in rows]
+    cur.execute('SELECT COALESCE(MAX(id), 0) FROM commands WHERE station = %s', (station,))
+    newest = cur.fetchone()[0]
+    if ack > newest:            # server DB was reset: tell the Core to start over
+        reply['ack_reset'] = newest
+    values = core_settings.for_core(core_settings.merged(cur, station))
+    rev = core_settings.rev(values)
+    if settings_rev != rev:
+        reply['settings'], reply['settings_rev'] = values, rev
+    plan, rev = ads.cached_plan(cur, station, fresh=accepted > 0)
+    if (text(part.get('ads_rev'), 50) or '') != rev:
+        reply['ads'], reply['ads_rev'] = plan, rev
+    if text(part.get('analyze_rev'), 50):
+        # a Core before 2.1.0 (a 1.x body or a 2.0.0 part) measured files on its on-air decks: its list is
+        # cleared and it gets no more (radio.lua 2.1.0 measures them on its analysis players)
+        reply.update(analyze=[], analyze_rev='')
+    if core and prev and prev['job']:      # its run from a 1.x Core (kept by migration 0017) becomes its Core's
+        lines += analysis.adopt(cur, station, core)
     return reply, lines
 
 
+_failed_logged = {}         # station (or core:<id>) -> monotonic time its failure was last logged
+
+
+def _part_failed(conn, name, exc):
+    """One station's part (or the Core's own bookkeeping, name core:<id>) failed: roll it back so the rest
+    goes on, and say so (to the Core: {error}; in the log at most every FAIL_LOG_S). The database itself
+    gone is everyone's: DatabaseUnavailable, 503 for the whole request."""
+    lost = isinstance(exc, db.DatabaseUnavailable) or (
+        isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError))
+        and not isinstance(exc, psycopg2.extensions.TransactionRollbackError))     # a deadlock is one station's
+    if not lost:
+        try:
+            conn.rollback()
+        except psycopg2.Error:
+            lost = True
+    if lost or conn.closed:
+        if isinstance(exc, db.DatabaseUnavailable):
+            raise exc
+        raise db.DatabaseUnavailable(f'database lost during the Core sync: {exc}'.strip()) from exc
+    error = text(str(exc).strip() or type(exc).__name__, 300)
+    t, lines = time.monotonic(), []
+    if t - _failed_logged.get(name, -1e9) >= FAIL_LOG_S:
+        if len(_failed_logged) > 1000:
+            _failed_logged.clear()
+        _failed_logged[name] = t
+        lines.append((30 if isinstance(exc, BadRequest) else 40,
+                      f'{name if name.startswith("core:") else "station=" + name} sync failed, rolled back '
+                      f'(the other stations go on): {type(exc).__name__}: {error}'))
+    return {'error': error}, lines
+
+
+def _results(part, kinds):
+    """Does this station's part carry a result for one of the Core's lists (an event of one of these kinds: an
+    analysis result or a file found unsupported, a fingerprint)? That list is then made again."""
+    evs = part.get('events') if isinstance(part, dict) else None
+    return isinstance(evs, list) and any(isinstance(e, dict) and e.get('kind') in kinds for e in evs)
+
+
+# the Core's own lists, each when it sends its rev: (name, module with sync(), the rev field)
+CORE_JOBS = (('analysis', analysis, 'analyze_rev'), ('fingerprint', fingerprints, 'fingerprint_rev'))
+
+
+def core_sync(conn, payload, now, log):
+    """The Core's once-a-second request. Returns the reply; log(lines) is called after each commit.
+    2.x: {version, boot, core, mem_kb, analyze_rev?, analyzers?, fingerprint_rev?, stations: [{station, ack,
+    settings_rev, ads_rev, meters, state?, events?, dropped?}]} -> {stations: {id: reply | {error}}, analyze?,
+    analyze_rev?, fingerprint?, fingerprint_rev?}; each station is its own transaction (its lock held for its
+    work only, committed before the next): one station's failure rolls back that station alone, which gets
+    {error} and sends its events again. Then the Core's own lists, each in its own transaction: its next files
+    to analyze (analyze_rev: it has an analysis player; analysis.sync) and to fingerprint (fingerprint_rev: it
+    can make fingerprints; fingerprints.sync), each when it differs from the Core's. 1.x: one station's part at
+    the top level ({station, version, boot, ack, ...}) -> that station's reply, as before 2.0."""
+    if not isinstance(payload, dict):
+        raise BadRequest('expected a JSON object')
+    version, boot = text(payload.get('version'), 50), text(payload.get('boot'), 100)
+    if 'stations' not in payload:
+        station = _station_name(payload)
+        with conn.cursor() as cur:
+            reply, lines = _station_sync(cur, station, payload, None, version, boot, now)
+        conn.commit()
+        log(lines)
+        return reply
+    parts = [] if payload['stations'] == {} else payload['stations']
+    if not isinstance(parts, list):
+        raise BadRequest('stations must be a list')
+    core = text(payload.get('core'), 200)
+    if core:
+        mem = number(payload.get('mem_kb'))
+        try:
+            with conn.cursor() as cur:
+                lines = cores.seen(cur, core, boot, version, mem if mem is not None and 0 <= mem < 2 ** 40 else None,
+                                   cores.clean_analyzers(payload.get('analyzers')))
+            conn.commit()
+        except Exception as exc:          # noqa: BLE001 (the stations' work goes on)
+            lines = _part_failed(conn, 'core:' + core, exc)[1]
+        log(lines)
+    replies = {}
+    for part in parts[:SYNC_STATIONS_MAX]:
+        station = text(part.get('station'), 200) if isinstance(part, dict) else None
+        if not station or station in replies:
+            continue
+        try:
+            with conn.cursor() as cur:
+                reply, lines = _station_sync(cur, station, part, core, version, boot, now)
+            conn.commit()
+        except Exception as exc:          # noqa: BLE001 (one station's failure is that station's alone)
+            reply, lines = _part_failed(conn, station, exc)
+        replies[station] = reply
+        log(lines)
+    out = {'stations': replies}
+    for name, job, field in CORE_JOBS:
+        if not core or field not in payload:
+            continue
+        try:
+            with conn.cursor() as cur:
+                more, lines = job.sync(cur, core, text(payload.get(field), 50) or '',
+                                       any(_results(p, job.RESULTS) for p in parts[:SYNC_STATIONS_MAX]))
+            conn.commit()
+            out.update(more)
+        except Exception as exc:          # noqa: BLE001 (the stations' replies stand; the Core asks again)
+            lines = _part_failed(conn, f'core:{core} {name}', exc)[1]
+        log(lines)
+    return out
+
+
 def core_library(conn, payload):
-    """The Core's file list after a scan. Returns (count, per-file figures the
-    Core uses: {key: {trail, lead, level, peak} | {unsupported}}, log_line)."""
+    """The Core's file list after a scan. 2.x: in parts ({station, boot, scan, part, parts, music_dir,
+    imaging_dir, ads_dir, items}, at most 1000 items each, one at a time); 1.x: whole (no scan): one complete
+    scan. Each part's files are upserted and marked with the scan id; only the last part, with every part of
+    the scan in, marks the station's files not in it gone, so an interrupted or partial upload never shrinks
+    the library (its last part without the others: ScanIncomplete, 409; the Core sends the scan again).
+    Returns (reply, log line or None): before the last part {ok, scan, part, parts}; the last {ok, items (in
+    the scan), learned: the per-file figures the Core uses, {key: {trail, lead, level, peak} | {unsupported}}}.
+    The figures are the file's, shared by every station that has it (media.py)."""
     station = _station_name(payload)
     items = payload.get('items')
     if items == {}:                 # Lua encodes an empty table as {}
         items = []
     if not isinstance(items, list):
         raise BadRequest('items must be a list')
+    scan = text(payload.get('scan'), 100)
+    if scan is None:                # 1.x: the whole list at once
+        scan, part, parts = 'whole-' + uuid.uuid4().hex, 1, 1
+    else:
+        part, parts = _int(payload.get('part'), 1, LIBRARY_PARTS_MAX), _int(payload.get('parts'), 1, LIBRARY_PARTS_MAX)
+        if part is None or parts is None or part > parts:
+            raise BadRequest(f'part and parts must be whole numbers, 1 <= part <= parts <= {LIBRARY_PARTS_MAX}')
     rows = {}
     for it in items[:100000]:
         if not isinstance(it, dict) or it.get('kind') not in KINDS or not text(it.get('key'), 1000):
             continue
-        size = it.get('size')
+        size = it.get('size')       # 0: the Core could not tell (unknown, so never shared)
         rows[text(it['key'], 1000)] = (
-            station, text(it['key'], 1000), it['kind'], text(it.get('dir'), 500) or '',
-            text(it.get('file'), 500) or text(it['key'], 500), text(it.get('artist'), 500), text(it.get('title'), 500),
-            size if isinstance(size, int) and not isinstance(size, bool) and 0 <= size < 2 ** 62 else None,
+            it['kind'], text(it.get('dir'), 500) or '', text(it.get('file'), 500) or text(it['key'], 500),
+            text(it.get('artist'), 500), text(it.get('title'), 500),
+            size if isinstance(size, int) and not isinstance(size, bool) and 0 < size < 2 ** 62 else None,
             number(it.get('duration')), number(it.get('lead_in')), number(it.get('trail')), number(it.get('peak')))
     with conn.cursor() as cur:
-        _lock_station(cur, station)
-        cur.execute('UPDATE library SET present = FALSE WHERE station = %s AND present', (station,))
-        execute_values(cur, """INSERT INTO library (station, key, kind, directory, file, artist, title, size,
-                                   duration_s, lead_in_s, trail_s, peak_dbfs) VALUES %s
-                               ON CONFLICT (station, key) DO UPDATE SET kind = EXCLUDED.kind,
-                                   directory = EXCLUDED.directory, file = EXCLUDED.file,
-                                   artist = EXCLUDED.artist, title = EXCLUDED.title, size = EXCLUDED.size,
-                                   duration_s = COALESCE(EXCLUDED.duration_s, library.duration_s),
-                                   lead_in_s = COALESCE(EXCLUDED.lead_in_s, library.lead_in_s),
-                                   trail_s = COALESCE(EXCLUDED.trail_s, library.trail_s),
-                                   peak_dbfs = COALESCE(EXCLUDED.peak_dbfs, CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size
-                                                                                 THEN library.peak_dbfs END),
-                                   level_db = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size THEN library.level_db END,
-                                   level_s = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size THEN library.level_s END,
-                                   unsupported = library.unsupported AND library.size IS NOT DISTINCT FROM EXCLUDED.size,
-                                   analyzed_at = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size
-                                                      THEN library.analyzed_at END,
-                                   analyze_failed_at = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size
-                                                            THEN library.analyze_failed_at END,
-                                   present = TRUE, last_seen = NOW()""", list(rows.values()), page_size=1000)
-        cur.execute("""INSERT INTO stations (station, library_at, music_dir, imaging_dir, ads_dir)
-                       VALUES (%s, NOW(), %s, %s, %s)
+        db.lock_station(cur, station)
+        cur.execute('SELECT scan, scan_parts FROM stations WHERE station = %s', (station,))
+        had = cur.fetchone()
+        got = sorted(set(had['scan_parts'] if had and had['scan'] == scan else []) | {part})
+        missing = sorted(set(range(1, parts + 1)) - set(got)) if part == parts else None
+        if missing:
+            conn.rollback()           # nothing written; the handler logs it outside the transaction
+            raise ScanIncomplete(f'library scan {scan} of station {station}: part(s) {", ".join(map(str, missing[:10]))} '
+                                 f'of {parts} not received; send the whole scan again')
+        media.link(cur, station, rows, scan)
+        analysis.stale(cur, station)
+        fingerprints.stale(cur, station)
+        if part < parts:
+            cur.execute("""INSERT INTO stations (station, scan, scan_parts) VALUES (%s, %s, %s)
+                           ON CONFLICT (station) DO UPDATE SET scan = EXCLUDED.scan, scan_parts = EXCLUDED.scan_parts""",
+                        (station, scan, got))
+            conn.commit()
+            return {'ok': True, 'scan': scan, 'part': part, 'parts': parts}, None
+        media.gone(cur, station, scan)
+        cur.execute("""INSERT INTO stations (station, library_at, music_dir, imaging_dir, ads_dir, scan, scan_parts)
+                       VALUES (%s, NOW(), %s, %s, %s, %s, %s)
                        ON CONFLICT (station) DO UPDATE SET library_at = NOW(), music_dir = EXCLUDED.music_dir,
-                           imaging_dir = EXCLUDED.imaging_dir, ads_dir = EXCLUDED.ads_dir""",
+                           imaging_dir = EXCLUDED.imaging_dir, ads_dir = EXCLUDED.ads_dir, scan = EXCLUDED.scan,
+                           scan_parts = EXCLUDED.scan_parts""",
                     (station, text(payload.get('music_dir'), 500), text(payload.get('imaging_dir'), 500),
-                     text(payload.get('ads_dir'), 500)))
+                     text(payload.get('ads_dir'), 500), scan, got))
+        ads.stale(cur, station)
         # what the Core uses: unsupported files, the quiet start / end (where to start, when to hand over) and
         # the average level with its peak (level matching); fixed = the operator set a figure, analyzed =
         # measured off air: the Core does not learn over either
         cur.execute("""SELECT key, unsupported, COALESCE(trail_set_s, trail_s) AS trail, COALESCE(lead_set_s, lead_in_s) AS lead,
                               trail_set_s IS NOT NULL OR lead_set_s IS NOT NULL AS fixed, analyzed_at IS NOT NULL AS analyzed,
                               level_db AS level, CASE WHEN level_db IS NOT NULL THEN peak_dbfs END AS peak
-                       FROM library
+                       FROM library_figures
                        WHERE station = %s AND present
                          AND (unsupported OR trail_s IS NOT NULL OR lead_in_s IS NOT NULL OR trail_set_s IS NOT NULL
                               OR lead_set_s IS NOT NULL OR level_db IS NOT NULL)""", (station,))
@@ -219,22 +361,27 @@ def core_library(conn, payload):
                         **{k: round(r[k], 1) for k in ('level', 'peak') if r[k] is not None},
                         **{k: True for k in ('fixed', 'analyzed') if r[k]})
                    for r in cur.fetchall()}
+        cur.execute('SELECT kind, count(*) FROM library WHERE station = %s AND present GROUP BY kind', (station,))
+        counts = dict(cur.fetchall())
     conn.commit()
-    counts = ' '.join(f'{k}={sum(1 for r in rows.values() if r[2] == k)}' for k in KINDS)
-    return len(rows), learned, (20, f'LIBRARY station={station} {counts}')
+    return ({'ok': True, 'items': sum(counts.values()), 'learned': learned},
+            (20, f'LIBRARY station={station} ' + ' '.join(f'{k}={counts.get(k, 0)}' for k in KINDS)
+                 + (f' parts={parts}' if parts > 1 else '')))
 
 
 # ── Web side ─────────────────────────────────────────────────────────────────
 
 def stations(conn):
     with conn.cursor() as cur:
-        cur.execute(f"""SELECT station, last_seen, radio_version,
-                               last_seen > NOW() - INTERVAL '{ONLINE_S} seconds' AS online,
+        cur.execute(f"""SELECT station, last_seen, radio_version, core, players,
+                               last_seen > NOW() - INTERVAL '{cores.ONLINE_S} seconds' AS online,
                                state->'automation' = 'true'::jsonb AS automation,
-                               state->'stop_after' = 'true'::jsonb AS stop_after
+                               state->'stop_after' = 'true'::jsonb AS stop_after,
+                               left(state->>'fault', 300) AS fault
                         FROM stations ORDER BY last_seen DESC""")
-        return [{'station': r['station'], 'online': r['online'], 'version': r['radio_version'],
-                 'automation': bool(r['automation']), 'stop_after': bool(r['stop_after']),
+        return [{'station': r['station'], 'online': r['online'], 'version': r['radio_version'], 'core': r['core'],
+                 'players': r['players'],
+                 'automation': bool(r['automation']), 'stop_after': bool(r['stop_after']), 'fault': r['fault'],
                  'last_seen': iso(r['last_seen'])} for r in cur.fetchall()]
 
 
@@ -251,9 +398,10 @@ def resolve_station(conn, station):
 
 def status(conn, station):
     """Live Core state + recent commands for the dashboard. state_age_s says
-    how old the Core's elapsed/remaining figures are."""
+    how old the Core's elapsed/remaining figures are. players: 1 = songs only
+    (no ads, holds or IDs to show)."""
     with conn.cursor() as cur:
-        cur.execute("""SELECT station, state, radio_version, boot, last_seen, library_at, meters,
+        cur.execute("""SELECT station, state, radio_version, boot, core, last_seen, library_at, meters, players,
                               EXTRACT(EPOCH FROM NOW() - last_seen) AS age,
                               EXTRACT(EPOCH FROM NOW() - state_at) AS state_age
                        FROM stations WHERE station = %s""", (station,))
@@ -263,22 +411,85 @@ def status(conn, station):
         cur.execute("""SELECT id, cmd, label, requested_by, created_at, delivered_at, done_at, ok, note
                        FROM commands WHERE station = %s ORDER BY id DESC LIMIT 12""", (station,))
         cmds = [{'id': c['id'], 'cmd': c['cmd'], 'label': c['label'], 'by': c['requested_by'],
-                 'created_at': iso(c['created_at']),
-                 'state': ('done' if c['ok'] else 'failed') if c['done_at'] else ('sent' if c['delivered_at'] else 'pending'),
-                 'note': c['note']} for c in cur.fetchall()]
+                 'created_at': iso(c['created_at']), 'state': _command_state(c), 'note': c['note']} for c in cur.fetchall()]
         state = _clean_state(r['state']) or {}
         _fill_durations(cur, station, state)
-        next_ad = ads.next_ad(cur, station)
-        holds = breaks.holds_view(cur, station)
-        ids = breaks.idents(cur, station)
-        analyze = analysis.view(cur, station, state)
+        single = r['players'] == 1
+        next_ad = {'owed': 0, 'at': None} if single else ads.next_ad(cur, station)
+        holds = {} if single else breaks.holds_view(cur, station)
+        ids = {'due': None, 'next_at': None, 'keys': []} if single else breaks.idents(cur, station)
+        analyze = analysis.view(cur, station)
     age = float(r['age'])
-    return {'station': r['station'], 'online': age < ONLINE_S, 'age_s': round(age, 1),
+    return {'station': r['station'], 'online': age < cores.ONLINE_S, 'age_s': round(age, 1),
             'state_age_s': round(float(r['state_age']), 2) if r['state_age'] is not None else None,
-            'version': r['radio_version'], 'boot': r['boot'], 'last_seen': iso(r['last_seen']),
+            'version': r['radio_version'], 'boot': r['boot'], 'core': r['core'], 'players': r['players'],
+            'last_seen': iso(r['last_seen']),
             'library_at': iso(r['library_at']), 'state': state, 'meters': r['meters'], 'commands': cmds, 'next_ad': next_ad,
             'holds': holds, 'ident': {'due': ids['due'], 'next_at': iso(ids['next_at']), 'count': len(ids['keys'])},
             'analysis': analyze}
+
+
+def _command_state(c):
+    """A command row's progress as the panel shows it: pending, sent (the Core has it), done or failed."""
+    return ('done' if c['ok'] else 'failed') if c['done_at'] else ('sent' if c['delivered_at'] else 'pending')
+
+
+OVERVIEW_DECK = ('state', 'live', 'kind', 'artist', 'title', 'file', 'elapsed', 'remaining', 'duration')
+OVERVIEW_NEXT = ('kind', 'artist', 'title', 'file', 'queued')
+OVERVIEW_COMMANDS_MAX = 50
+
+
+def overview(conn, station=None, command_ids=()):
+    """Every station at a glance (the Stations page), by name, in a fixed number of queries however many stations
+    there are: the stations, the open play of each (from the play log: what was on air when its Core went quiet),
+    the Cores (cores.view) and the commands the page is waiting on (command_ids). Each station's row has the
+    shape of status() for what the header needs (online, state, state_age_s, players), so `station` (the
+    requested one, else the most recently seen; None when the requested one does not exist) serves the header.
+    Only what the page shows: the Core's state cut to its decks, what is next and the library counts."""
+    with conn.cursor() as cur:
+        cur.execute("""SELECT station, core, players, radio_version, last_seen, meters,
+                              EXTRACT(EPOCH FROM NOW() - last_seen) AS age,
+                              EXTRACT(EPOCH FROM NOW() - state_at) AS state_age,
+                              jsonb_build_object('automation', state->'automation', 'state', state->'state',
+                                                 'stop_after', state->'stop_after', 'fault', state->'fault',
+                                                 'retry_s', state->'retry_s', 'decks', state->'decks',
+                                                 'next_up', state->'next_up', 'library', state->'library') AS state
+                       FROM stations ORDER BY station""")
+        rows = cur.fetchall()
+        cur.execute("""SELECT DISTINCT ON (station) station, artist, title, file
+                       FROM play_log WHERE ended_at IS NULL AND started_at > NOW() - INTERVAL '1 day'
+                       ORDER BY station, started_at DESC, id DESC""")
+        playing = {p['station']: {'artist': p['artist'], 'title': p['title'], 'file': p['file']} for p in cur.fetchall()}
+        machines = cores.view(cur)
+        ids = [i for i in command_ids if type(i) is int and 0 < i < 2 ** 31][:OVERVIEW_COMMANDS_MAX]
+        commands = []
+        if ids:
+            cur.execute('SELECT id, station, delivered_at, done_at, ok, note FROM commands WHERE id = ANY(%s)', (ids,))
+            commands = [{'id': c['id'], 'station': c['station'], 'state': _command_state(c), 'note': c['note']}
+                        for c in cur.fetchall()]
+    out = []
+    for r in rows:
+        state = _clean_state(r['state']) or {}
+        decks = {d: {k: v[k] for k in OVERVIEW_DECK if k in v} for d, v in state['decks'].items() if isinstance(v, dict)}
+        nxt = state.get('next_up')
+        age = float(r['age'])
+        out.append({
+            'station': r['station'], 'online': age < cores.ONLINE_S, 'age_s': round(age, 1),
+            'state_age_s': round(float(r['state_age']), 2) if r['state_age'] is not None else None,
+            'last_seen': iso(r['last_seen']), 'core': r['core'], 'version': r['radio_version'], 'players': r['players'],
+            'fault': state.get('fault'), 'meters': r['meters'], 'playing': playing.get(r['station']),
+            'state': {'automation': state['automation'], 'stop_after': state['stop_after'], 'state': text(state.get('state'), 20),
+                      'fault': state.get('fault'), 'retry_s': number(state.get('retry_s')), 'decks': decks,
+                      'next_up': {k: nxt[k] for k in OVERVIEW_NEXT if k in nxt} if isinstance(nxt, dict) else None,
+                      'library': {k: number(state['library'].get(k)) for k in KINDS}}})
+    if station:
+        current = next((s for s in out if s['station'] == station), None)
+    else:
+        current = max(zip(rows, out), key=lambda p: p[0]['last_seen'], default=(None, None))[1]
+    if current:                          # the header's analysis chip, as status() gives it (one station: fixed cost)
+        with conn.cursor() as cur:
+            current = dict(current, analysis=analysis.view(cur, current['station']))
+    return {'stations': out, 'station': current, 'cores': machines, 'commands': commands}
 
 
 def _fill_durations(cur, station, state):
@@ -287,7 +498,7 @@ def _fill_durations(cur, station, state):
              if isinstance(i, dict) and i.get('duration') is None and isinstance(i.get('key'), str)]
     if not items:
         return
-    cur.execute('SELECT key, duration_s FROM library WHERE station = %s AND key = ANY(%s) AND duration_s IS NOT NULL',
+    cur.execute('SELECT key, duration_s FROM library_figures WHERE station = %s AND key = ANY(%s) AND duration_s IS NOT NULL',
                 (station, list({i['key'] for i in items})))
     known = {k: d for k, d in cur.fetchall()}
     for i in items:
@@ -295,8 +506,8 @@ def _fill_durations(cur, station, state):
 
 
 def _library_item(cur, station, key):
-    cur.execute("""SELECT key, kind, artist, title, file FROM library
-                   WHERE station = %s AND key = %s AND present AND NOT unsupported""", (station, key))
+    cur.execute(f"""SELECT key, kind, artist, title, file FROM library
+                    WHERE station = %s AND key = %s AND present AND {media.supported()}""", (station, key))
     return cur.fetchone()
 
 
@@ -309,6 +520,8 @@ def add_command(conn, station, cmd, args, user):
     clean = {}
     with conn.cursor() as cur:
         key = text(args.get('key'), 1000)
+        if cmd in ('bumper_now', 'ad_now'):
+            breaks.refuse_one_player(cur, station, label)
         if needs_key or (cmd in ('bumper_now', 'ad_now') and key):
             item = _library_item(cur, station, key or '')
             if not item:
@@ -319,6 +532,8 @@ def add_command(conn, station, cmd, args, user):
                 raise BadRequest('Ad break now needs an ad')
             if cmd == 'queue_add' and item['kind'] != 'music':
                 raise BadRequest('only music can be queued; use Play now for imaging and ads')
+            if item['kind'] != 'music':
+                breaks.refuse_one_player(cur, station, label)
             clean['key'] = item['key']
             label += ': ' + (' - '.join(x for x in (item['artist'], item['title']) if x) or item['file'])
         if cmd == 'queue_add':
@@ -339,18 +554,20 @@ def add_command(conn, station, cmd, args, user):
                     raise BadRequest('to must be a queue position')
             if key:
                 clean['key'] = key
-        _lock_station(cur, station)
+        db.lock_station(cur, station)
         cur.execute("""INSERT INTO commands (station, cmd, args, label, requested_by, requested_by_id)
                        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
                     (station, cmd, json.dumps(clean), label, user.get('username'), user.get('user_id')))
         cid = cur.fetchone()['id']
+        ads.stale(cur, station)
     conn.commit()
     return cid, (20, f'COMMAND station={station} id={cid} {label} by={user.get("username")}')
 
 
 def set_trim(conn, station, key, lead, trail, user):
-    """The operator's quiet start / end for a file (seconds; None = use what the Core measures).
-    The caller queues a rescan so the Core picks it up. Returns a log line."""
+    """The operator's quiet start / end for a file (seconds; None = use what the Core measures), for every
+    station that has the file. Returns (log line, the stations to rescan: this one and every other that has
+    the file, so each Core picks it up)."""
     vals = []
     for name, v in (('quiet start', lead), ('quiet end', trail)):
         n = None if v is None else number(v)
@@ -358,30 +575,52 @@ def set_trim(conn, station, key, lead, trail, user):
             raise BadRequest(f'{name} must be 0–600 seconds, or empty to use the measured one')
         vals.append(None if n is None else round(n, 2))
     with conn.cursor() as cur:
-        cur.execute("""UPDATE library SET lead_set_s = %s, trail_set_s = %s
-                       WHERE station = %s AND key = %s AND present""", (*vals, station, key or ''))
-        if not cur.rowcount:
+        db.lock_station(cur, station)
+        cur.execute(f"""UPDATE media_files SET lead_set_s = %(lead)s, trail_set_s = %(trail)s
+                        WHERE {media.file_of(present=True)} RETURNING id""",
+                    dict(lead=vals[0], trail=vals[1], station=station, key=key or ''))
+        ids = [r[0] for r in cur.fetchall()]
+        if not ids:
             raise BadRequest('that file is not in the library')
+        stations = media.stations_of(cur, station, ids)
     conn.commit()
     show = lambda v: 'measured' if v is None else f'{v}s'
-    return 20, f'TRIM station={station} key="{key}" start={show(vals[0])} end={show(vals[1])} by={user.get("username")}'
+    return (20, f'TRIM station={station} key="{key}" start={show(vals[0])} end={show(vals[1])} by={user.get("username")}'), stations
 
 
 def forget_measured(conn, station, key, kind, user):
-    """Forget the measured quiet start / end and level of one file (key) or every file of a kind; they
-    are measured again on the next play. Operator figures stay. Returns (files, log line)."""
+    """Forget the measured quiet start / end and level of one file (key) or of every file of a kind the
+    station has, for every station that has them; they are measured again on the next play, and fingerprinted
+    again (a file replaced by another of the same length is then told apart). Operator figures stay. Returns
+    (files, log line, the stations to rescan: this one and every other that has one of the files forgotten)."""
     if not key and kind not in KINDS:
         raise BadRequest('give a file (key) or a kind')
     with conn.cursor() as cur:
-        cur.execute("""UPDATE library SET lead_in_s = NULL, trail_s = NULL, analyzed_at = NULL, analyze_failed_at = NULL,
+        db.lock_station(cur, station)
+        cur.execute("""UPDATE media_files SET lead_in_s = NULL, trail_s = NULL, analyzed_at = NULL, analyze_failed_at = NULL,
                               level_db = NULL, level_s = NULL, peak_dbfs = NULL
-                       WHERE station = %s AND (lead_in_s IS NOT NULL OR trail_s IS NOT NULL OR analyzed_at IS NOT NULL
-                                               OR level_db IS NOT NULL OR peak_dbfs IS NOT NULL)
-                         AND """ + ('key = %s' if key else 'kind = %s'), (station, key or kind))
-        n = cur.rowcount
+                       WHERE (lead_in_s IS NOT NULL OR trail_s IS NOT NULL OR analyzed_at IS NOT NULL
+                              OR level_db IS NOT NULL OR peak_dbfs IS NOT NULL)
+                         AND """ + (media.file_of() if key else
+                                    'id IN (SELECT file_id FROM library WHERE station = %(station)s AND present AND kind = %(kind)s)')
+                    + ' RETURNING id', dict(station=station, key=key, kind=kind))
+        ids = [r[0] for r in cur.fetchall()]
+        stations = media.stations_of(cur, station, ids)
+        if ids:
+            analysis.stale(cur)                  # files not analyzed any more: owed again on every Core
+            # and fingerprinted again (a replacement of the same length is another file: it parts from these figures)
+            cur.execute("""UPDATE library SET fingerprint = NULL, fingerprint_size = NULL, fingerprint_at = NULL,
+                                  fingerprint_error = NULL WHERE file_id = ANY(%s) AND fingerprint IS NOT NULL""", (ids,))
+            fingerprints.stale(cur)
     conn.commit()
-    return n, (20, f'FORGET station={station} {"key=" + repr(key) if key else "kind=" + kind} files={n} '
-                   f'by={user.get("username")}')
+    return len(ids), (20, f'FORGET station={station} {"key=" + repr(key) if key else "kind=" + kind} files={len(ids)} '
+                          f'by={user.get("username")}'), stations
+
+
+def rescan(conn, stations, user):
+    """Queue a rescan on each station, so its Core takes the files' figures from its library upload reply.
+    Returns the log lines."""
+    return [add_command(conn, s, 'rescan', {}, user)[1] for s in stations]
 
 
 _SORTS = {
@@ -410,12 +649,12 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
     sql = """SELECT l.key, l.kind, l.directory, l.file, l.artist, l.title, l.duration_s, l.unsupported, l.ident,
                     l.lead_in_s, l.trail_s, l.lead_set_s, l.trail_set_s, l.analyzed_at, l.analyze_failed_at, l.analyze_error,
                     l.level_db, l.level_s, l.peak_dbfs,
-                    COALESCE({owed}, FALSE) AS analyze_queued,
+                    COALESCE(%s AND {owed}, FALSE) AS analyze_queued,
                     GREATEST(0, l.duration_s - COALESCE(l.lead_set_s, l.lead_in_s, 0)
                                              - COALESCE(l.trail_set_s, l.trail_s, 0)) AS audible_s,
                     COALESCE(p.plays, 0) AS plays, p.last_played, COALESCE(p.plays_hour, 0) AS plays_hour,
                     COALESCE(p.plays_today, 0) AS plays_today, COALESCE(r.mode, 'mix') AS mode, r.per_hour
-             FROM library l
+             FROM library_figures l
              LEFT JOIN LATERAL (SELECT count(*) AS plays, MAX(started_at) AS last_played,
                                        count(*) FILTER (WHERE started_at >= date_trunc('hour', NOW())) AS plays_hour,
                                        count(*) FILTER (WHERE started_at >= date_trunc('day', NOW())) AS plays_today
@@ -423,9 +662,10 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
                                 WHERE pl.station = l.station AND pl.file = l.file
                                   AND COALESCE(pl.directory, '') = l.directory) p ON TRUE
              LEFT JOIN ad_rules r ON r.station = l.station AND r.key = l.key
-             LEFT JOIN stations s ON s.station = l.station
-             WHERE l.station = %s AND l.present""".replace('{owed}', analysis.owed_sql('l', 's.analyze_from', 's.analyze_run_at'))
-    args = [station]
+             WHERE l.station = %s AND l.present""".replace('{owed}', analysis.owed_sql('l'))
+    with conn.cursor() as cur:
+        can, since, run_at = analysis.run_of(cur, station)
+    args = [can, since, since, run_at, station]
     if kind in KINDS:
         sql += ' AND l.kind = %s'
         args.append(kind)
@@ -458,32 +698,46 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
     return total, items, totals
 
 
-def _setting_rows(spec, overrides, running):
-    return [{'name': n, 'label': lb, 'group': g, 'type': t, 'min': None if t == 'choice' else lo,
-             'max': hi, 'step': st, 'choices': list(lo) if t == 'choice' else None, 'default': d, 'help': h,
-             'override': overrides.get(n), 'running': running.get(n), 'server_only': n in core_settings.SERVER_ONLY}
+def _setting_rows(spec, overrides, running, extra=lambda n: {}):
+    return [dict({'name': n, 'label': lb, 'group': g, 'type': t, 'min': None if t == 'choice' else lo,
+                  'max': hi, 'step': st, 'choices': list(lo) if t == 'choice' else None, 'default': d, 'help': h,
+                  'override': overrides.get(n), 'running': running.get(n), 'server_only': n in core_settings.SERVER_ONLY},
+                 **extra(n))
             for n, lb, g, t, lo, hi, st, d, h in spec]
 
 
 def settings_view(conn, station):
+    """The Settings page. station None = All stations (no folders: those are per station); else that station's
+    view: per row its own value, the All-stations one, where the value in force comes from (station | all |
+    default) and what the Core runs (the server's own settings: what the server uses for it).
+    'override' = the value set in the scope shown."""
     with conn.cursor() as cur:
-        overrides = core_settings.load(cur)
-        running, rev_core = {}, None
+        every, own = core_settings.layers(cur, station)
+        r = None
         if station:
-            cur.execute('SELECT state, settings_rev FROM stations WHERE station = %s', (station,))
+            cur.execute('SELECT state, settings_rev, players FROM stations WHERE station = %s', (station,))
             r = cur.fetchone()
-            if r:
-                running = (_clean_state(r['state']) or {}).get('settings') or {}
-                rev_core = r['settings_rev']
-    rev = core_settings.rev(core_settings.for_core(overrides))
+    if not station:
+        spec = [x for x in core_settings.SPEC if x[0] not in core_settings.STATION_ONLY]
+        return {'scope': 'all', 'station': None, 'settings': _setting_rows(spec, every, {}, lambda n: {
+            'all': every.get(n), 'source': 'all' if n in every else 'default', 'station_only': False})}
+    players = r['players'] if r else 2          # one player: songs only, its break settings and folders left out
+    spec = [x for x in core_settings.SPEC if x[0] not in core_settings.ALL_ONLY      # the whole Core's: All stations
+            and not (players == 1 and x[0] in core_settings.BREAK_ONLY)]
+    values = {**every, **own}
+    running = ((_clean_state(r['state']) if r else None) or {}).get('settings') or {}
     for name in core_settings.SERVER_ONLY:          # the server's own: "running" is what it uses
-        running[name] = overrides.get(name, core_settings.BY_NAME[name][7])
-    return {'rev': rev, 'core_rev': rev_core, 'in_sync': rev_core == rev,
-            'settings': _setting_rows(core_settings.SPEC, overrides, running)}
+        running[name] = values.get(name, core_settings.DEFAULTS[name])
+    rev, rev_core = core_settings.rev(core_settings.for_core(values)), r and r['settings_rev']
+    return {'scope': 'station', 'station': station, 'players': players, 'rev': rev, 'core_rev': rev_core, 'in_sync': rev_core == rev,
+            'settings': _setting_rows(spec, own, running, lambda n: {
+                'all': every.get(n), 'own': own.get(n), 'station_only': n in core_settings.STATION_ONLY,
+                'source': 'station' if n in own else 'all' if n in every else 'default'})}
 
 
-def _save(conn, form, user, spec, prefix, what):
-    """form: {name: value, or None to go back to the default}.
+def _save(conn, form, user, spec, what, prefix=core_settings.PREFIX, station=None):
+    """form: {name: value, or None to go back to the layer below: the default, or for a station its
+    All-stations value (its folders: the default)}. station: into that station's own layer.
     Returns (changed names, log_line or None)."""
     if not isinstance(form, dict):
         raise BadRequest('expected an object of settings')
@@ -497,19 +751,34 @@ def _save(conn, form, user, spec, prefix, what):
         except ValueError as exc:
             raise BadRequest(str(exc))
     with conn.cursor() as cur:
-        before = core_settings.load(cur, prefix, by_name)
+        if prefix == core_settings.PREFIX:
+            db.lock_station(cur, station)        # All stations: every station's lock (their plans go stale)
+        before = core_settings.layer(cur, station) if station else core_settings.load(cur, prefix, by_name)
         changed = {k: v for k, v in changes.items() if before.get(k) != v}
-        core_settings.save(cur, changed, prefix)
+        core_settings.save(cur, changed, prefix, station)
+        if changed and prefix == core_settings.PREFIX:
+            ads.stale(cur, station)              # All stations: every station's plan
+        if set(changed) & core_settings.ALL_ONLY:
+            analysis.stale(cur)                  # analyze_at: every Core's list of files to analyze
     conn.commit()
+    below = lambda k: 'all-stations' if station and k not in core_settings.STATION_ONLY else 'default'
     line = None
     if changed:
         line = (20, f'{what} changed by={user.get("username")} ' +
-                ' '.join(f'{k}={"default" if v is None else v}' for k, v in sorted(changed.items())))
+                ' '.join(f'{k}={below(k) if v is None else v}' for k, v in sorted(changed.items())))
     return sorted(changed), line
 
 
-def save_settings(conn, form, user):
-    return _save(conn, form, user, core_settings.SPEC, core_settings.PREFIX, 'SETTINGS')
+def save_settings(conn, form, user, station=None):
+    """Into one layer: All stations (station None; never the folders) or that station's own values (never what
+    applies to a whole Core: ALL_ONLY)."""
+    if isinstance(form, dict):
+        only, why = (core_settings.ALL_ONLY, 'applies to every station of the Core: set it for All stations') if station else \
+            (core_settings.STATION_ONLY, 'is set per station: choose the station, not All stations')
+        label = next((x[1] for x in core_settings.SPEC if x[0] in form and x[0] in only), None)
+        if label:
+            raise BadRequest(f'{label} {why}')
+    return _save(conn, form, user, core_settings.SPEC, f'SETTINGS station={station or "all"}', station=station)
 
 
 # ── Server settings (syslog, clock) ──────────────────────────────────────────
@@ -548,7 +817,7 @@ def save_server_settings(conn, form, user):
     for m, what in SERVER_GROUPS:
         part = {k: v for k, v in form.items() if k in {x[0] for x in m.spec()}}
         if part:
-            c, line = _save(conn, part, user, m.spec(), m.PREFIX, what)
+            c, line = _save(conn, part, user, m.spec(), what, m.PREFIX)
             changed += c
             lines.append(line)
     apply_server_settings(conn)

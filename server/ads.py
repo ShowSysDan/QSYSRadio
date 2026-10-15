@@ -13,18 +13,25 @@ stopped, a long song) is skipped, not made up later in the hour.
 The server also names the next song (next_song): normally a random one of
 the least recently played, so every song gets airtime; near an ad slot the
 one whose length makes the song change fall just after the slot opens.
+
+The plan is cached per station (cached_plan): made again when the station's
+events come in, when anything it is made from changes (stale()), when it
+changes by the clock (a slot opens) or every 30 s; not on every sync of every
+station. A one-player station (breaks.one_player) has no breaks: its plan
+names only the next song.
 """
 import hashlib
 import json
 from datetime import timedelta
 
-from . import breaks, core_settings
+from . import breaks, core_settings, db, media
 from .db import text
 from .events import BadRequest
 
 MODES = ('mix', 'hourly', 'off')
 POOL = 40                  # at most this many least recently played songs to pick the next one from
 PER_HOUR_MAX = 30
+PLAN_MAX_AGE_S = 30        # a station's cached plan is made again at least this often
 
 
 WINDOW_MAX_MIN = 10
@@ -81,11 +88,11 @@ def schedule(cur, station):
     """This hour for the station's ads: ({key: row}, hour_start). Hourly rows
     also get slots (minutes past the hour; hourly ads are staggered evenly in
     key order so ads with the same count fall due one at a time) and states."""
-    cur.execute("""SELECT l.key, l.artist, l.title, l.file, COALESCE(r.mode, 'mix') AS mode, r.per_hour,
-                          COALESCE(p.plays, '{}') AS plays, h.hour_start,
+    cur.execute(f"""SELECT l.key, l.artist, l.title, l.file, COALESCE(r.mode, 'mix') AS mode, r.per_hour,
+                          COALESCE(p.plays, '{{}}') AS plays, h.hour_start,
                           EXTRACT(EPOCH FROM NOW() - h.hour_start) / 60 AS now_m
                    FROM (SELECT date_trunc('hour', NOW()) AS hour_start) h
-                   JOIN library l ON l.station = %s AND l.present AND l.kind = 'ad' AND NOT l.unsupported
+                   JOIN library l ON l.station = %s AND l.present AND l.kind = 'ad' AND {media.supported('l')}
                    LEFT JOIN ad_rules r ON r.station = l.station AND r.key = l.key
                    LEFT JOIN (SELECT COALESCE(directory, '') AS directory, file,
                                      array_agg(EXTRACT(EPOCH FROM started_at - date_trunc('hour', NOW())) / 60) AS plays
@@ -103,10 +110,6 @@ def schedule(cur, station):
     return {r['key']: r for r in rows}, rows[0]['hour_start']
 
 
-def _setting(cur, name):
-    return core_settings.load(cur).get(name, core_settings.BY_NAME[name][7])
-
-
 def next_song(cur, station, slot=None):
     """The song the Core should play after the one on air: (key, why) or (None, None).
 
@@ -122,20 +125,25 @@ def next_song(cur, station, slot=None):
                    FROM stations s
                    LEFT JOIN LATERAL (SELECT * FROM play_log WHERE station = s.station AND kind = 'music' AND ended_at IS NULL
                                       ORDER BY started_at DESC LIMIT 1) p ON TRUE
-                   LEFT JOIN library l ON l.station = p.station AND l.key = COALESCE(p.directory, '') || p.file
+                   LEFT JOIN library_figures l ON l.station = p.station AND l.key = COALESCE(p.directory, '') || p.file
                    WHERE s.station = %s""", (station,))
     on_air = cur.fetchone()
     state = (on_air and on_air['state']) or {}
     if not on_air or state.get('queue') or state.get('automation') is not True:
         return None, None
-    cur.execute("""SELECT key, duration_s, COALESCE(trail_set_s, trail_s) AS trail_s,
-                          COALESCE(lead_set_s, lead_in_s) AS lead_in_s, count(*) OVER () AS n FROM library
-                   WHERE station = %s AND present AND NOT unsupported AND kind = 'music' AND key IS DISTINCT FROM %s
-                     AND lower(COALESCE(artist, '')) NOT IN (
-                         SELECT lower(artist) FROM (SELECT artist FROM play_log WHERE station = %s AND kind = 'music'
-                                                    ORDER BY started_at DESC LIMIT %s) a WHERE artist IS NOT NULL)
-                   ORDER BY last_played NULLS FIRST, key LIMIT %s""",
-                (station, on_air['key'], station, int(_setting(cur, 'artist_separation')), POOL))
+    s = core_settings.effective(cur, station)
+    # the whole library is filtered and counted without touching media_files; only the pool gets its figures
+    cur.execute(f"""SELECT o.key, m.duration_s, COALESCE(m.trail_set_s, m.trail_s) AS trail_s,
+                           COALESCE(m.lead_set_s, m.lead_in_s) AS lead_in_s, o.n
+                    FROM (SELECT key, file_id, last_played, count(*) OVER () AS n FROM library
+                          WHERE station = %s AND present AND kind = 'music' AND key IS DISTINCT FROM %s AND {media.supported()}
+                            AND lower(COALESCE(artist, '')) NOT IN (
+                                SELECT lower(artist) FROM (SELECT artist FROM play_log WHERE station = %s AND kind = 'music'
+                                                           ORDER BY started_at DESC LIMIT %s) a WHERE artist IS NOT NULL)
+                          ORDER BY last_played NULLS FIRST, key LIMIT %s) o
+                    JOIN media_files m ON m.id = o.file_id
+                    ORDER BY o.last_played NULLS FIRST, o.key""",
+                (station, on_air['key'], station, int(s['artist_separation']), POOL))
     oldest = cur.fetchall()
     if not oldest:
         return None, None
@@ -147,10 +155,10 @@ def next_song(cur, station, slot=None):
     quarter, half = shuffled(0.25), shuffled(0.5)
     if not (slot and on_air['duration_s']):
         return quarter[0]['key'], 'rotation'
-    air = airtime({n: float(_setting(cur, n)) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})
+    air = airtime({n: float(s[n]) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})
     gap = (slot[0] - on_air['started_at']).total_seconds() - air(on_air)     # from the next song's start to the slot
     timed = lambda pool: [(r['key'], air(r)) for r in pool if r['duration_s']]
-    return choose(quarter[0]['key'], timed(quarter), timed(half), gap, float(_setting(cur, 'ad_fit_tolerance_s')), slot[1])
+    return choose(quarter[0]['key'], timed(quarter), timed(half), gap, float(s['ad_fit_tolerance_s']), slot[1])
 
 
 def airtime(settings):
@@ -196,15 +204,31 @@ def choose(rotation, quarter, half, gap, tolerance, window):
 
 
 def plan(cur, station):
-    """The Core's plan, and its rev: {'due': [ads owed, longest waiting first], 'mix': [ads],
-    'next': song to play next, 'next_why': 'rotation' | 'ad', 'ident': station ID owed,
-    'no_bumpers': True while bumpers are held}. Held ads: none owed or mixed in."""
+    """The Core's plan, its rev and until (when it changes by the clock alone: an ad or ID slot opens, a due
+    slot's window closes, a hold ends, the hour turns): {'due': [ads owed, longest waiting first], 'mix':
+    [ads], 'next': song to play next, 'next_why': 'rotation' | 'ad', 'ident': station ID owed, 'no_bumpers':
+    True while bumpers are held}. Held ads: none owed or mixed in. A one-player station's: only next / next_why."""
+    if breaks.one_player(cur, station):
+        cur.execute("SELECT date_trunc('hour', NOW()) + INTERVAL '1 hour'")
+        out, upcoming, changes = {}, [], [cur.fetchone()[0]]
+    else:
+        out, upcoming, changes = _breaks_plan(cur, station)
+    song, why = next_song(cur, station, min(upcoming) if upcoming else None)
+    if song:
+        out['next'], out['next_why'] = song, why
+    return out, hashlib.sha1(json.dumps(out).encode()).hexdigest()[:12], min(changes)
+
+
+def _breaks_plan(cur, station):
+    """plan()'s breaks: (out without the next song, the upcoming ad / ID slots [(datetime, window s)], the times
+    the plan changes by the clock)."""
     rows, hour_start = schedule(cur, station)
     rows = rows.values()
     hold = breaks.holds(cur, station)
     ids = breaks.idents(cur, station)
     out = {'due': [], 'mix': []}
     upcoming = []                      # (datetime a slot opens, its window s): the next song is timed for the first
+    changes = [hour_start + timedelta(minutes=60)] + [h['until'] for h in hold.values() if h['until']]
     if 'ads' not in hold:
         out['mix'] = [r['key'] for r in rows if r['mode'] == 'mix']
         due = sorted((r['slots'][r['states'].index('due')], r['key']) for r in rows if 'due' in r.get('states', ()))
@@ -212,16 +236,41 @@ def plan(cur, station):
         upcoming = [(hour_start + timedelta(minutes=m + hour), window_minutes(r['per_hour']) * 60)
                     for r in rows for m, st in zip(r.get('slots', ()), r.get('states', ()))
                     for hour in (0, 60) if (st == 'next' and not hour) or (hour and m == r['slots'][0])]
+        changes += [hour_start + timedelta(minutes=m + (window_minutes(r['per_hour']) if st == 'due' else 0))
+                    for r in rows for m, st in zip(r.get('slots', ()), r.get('states', ())) if st in ('next', 'due')]
     if ids['next_at']:
         upcoming.append((ids['next_at'], ids['window_s']))
+        changes.append(ids['next_at'])
     if ids['due']:
         out['ident'] = ids['due']
+        changes.append(ids['due_until'])
     if 'bumpers' in hold:
         out['no_bumpers'] = True
-    song, why = next_song(cur, station, min(upcoming) if upcoming else None)
-    if song:
-        out['next'], out['next_why'] = song, why
-    return out, hashlib.sha1(json.dumps(out).encode()).hexdigest()[:12]
+    return out, upcoming, changes
+
+
+def cached_plan(cur, station, fresh=False):
+    """plan() and its rev for the station's sync (inside its transaction, under its station lock), cached on
+    its stations row: made again only when fresh (its events were just accepted), stale (stale()),
+    PLAN_MAX_AGE_S old or at its until (a slot opening: the next song may be timed to land just after it)."""
+    if not fresh:
+        cur.execute(f"""SELECT plan, plan_rev FROM stations WHERE station = %s AND plan IS NOT NULL
+                        AND plan_at > NOW() - INTERVAL '{PLAN_MAX_AGE_S} seconds' AND plan_until > NOW()""", (station,))
+        row = cur.fetchone()
+        if row:
+            return row['plan'], row['plan_rev']
+    out, rev, until = plan(cur, station)
+    cur.execute('UPDATE stations SET plan = %s, plan_rev = %s, plan_at = NOW(), plan_until = %s WHERE station = %s',
+                (json.dumps(out), rev, until, station))
+    return out, rev
+
+
+def stale(cur, station=None):
+    """Something a plan is made from changed (ad rules, holds, IDs, settings, the library, a command): the
+    station's cached plan (station None: every station's) is made again on its next sync. Call it in the
+    transaction that makes the change, which took the station's lock first (db.lock_station)."""
+    cur.execute('UPDATE stations SET plan_at = NULL WHERE plan_at IS NOT NULL' + (' AND station = %s' if station else ''),
+                (station,) if station else None)
 
 
 def next_ad(cur, station):
@@ -254,6 +303,8 @@ def save_rule(conn, station, payload, user):
         if not isinstance(per_hour, int) or isinstance(per_hour, bool) or not 1 <= per_hour <= PER_HOUR_MAX:
             raise BadRequest(f'plays per hour must be a whole number from 1 to {PER_HOUR_MAX}')
     with conn.cursor() as cur:
+        db.lock_station(cur, station)
+        breaks.refuse_one_player(cur, station, 'Advertisement schedule')
         cur.execute("SELECT 1 FROM library WHERE station = %s AND key = %s AND kind = 'ad' AND present",
                     (station, key or ''))
         if not cur.fetchone():
@@ -263,6 +314,7 @@ def save_rule(conn, station, payload, user):
                        ON CONFLICT (station, key) DO UPDATE SET mode = EXCLUDED.mode, per_hour = EXCLUDED.per_hour,
                            updated_at = NOW(), updated_by = EXCLUDED.updated_by""",
                     (station, key, mode, per_hour, user.get('username')))
+        stale(cur, station)
     conn.commit()
     rule = f'{per_hour}/hour' if mode == 'hourly' else mode
     return 20, f'AD RULE station={station} key="{key}" {rule} by={user.get("username")}'

@@ -1,15 +1,20 @@
 """Station settings: defined, documented and validated here, edited on the web
 page, pushed to the Core on its next sync.
 
-Only overrides are stored (app_settings key 'core.<name>'); a setting with no
-override uses the fallback in radio.lua's SETTINGS table (the `default`
-column below must match it). The Core reports the values it is running,
-which the settings page shows next to each field.
+Three layers, the most specific wins: radio.lua's fallback (its SETTINGS
+table; the `default` column below must match it) <- All stations (app_settings
+key 'core.<name>') <- this station (station_settings). Each layer stores only
+what differs. The folders (STATION_ONLY) are never set for all stations; what
+applies to a whole Core (ALL_ONLY: file analysis) never per station. The
+Core reports the values it is running, which the settings page shows next to
+each field.
 """
 import hashlib
 import json
 import math
 import re
+
+RIGHT_AWAY = 'right away'      # analyze_at: each new file as soon as the Core's analysis player is free
 
 # name, label, group, type, min, max, step, radio.lua default, help
 # (types: int, float, dir, choice (min holds the choices); logs.spec() adds host and name)
@@ -79,11 +84,13 @@ SPEC = [
     ('fade_out_drop_db', 'Fade-out level', 'Silence detection', 'float', 6, 40, 1, 20,
      'The end counts as faded once it stays this far below the file\'s own peak for half a second (dB).'),
 
-    ('analyze_at', 'Analyze new files daily at', 'Silence detection', 'choice',
-     ('off',) + tuple(f'{h:02d}:00' for h in range(24)), None, None, '04:00',
-     'Each day at this time (server time) the Core measures the quiet start, end and average level of every file not analyzed yet, '
-     'on the deck that is off air (its RadioOut input muted), between songs. An analyzed quiet start and end are final: '
-     'plays no longer learn over them (the level keeps learning). The library pages can also start a run.'),
+    ('analyze_at', 'Analyze new files', 'Silence detection', 'choice',
+     (RIGHT_AWAY, 'off') + tuple(f'{h:02d}:00' for h in range(24)), None, None, RIGHT_AWAY,
+     'The Core\'s analysis player (CFG.ANALYZERS in radio.lua: an Audio Player of its own, routed to no output; nothing on air is '
+     'touched) measures the quiet start, end and average level of each file, at any hour. Right away: new files within minutes '
+     '(one that fails is tried again a day later). 00:00 to 23:00: each day at this time (server time), every file not analyzed yet. '
+     'Off: only when a library page starts it. An analyzed quiet start and end are final: plays no longer learn over them (the '
+     'level keeps learning). One setting for every station of the Core: set for All stations only.'),
 
     ('artist_separation', 'Artist separation', 'Rotation', 'int', 0, 20, 1, 2,
      'Avoid repeating an artist within the last N songs.'),
@@ -100,8 +107,13 @@ SPEC = [
      'If nothing is playing for this long, start something (seconds).'),
 ]
 BY_NAME = {s[0]: s for s in SPEC}
+DEFAULTS = {s[0]: s[7] for s in SPEC}
 REQUIRED = {'music_dir'}
 SERVER_ONLY = {'ad_fit_tolerance_s', 'ident_schedule', 'ident_window_min', 'analyze_at'}   # the server's own; not sent to the Core
+STATION_ONLY = {'music_dir', 'imaging_dir', 'ads_dir'}      # each station its own folders; never set for all stations
+ALL_ONLY = {'analyze_at'}       # the whole Core's (its analysis players serve every station on it): never set per station
+# what only breaks use: a one-player station (songs only) has none, and its Settings page leaves them out
+BREAK_ONLY = {s[0] for s in SPEC if s[2] == 'Bumpers & advertisements'} | {'imaging_dir', 'ads_dir', 'ad_fit_tolerance_s'}
 PREFIX = 'core.'
 
 
@@ -147,32 +159,71 @@ def coerce(name, raw, by_name=None):
     return f
 
 
-def load(cur, prefix=PREFIX, by_name=None):
-    """{name: value} overrides stored on the server."""
-    cur.execute('SELECT key, value FROM app_settings WHERE key LIKE %s', (prefix + '%',))
+def _decode(rows, by_name=None):
+    """{name: value} from (name, JSON text) pairs, known names only."""
     out = {}
-    for r in cur.fetchall():
-        name = r['key'][len(prefix):]
+    for name, raw in rows:
         if name in (by_name or BY_NAME):
             try:
-                out[name] = json.loads(r['value'])
+                out[name] = json.loads(raw)
             except ValueError:
                 pass
     return out
 
 
-def for_core(overrides):
-    return {k: v for k, v in overrides.items() if k not in SERVER_ONLY}
+def load(cur, prefix=PREFIX, by_name=None):
+    """{name: value} stored in app_settings under prefix (the server settings use their own)."""
+    cur.execute('SELECT key, value FROM app_settings WHERE key LIKE %s', (prefix + '%',))
+    return _decode(((r['key'][len(prefix):], r['value']) for r in cur.fetchall()), by_name)
 
 
-def rev(overrides):
-    return hashlib.sha1(json.dumps(overrides, sort_keys=True).encode()).hexdigest()[:12]
+def layers(cur, station=None):
+    """(All stations, the station's own) values, in one query; the folders only ever from the station's own, the
+    whole Core's settings (ALL_ONLY) only ever from All stations."""
+    cur.execute("""SELECT FALSE AS own, substr(key, %s) AS name, value FROM app_settings WHERE key LIKE %s
+                   UNION ALL SELECT TRUE, name, value FROM station_settings WHERE station = %s""",
+                (len(PREFIX) + 1, PREFIX + '%', station))
+    rows = cur.fetchall()
+    return (_decode((r['name'], r['value']) for r in rows if not r['own'] and r['name'] not in STATION_ONLY),
+            _decode((r['name'], r['value']) for r in rows if r['own'] and r['name'] not in ALL_ONLY))
 
 
-def save(cur, changes, prefix=PREFIX):
-    """changes: {name: value or None (= back to the default)}."""
+def layer(cur, station=None):
+    """One layer: All stations (station None) or that station's own values."""
+    return layers(cur, station)[1 if station else 0]
+
+
+def merged(cur, station):
+    """The station's values that differ from radio.lua's fallbacks: All stations, its own on top."""
+    every, own = layers(cur, station)
+    return {**every, **own}
+
+
+def effective(cur, station):
+    """Every station setting in force for this station (the server's reads: ads, IDs, forecast); station None:
+    the All-stations values (the whole Core's: analysis)."""
+    return {**DEFAULTS, **merged(cur, station)}
+
+
+def for_core(values):
+    return {k: v for k, v in values.items() if k not in SERVER_ONLY}
+
+
+def rev(values):
+    return hashlib.sha1(json.dumps(values, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def save(cur, changes, prefix=PREFIX, station=None):
+    """changes: {name: value or None (= delete: back to the layer below)} into one layer: app_settings
+    under prefix (station settings: All stations) or, with station, that station's own."""
     for name, value in changes.items():
-        if value is None:
+        if station is not None and value is None:
+            cur.execute('DELETE FROM station_settings WHERE station = %s AND name = %s', (station, name))
+        elif station is not None:
+            cur.execute("""INSERT INTO station_settings (station, name, value, updated_at) VALUES (%s, %s, %s, NOW())
+                           ON CONFLICT (station, name) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+                        (station, name, json.dumps(value)))
+        elif value is None:
             cur.execute('DELETE FROM app_settings WHERE key = %s', (prefix + name,))
         else:
             cur.execute("""INSERT INTO app_settings (key, value, updated_at) VALUES (%s, %s, NOW())

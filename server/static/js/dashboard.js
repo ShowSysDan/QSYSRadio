@@ -11,13 +11,7 @@
 
   const core = R.core, age = R.age, playing = R.playing, liveDeck = R.liveDeck;
 
-  // deck meter scale: dB on the player meter -> percent of the height, widest around 0 dB (radio.css colours match it)
-  const STEPS = [[-60, 0], [-40, 12], [-20, 35], [-10, 52], [0, 70], [10, 86], [20, 100]];
-  const meterPct = (v) => {
-    v = Math.max(-60, Math.min(20, num(v) == null ? -120 : v));
-    const i = Math.max(1, STEPS.findIndex(([db]) => v <= db)), [a, pa] = STEPS[i - 1], [b, pb] = STEPS[i];
-    return pa + (v - a) / (b - a) * (pb - pa);
-  };
+  const meterPct = R.meterPct;   // deck meter scale (common.js)
   const pct = (v) => v.toFixed(1) + '%';
   const SCALE = [10, 0, -10, -20, -40];
 
@@ -30,12 +24,6 @@
     '"><em class="g"></em><span>GAIN</span>' + (num(trim) ? '<span class="trim">(' + R.db(trim) + ')</span>' : '') + '</div></div>';
 
   function deckHtml(id, d) {
-    if (d && d.analyzing && d.file) {          // measuring a file, muted at the mixer
-      return '<div class="dk analyzing">' + meterHtml(id) + '<div class="dk-main"><div class="dk-head"><span class="dk-id">DECK ' + esc(id) + '</span>' +
-        '<span class="dk-state">analyzing · off air</span></div>' +
-        '<div class="dk-idle" title="Measuring its quiet start, end and average level; this deck is muted at the mixer and is taken back the moment the station needs it">' +
-        esc(R.whoLine(d)) + '</div></div></div>';
-    }
     if (!d || !d.file || !(playing(d) || d.state === 'loading')) {
       return '<div class="dk">' + meterHtml(id) + '<div class="dk-main"><div class="dk-head"><span class="dk-id">DECK ' + esc(id) + '</span>' +
         '<span class="dk-state">idle</span></div><div class="dk-idle">NO SIGNAL</div></div></div>';
@@ -56,48 +44,22 @@
   }
 
   // the decks' gain and meters from the Core's last sync; hidden while it is offline. The Core reports once a
-  // second (rms now, the loudest peak since its last report): animateMeters glides between reports
+  // second (rms now, the loudest peak since its last report): R.meter glides between reports
   const put = (el, prop, v) => { if (el[prop] !== v) el[prop] = v; };
-  const FLOOR = -60, meters = {};    // deck id -> { bar, pk, rms, peak (reported), base, vel, pkv, pkAt (shown), ph }
-  const clampDb = (v) => Math.max(FLOOR, Math.min(20, num(v) == null ? FLOOR : v));
   function renderMeters() {
     const st = core(), all = st && last.station.meters, target = num(st && st.settings && st.settings.level_target_db);
     document.querySelectorAll('.dk-lvl[data-m]').forEach((el) => {
       const id = el.dataset.m, m = all && all[id];
       put(el, 'hidden', !m);
-      if (!m) { delete meters[id]; return; }
       const mtr = el.querySelector('.mtr');
-      const a = meters[id] = meters[id] || { base: FLOOR, vel: 0, pkv: FLOOR, pkAt: 0, ph: [0, 1, 2].map(() => Math.random() * 6.3) };
-      Object.assign(a, { bar: mtr.querySelector('i'), pk: mtr.querySelector('b'), rms: clampDb(m.rms), peak: clampDb(m.peak) });
+      R.meter('deck:' + id, mtr.querySelector('i'), mtr.querySelector('b'), m);
+      if (!m) return;
       put(mtr.querySelector('s').style, 'bottom', pct(meterPct(target == null ? 0 : target)));
       put(mtr, 'title', 'Player meter after the deck\'s gain: bar = rms, line = peak (' + R.db(m.peak, -120) + ' dB), mark = the Average level. ' +
         'Reported once a second; the bar is smoothed in between.');
       put(el.querySelector('.r'), 'textContent', R.db(m.rms, -120));
       put(el.querySelector('.g'), 'textContent', R.db(m.gain, -100));
     });
-  }
-
-  // ~30 frames a second: the bar follows the reported rms like a damped spring (no corners; quicker up than down)
-  // and sways gently around it while there is sound (wider for music with more dynamics: peak well over rms);
-  // the peak line holds 1 s, then falls
-  let frameAt = 0;
-  function animateMeters(t) {
-    requestAnimationFrame(animateMeters);
-    const dt = Math.min(0.1, (t - frameAt) / 1000), s = t / 1000;
-    if (dt < 0.03) return;
-    frameAt = t;
-    for (const id in meters) {
-      const a = meters[id];
-      const w = a.rms > a.base ? 4.5 : 3.2;
-      a.vel += (w * w * (a.rms - a.base) - 2 * w * a.vel) * dt;
-      a.base += a.vel * dt;
-      const sound = Math.min(1, Math.max(0, (a.base - FLOOR - 5) / 10));
-      const swing = sound * Math.min(2.5, Math.max(1, (a.peak - a.rms) / 5));
-      const v = a.base + swing * (0.55 * Math.sin(1.3 * s + a.ph[0]) + 0.3 * Math.sin(3.1 * s + a.ph[1]) + 0.15 * Math.sin(6.3 * s + a.ph[2]));
-      if (a.peak >= a.pkv) { a.pkv = a.peak; a.pkAt = s; } else if (s - a.pkAt > 1) a.pkv = Math.max(a.peak, a.pkv - 10 * dt);
-      put(a.bar.style, 'height', pct(100 - meterPct(v)));
-      put(a.pk.style, 'bottom', pct(meterPct(Math.max(a.pkv, v))));
-    }
   }
 
   // clocks between polls: extrapolate from the Core's last report
@@ -122,7 +84,7 @@
   function renderDecks() {
     const st = core();
     if (st) {
-      R.setHTML($('decks'), deckHtml('A', st.decks.A) + deckHtml('B', st.decks.B));
+      R.setHTML($('decks'), deckHtml('A', st.decks.A) + (R.onePlayer() ? '' : deckHtml('B', st.decks.B)));
       $('decks-note').textContent = '';
       return;
     }
@@ -130,7 +92,8 @@
     const on = (last && last.on_air) || [];
     $('decks-note').textContent = on.length ? 'Core offline: from the play log' : '';
     R.setHTML($('decks'), on.length ? on.slice(0, 2).map((p) => deckHtml(p.deck || '?', { file: p.file, dir: p.directory,
-      artist: p.artist, title: p.title, kind: p.kind, state: 'playing', live: true })).join('') : deckHtml('A', null) + deckHtml('B', null));
+      artist: p.artist, title: p.title, kind: p.kind, state: 'playing', live: true })).join('')
+      : deckHtml('A', null) + (R.onePlayer() ? '' : deckHtml('B', null)));
   }
 
   const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
@@ -222,7 +185,7 @@
       $('air-rem').textContent = '-:--';
       $('air-meter').style.width = '0';
       $('air-sub').textContent = !s ? 'No Core has connected yet' : (!s.online ? 'Core offline · last seen ' + R.ago(s.last_seen)
-        : (st && !st.automation ? 'Automation stopped' : 'Between tracks'));
+        : (st && st.fault ? 'Station fault (see above)' : st && !st.automation ? 'Automation stopped' : 'Between tracks'));
     }
     const n = nextItem(st), stopping = st && st.stop_after;
     R.marquee($('next-title'), stopping ? 'Nothing (stopping)' : (n ? R.who(n).title : '–'));
@@ -266,18 +229,19 @@
         $('ad-meter').style.width = ad.pct;
       }
       R.setHTML($('lib-big'), (num(lib.music) || 0) + ' <small>songs</small>');
-      $('lib-sub').textContent = plural(imaging, 'bumper') + ' · ' + plural(adCount, 'advertisement') + ' · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
+      $('lib-sub').textContent = (R.onePlayer() ? 'songs only (one player)' : plural(imaging, 'bumper') + ' · ' + plural(adCount, 'advertisement')) +
+        ' · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
       $('core-meter').style.width = '100%';
     } else {
       ['bump', 'ad', 'lib'].forEach((k) => { $(k + '-big').textContent = '–'; R.marquee($(k + '-sub'), ' '); });
       $('core-meter').style.width = '0';
     }
-    $('core-info').textContent = s ? '· ' + s.station + ' · radio.lua ' + (s.version || '?') + (s.online ? '' : ' · offline')
+    $('core-info').textContent = s ? '· ' + s.station + (s.core ? ' on ' + s.core : '') + ' · radio.lua ' + (s.version || '?') + (s.online ? '' : ' · offline')
       : '· no Core connected (set CFG.SERVER_URL in radio.lua)';
   }
 
   function renderTransport() {
-    const st = core(), op = R.canOperate, auto = !!(st && st.automation);
+    const st = core(), op = R.canOperate && !(st && st.fault), auto = !!(st && st.automation);   // faulted: the Core rebuilds it
     const b = (c) => document.querySelector('#transport [data-cmd="' + c + '"]');
     b('skip').disabled = !(op && auto && st.state === 'playing');
     const inBreak = st && (st.state === 'bumper' || st.state === 'ad');
@@ -323,10 +287,19 @@
       esc(R.timeOf(x.created_at)) + '</span></li>').join('') : '<li class="dim" style="grid-template-columns:1fr">No commands yet.</li>');
   }
 
+  // a station the Core could not build or keep running: its decks are stopped and the Core rebuilds it by itself
+  function renderFault() {
+    const st = core(), f = st && st.fault, el = $('fault-banner'), retry = num(st && st.retry_s);
+    el.hidden = !f;
+    R.setHTML(el, f ? '<b>Station fault</b><span>' + esc(last.station.station) + ': ' + esc(f) + '. Its decks are stopped; the Core ' +
+      'builds it again by itself (' + (retry != null ? 'next try in about ' + R.clock(Math.max(0, retry - age()))
+        : 'after 30 s, then less often, up to every 5 min') + '). The other stations on the Core play on.</span>' : '');
+  }
+
   function render(d) {
     if (!d) return;
     last = d;
-    renderKpis(); renderTransport(); renderDecks(); renderMeters(); renderNext(); renderActivity(); tick();
+    renderFault(); renderKpis(); renderTransport(); renderDecks(); renderMeters(); renderNext(); renderActivity(); tick();
     R.setHTML($('recent'), d.recent.map((p) => R.playRow(p, false)).join('') || '<tr><td colspan="6" class="empty-state">No plays logged yet.</td></tr>');
   }
 
@@ -352,6 +325,5 @@
   });
 
   setInterval(tick, 250);
-  requestAnimationFrame(animateMeters);
   R.status(1000, 12, render, 10);
 })();

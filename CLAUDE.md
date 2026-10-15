@@ -1,6 +1,8 @@
 # QSYSRadio: notes for Claude
 
-Two-deck radio automation: Lua on the Q-SYS Core (`qsys/`) does real time;
+Radio automation, two decks per station (or one: a background-music zone,
+songs only): ONE radio.lua on the Q-SYS Core
+(`qsys/`) runs every station in `CFG.STATIONS` and does real time;
 a Flask + PostgreSQL server (`server/`) does everything else (play log, web
 control panel, settings, library, sign-in, syslog). README.md has the design.
 
@@ -15,9 +17,18 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 - Tell the user what to redeploy: the Core (paste radio.lua), the server
   (`git pull && sudo systemctl restart qsysradio`), both, or neither.
 - No duplicated code: reuse the helpers (Lua: `push`, `shuffled`, `set`/`trigger`,
-  `readJson`/`writeJson`, `timer`, `post`, `emit`; Python: `db.text`,
-  `db.number`, `db.clean_json`, `db.like`, `db.iso`, `dbconn()`,
-  `write_logs`; JS: `Radio.api/post/command/setHTML/esc/num/status`).
+  `readJson`/`writeJson`, `timer`, `post`, `emit(st, kind, data)`, `guard`,
+  `Station:figures(key)`, `Station:track(key)` (its record of a file, listed or not),
+  `Station:keyOf(path)` (a media path's key in its library);
+  Python: `db.text`, `db.number`, `db.clean_json`, `db.like`, `db.iso`,
+  `db.lock_station`, `dbconn()`, `write_logs`, `core_settings.effective`, `media.file_of` /
+  `media.supported` (per-file figures live in `media_files`; read them
+  through the view `library_figures`), `ads.stale` (call it in the
+  transaction of any change a station's ads plan is made from, which took
+  `db.lock_station` first), `analysis.stale` (the same for a Core's list
+  of files to analyze), `fingerprints.stale` (and to fingerprint),
+  `media.fingerprinted` (which file a fingerprint is), `cores.seen`; JS:
+  `Radio.api/post/command/setHTML/esc/num/status/meter/pick`).
 
 ## radio.lua: keep it slim and light
 - Real time only. Anything that can live on the server does.
@@ -27,20 +38,43 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   drift. Internals (timer rates, timeouts, paths) are constants in `K` /
   `FILES`, not settings.
 - No header essays; one-line comments only where the line needs one.
-- Overhead budget: one 250 ms timer; the 50 ms `Fast` timer only while a deck
-  fades or loads (`Engine.wake()`); one HTTP request per second; control
-  objects cached in `Deck.new`; panel writes only on change; files written
-  only from `Chores` (every 30 s) or when settings change. Never add per-tick allocation, polling of the server,
-  or whole-file writes on every event.
+- Overhead budget, for every station together: one 250 ms timer (`Tick`
+  loops over the prebuilt `Radio.stations`, then `Analyzer:tick` over the
+  analysis players); the 50 ms `Fast` timer only while a deck fades or
+  loads (`Engine.wake()`, loops over `Radio.decks`: every station's decks
+  and the analysis players); the 0.5 s `Hashing` timer only while the server
+  lists files to fingerprint (one file per run, at most 192 KiB read, never
+  inside `Tick` / `Fast`);
+  one sync request per second for all stations (plus one library part at a
+  time after a scan); control objects cached in `Deck.new`; panel writes
+  only on change; files written only from `Chores` (every 30 s) or once per
+  sync reply that changed any station's settings. Never add per-tick
+  allocation (no closures, tables or string building in `Tick` / `Fast`),
+  polling of the server, or whole-file writes on every event.
+- Stations are objects (`Station.new(cfg)`): per-station state lives on the
+  station, never in a global. Each station's tick, deck handlers, commands
+  and reply part run under `guard` (pcall); a station failing 5 ticks in a
+  row or failing to build is faulted (decks stopped, `station_fault`,
+  rebuilt from its CFG entry after a back-off); the others never notice.
+- A station has one or two decks (`st.single`: one player, songs only, no
+  breaks). One code path with a one-deck case (`otherDeck` is the deck
+  itself, the next song loads once the fade-out ends); never a copy of the
+  transition logic, and loops over `st.decks`, never `decks[2]` blindly.
+- Every list has a cap (`K.outbox_max`, `events_max`, `history_max`,
+  `queue_max`, `analyze_max`, `fingerprint_max`); nothing may grow with uptime. The Core
+  reports `mem_kb` every sync; `scenario_multi.lua` checks memory is flat.
 - Use the documented Q-SYS APIs (HttpClient.Upload, Timer, Component, dir,
-  io on media/, rapidjson). Keep `Tick`, `Fast`, `Sync`, `Chores` timers
-  global (a local timer can be garbage-collected).
+  io on media/, rapidjson, Crypto). Keep `Tick`, `Fast`, `Sync`, `Chores`,
+  `Hashing` timers global (a local timer can be garbage-collected).
 - After any change run every MockCore scenario (`for s in
   qsys/test/scenario_*.lua; do python3 qsys/test/run_mock.py $s; done`); add a
   case to `scenario_regressions.lua` for every bug fixed.
-- The Core's only files are `settings.json` and `outbox.json` (both for when
-  the server is unreachable). Per-file data (learned figures, unsupported)
-  and command state live on the server; don't add Core files.
+- The Core's only files are `settings.json` (`{stations: {id: {rev,
+  settings}}}`) and `outbox.json` (every station's events), both for when
+  the server is unreachable (the outbox also while a station's part is
+  answered `{error}`). Per-file data (learned figures, unsupported,
+  fingerprints) and command state live on the server; don't add Core files
+  (fingerprinting only reads files).
 
 ## PostgreSQL: its own schema, PostgreSQL only
 - Every QSYSRadio table lives in `PG_APP_SCHEMA` (default `qsysradio`).
@@ -65,29 +99,92 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   (own throw-away schemas). PG 16 is installed in the cloud sandbox.
 
 ## Core <-> server protocol
-- `POST /api/v1/core/sync` (≈1/s, X-Radio-Token): events (station, boot,
-  seq unique; stored once, each in a savepoint), optional state, command ack,
-  `meters` (each deck's gain, peak, rms; kept on `stations` for the panel);
-  reply: commands with id > ack, settings when the rev differs, ack_reset.
-  One advisory lock per station serialises sync and `add_command`.
-- `POST /api/v1/core/library` after every scan (bulk `execute_values`);
-  reply: `learned` {key: {trail, lead, level, peak} | {unsupported}} for the Core.
+- `POST /api/v1/core/sync` (≈1/s, X-Radio-Token), ONE request for all the
+  Core's stations: `{version, boot, core, mem_kb, analyze_rev?, analyzers?,
+  fingerprint_rev?, stations: [{station, ack, settings_rev, ads_rev, meters,
+  state?, events?, dropped?}]}`; reply `{stations: {id: {commands, settings,
+  settings_rev, ads, ads_rev, ack_reset, accepted, duplicates, rejected} |
+  {error}}, analyze?, analyze_rev?, fingerprint?, fingerprint_rev?}`. Events (station, boot, seq unique; stored once, each in a
+  savepoint; at most `K.sync_batch` per request, shared round-robin);
+  optional state (with `fault` when faulted); command ack; `meters` (each
+  deck's gain, peak, rms; kept on `stations` for the panel). Server: one
+  pooled connection, each station's part its own transaction (its advisory
+  lock for its own work only, committed before the next, logs after each
+  commit); a failing part is rolled back alone and answered `{error}` (the
+  Core keeps that station's events); `DatabaseUnavailable` / connection
+  loss = 503 for all. The 1.x body (no `stations`) is still accepted and
+  answered as before (one version of overlap). `cores.seen` keeps each
+  Core's boot / memory (lowest sample per 10-minute window) and logs the
+  leak warning. One advisory lock per station (`db.lock_station`)
+  serialises the sync and EVERY web write to that station's rows (commands,
+  holds, IDs, ad rules, settings, analysis, figures): take it first, before
+  touching any row (All stations: every station's, in name order; a Core's
+  analysis run: every station of that Core, in name order, then its `cores`
+  row). Lua sends `{}` for an empty table: accept `{}` where a list is expected.
+- `POST /api/v1/core/library` after every scan, in parts of at most
+  `K.library_chunk` (1000) items: `{station, boot, scan, part, parts,
+  music_dir, imaging_dir, ads_dir, items}`, one upload in flight per Core.
+  Each part is upserted (bulk `execute_values`) and marked with the scan id
+  (`library.scan`, `stations.scan` / `scan_parts`); only the last part with
+  every part in marks the rest gone (an upload never shrinks the library);
+  a missing part = 409 and the Core sends the whole scan again. Reply:
+  `{ok, scan, part, parts}`, the last `{ok, items, learned}`, `learned`
+  {key: {trail, lead, level, peak} | {unsupported}} for the Core. A 1.x
+  upload (no scan) is one complete scan.
 - Level matching: `*_end` and `analysis` events carry `level` / `level_s` (rms
   average at unity, seconds heard) and `peak`; the server keeps their
   seconds-weighted energy average (`events.LEVEL_SET`) and the highest peak.
   The Core plays each item at its kind's gain + `levelTrim`; fades start from
   the deck's current gain, never from 0 dB.
-- File analysis (`analysis.py`): the server sends `analyze` [keys] when `analyze_rev` differs
-  (only to a Core that sends `analyze_rev`, i.e. has the RadioOut mixer); the Core measures
-  them on the off-air deck (its mixer input muted; every on-air `Deck:play` unmutes) and
-  reports `analysis` events. Analyzed figures are final (plays don't learn over them); a failure is
-  retried by the next run, never the same one; one file (`analyze_wanted`) goes without a run.
+- File analysis (`analysis.py`) is per Core, on its own analysis players (`CFG.ANALYZERS`: an
+  Audio Player + a peak/rms meter channel, routed to no output; `Analyzer` in radio.lua, its decks
+  are `Deck` objects of no station). On-air decks never analyze (no mixer, no take-over). The body
+  carries top-level `analyze_rev` (only with an analysis player) and `analyzers` [{name, state,
+  station?, key?}] (when changed or every 10 s; kept on `cores.analyzers`); the reply carries
+  top-level `analyze` [{station, key}] (at most 20, in the order to measure) and `analyze_rev` when
+  the rev differs. The list is cached on the `cores` row (`owed`, made again on a result, on
+  `analysis.stale()`, or after 60 s), built after the stations' parts in its own transaction.
+  Results are `analysis` events in the named station's part. The job (`cores.analyze_from`,
+  `analyze_run_at`, `analyze_auto_at`) and the setting `analyze_at` ('right away' (default; a
+  failure retried after 24 h) / 'HH:00' / 'off') are the Core's: All stations only. Analyzed
+  figures are final (plays don't learn over them); a failure is retried by the next run, never
+  the same one; one file (`analyze_wanted`) goes without a run. A pre-2.1 Core (per-station
+  `analyze_rev`) gets `analyze: []` once, then nothing; a 1.x station's run stays on its
+  `stations.analyze_*` columns until its first 2.x sync (`analysis.adopt`). A Core without an
+  analysis player owes nothing (`analysis.run_of` gives `can` False).
+- File fingerprints (`fingerprints.py`, `media.fingerprinted`; radio.lua `Fingerprint`): sha1 (lowercase
+  hex) of the size as decimal text, a newline, the first, middle (from size // 2 - 32 KiB) and last
+  64 KiB (the whole file when no longer than 192 KiB), made with `Crypto.Digest("sha1", …)` (raw or hex)
+  over `io.open(path, "rb")` + seek. Once per size: Forget measured clears it (fingerprinted again).
+  Checked at boot (the digest of "abc", a test read of a listed file; no file yet: again from
+  `Chores`); off = logged once, no top-level `fingerprint_rev` sent, identity stays name + size. The
+  reply carries top-level `fingerprint` [{station, key}] (at most 20) and `fingerprint_rev` when the
+  rev differs (cached on `cores.fp_owed` / `fp_rev` / `fp_at` like the analysis list; made again on
+  a result, `fingerprints.stale()` (library upload) or after 60 s; owed: present, known size, no
+  fingerprint at that size, not failed since the last scan / 24 h, station not faulted; index
+  `library_fingerprint_owed`). Results are `fingerprint` events {dir, file, size, fp} | {dir, file,
+  error} of the listed station and every other station on the Core listing the same media path (one
+  read); a listed file of a station that is not built is reported (`station not built`), never passed
+  silently (the list would stall). On the server
+  (`media.fingerprinted`, in the event's savepoint): recorded on the library row (`fingerprint`,
+  `fingerprint_size`, `fingerprint_at`, `fingerprint_error`); another `media_files` row with that
+  fingerprint = the same file (the library row moves to it; the row left, when not fingerprinted,
+  merges in what the target lacks (levels via `events.LEVEL_SET`, then cleared on the row left: once)
+  and goes when unused); a row with another fingerprint = another file (a new row); else the row takes
+  it (a unique violation from another station's transaction: follow that row). `media_files`: one row
+  per fingerprint, one per (file, size) only while not fingerprinted; `media.link` puts a library row
+  fingerprinted at its size on its fingerprint's row. Lock order: the station's own library row,
+  then at most two `media_files` rows by primary key, locked in id order.
 - Ads: the server sends `ads` {due, mix, next, next_why, ident, no_bumpers} when `ads_rev` differs
-  (`ads.py`); the Core only plays the plan (without one, every ad is a mix-in).
+  (`ads.py`); the Core only plays the plan (without one, every ad is a mix-in). The plan
+  is cached per station (`ads.cached_plan`: made again when the station's events were
+  accepted, when stale (`ads.stale`), at its own `plan_until` or after 30 s).
   `next` is the song to play next, picked on the server (`next_song`: least
   recently played, or by length to land the break on an ad slot); the Core
   takes it after the operator queue, once, and uses its own shuffle only when
-  the server has named nothing.
+  the server has named nothing. A one-player station (`stations.players` = 1,
+  from its state) gets `next` only; its break commands, holds, ad rules and
+  IDs are refused (`breaks.one_player` / `refuse_one_player`).
 
 ## Web panel
 - Pages poll through `Radio.status()` (one loop per page, 8 s timeout);

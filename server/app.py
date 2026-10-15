@@ -71,6 +71,23 @@ def _bad_request(exc):
     return jsonify(ok=False, error=str(exc)), 400
 
 
+@app.errorhandler(control.ScanIncomplete)
+def _scan_incomplete(exc):
+    log.warning('LIBRARY %s', exc)
+    return jsonify(ok=False, error=str(exc)), 409
+
+
+@app.errorhandler(db.psycopg2.extensions.TransactionRollbackError)
+def _cancelled(exc):
+    """PostgreSQL cancelled this request's transaction (a deadlock): a file's figures are shared by every station
+    that has it, so a change to many files can meet another station's sync writing the same rows. Nothing was
+    changed (rolled back when the connection goes back to the pool)."""
+    log.warning('%s %s cancelled by the database, nothing changed (409): %s', request.method, request.path,
+                (str(exc).strip().splitlines() or [type(exc).__name__])[0])
+    return _error(409, 'Try again', 'Another station was saving the same files at that moment, so nothing was '
+                                    'changed. Try again.')
+
+
 @app.errorhandler(403)
 def _forbidden(_exc):
     return _error(403, 'Not allowed', g.get('deny_message') or 'Your account does not have permission for that.')
@@ -213,6 +230,12 @@ def library_kind(which):
     return render_template('library.html', page=kind, kind=kind, title=title)
 
 
+@app.get('/stations')
+@auth.login_required
+def stations_page():
+    return _page('stations.html', 'stations')
+
+
 @app.get('/log')
 @auth.login_required
 def log_page():
@@ -238,29 +261,36 @@ def health():
                    schema=db.schemas()[0], schema_version=schema_version, schema_expected=expected)
 
 
+def _note_version(station, version):
+    """Each station's radio.lua version, once per (station, version): a warning when it is not the server's."""
+    seen = (station, version)
+    if isinstance(version, str) and seen not in _versions_seen:
+        if len(_versions_seen) > 1000:
+            _versions_seen.clear()
+        _versions_seen.add(seen)
+        if version != VERSION:
+            log.warning('station=%s runs radio.lua %s, server is %s', station, version, VERSION)
+
+
 @app.post('/api/v1/core/sync')
 @core_endpoint
 def core_sync():
-    """The Core's once-a-second request: events in, commands and settings out."""
+    """The Core's once-a-second request for all its stations: events in, commands and settings out
+    (a 1.x Core's single-station body too)."""
     payload = _json_body()
-    reply, lines = control.core_sync(dbconn(), payload, datetime.now(timezone.utc))
-    write_logs(lines)
-    seen = (payload.get('station'), payload.get('version'))
-    if isinstance(seen[1], str) and seen not in _versions_seen:
-        if len(_versions_seen) > 100:
-            _versions_seen.clear()
-        _versions_seen.add(seen)
-        if seen[1] != VERSION:
-            log.warning('station=%s runs radio.lua %s, server is %s', seen[0], seen[1], VERSION)
+    reply = control.core_sync(dbconn(), payload, datetime.now(timezone.utc), write_logs)
+    for station in reply['stations'] if 'stations' in payload else [payload.get('station')]:
+        _note_version(station, payload.get('version'))
     return jsonify(reply)
 
 
 @app.post('/api/v1/core/library')
 @core_endpoint
 def core_library():
-    count, learned, line = control.core_library(dbconn(), _json_body())
+    """A station's file list after a scan, in parts (a 1.x Core: whole)."""
+    reply, line = control.core_library(dbconn(), _json_body())
     write_logs([line])
-    return jsonify(ok=True, items=count, learned=learned)
+    return jsonify(reply)
 
 
 # ── Web API (signed in) ──────────────────────────────────────────────────────
@@ -285,6 +315,16 @@ def get_now():
         if n:
             out['on_air'], out['recent'] = plays.recent(conn, station, n)
     return jsonify(out)
+
+
+@app.get('/api/v1/stations-overview')
+@auth.login_required
+def get_stations_overview():
+    """The Stations page's poll: every station at a glance in a fixed number of queries however many there
+    are, the header's station (?station=, else the most recent) among them, the Cores (memory warning,
+    radio.lua version against the server's) and the commands the page is waiting on (?cmds=1,2,3)."""
+    ids = [int(x) for x in (_arg('cmds') or '').split(',') if x.isascii() and x.isdecimal() and len(x) < 10]
+    return jsonify(ok=True, version=VERSION, clock=clock.status(), **control.overview(dbconn(), _arg('station'), ids))
 
 
 @app.post('/api/v1/control')
@@ -347,8 +387,8 @@ def post_trim():
     if not station:
         raise BadRequest('no station has connected yet')
     conn, user = dbconn(), auth.current_user()
-    line = control.set_trim(conn, station, body.get('key'), body.get('lead'), body.get('trail'), user)
-    write_logs([line, control.add_command(conn, station, 'rescan', {}, user)[1]])   # the Core picks it up
+    line, stations = control.set_trim(conn, station, body.get('key'), body.get('lead'), body.get('trail'), user)
+    write_logs([line] + control.rescan(conn, stations, user))     # every Core that has the file picks it up
     return jsonify(ok=True)
 
 
@@ -361,15 +401,16 @@ def post_forget():
     if not station:
         raise BadRequest('no station has connected yet')
     conn, user = dbconn(), auth.current_user()
-    n, line = control.forget_measured(conn, station, body.get('key'), body.get('kind'), user)
-    write_logs([line, control.add_command(conn, station, 'rescan', {}, user)[1]])
+    n, line, stations = control.forget_measured(conn, station, body.get('key'), body.get('kind'), user)
+    write_logs([line] + control.rescan(conn, stations, user))
     return jsonify(ok=True, files=n)
 
 
 @app.post('/api/v1/analyze')
 @auth.operator_required
 def post_analyze():
-    """{station, scope: new|all|stop} or {station, key}: start / stop analyzing files on the off-air deck."""
+    """{station, scope: new|all|stop}: start / stop a run on the station's Core (its analysis players); or {station,
+    key}: that file again."""
     body = _json_body()
     station = _station(body.get('station'))
     if not station:
@@ -393,15 +434,24 @@ def post_ad_rule():
 @app.get('/api/v1/settings')
 @auth.login_required
 def get_settings():
-    return jsonify(ok=True, **control.settings_view(dbconn(), _station()))
+    """?station=X (default the most recent) -> that station's view; ?scope=all (or no station yet) -> All stations."""
+    station = None if _arg('scope') == 'all' else _station()
+    return jsonify(ok=True, **control.settings_view(dbconn(), station))
 
 
 @app.post('/api/v1/settings')
 @auth.admin_required
 def post_settings():
-    changed, line = control.save_settings(dbconn(), _json_body().get('settings'), auth.current_user())
+    """{settings, scope: 'station' (with station; default the most recent) | 'all' (the default)}."""
+    body = _json_body()
+    station = None
+    if body.get('scope') == 'station':
+        station = _station(body.get('station'))
+        if not station:
+            raise BadRequest('no such station: choose one that has connected, or All stations')
+    changed, line = control.save_settings(dbconn(), body.get('settings'), auth.current_user(), station)
     write_logs([line])
-    return jsonify(ok=True, changed=changed)
+    return jsonify(ok=True, changed=changed, scope='station' if station else 'all', station=station)
 
 
 @app.get('/api/v1/server-settings')
