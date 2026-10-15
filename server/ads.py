@@ -18,7 +18,7 @@ import hashlib
 import json
 from datetime import timedelta
 
-from . import breaks, core_settings
+from . import breaks, core_settings, media
 from .db import text
 from .events import BadRequest
 
@@ -81,11 +81,11 @@ def schedule(cur, station):
     """This hour for the station's ads: ({key: row}, hour_start). Hourly rows
     also get slots (minutes past the hour; hourly ads are staggered evenly in
     key order so ads with the same count fall due one at a time) and states."""
-    cur.execute("""SELECT l.key, l.artist, l.title, l.file, COALESCE(r.mode, 'mix') AS mode, r.per_hour,
-                          COALESCE(p.plays, '{}') AS plays, h.hour_start,
+    cur.execute(f"""SELECT l.key, l.artist, l.title, l.file, COALESCE(r.mode, 'mix') AS mode, r.per_hour,
+                          COALESCE(p.plays, '{{}}') AS plays, h.hour_start,
                           EXTRACT(EPOCH FROM NOW() - h.hour_start) / 60 AS now_m
                    FROM (SELECT date_trunc('hour', NOW()) AS hour_start) h
-                   JOIN library l ON l.station = %s AND l.present AND l.kind = 'ad' AND NOT l.unsupported
+                   JOIN library l ON l.station = %s AND l.present AND l.kind = 'ad' AND {media.supported('l')}
                    LEFT JOIN ad_rules r ON r.station = l.station AND r.key = l.key
                    LEFT JOIN (SELECT COALESCE(directory, '') AS directory, file,
                                      array_agg(EXTRACT(EPOCH FROM started_at - date_trunc('hour', NOW())) / 60) AS plays
@@ -118,20 +118,24 @@ def next_song(cur, station, slot=None):
                    FROM stations s
                    LEFT JOIN LATERAL (SELECT * FROM play_log WHERE station = s.station AND kind = 'music' AND ended_at IS NULL
                                       ORDER BY started_at DESC LIMIT 1) p ON TRUE
-                   LEFT JOIN library l ON l.station = p.station AND l.key = COALESCE(p.directory, '') || p.file
+                   LEFT JOIN library_figures l ON l.station = p.station AND l.key = COALESCE(p.directory, '') || p.file
                    WHERE s.station = %s""", (station,))
     on_air = cur.fetchone()
     state = (on_air and on_air['state']) or {}
     if not on_air or state.get('queue') or state.get('automation') is not True:
         return None, None
     s = core_settings.effective(cur, station)
-    cur.execute("""SELECT key, duration_s, COALESCE(trail_set_s, trail_s) AS trail_s,
-                          COALESCE(lead_set_s, lead_in_s) AS lead_in_s, count(*) OVER () AS n FROM library
-                   WHERE station = %s AND present AND NOT unsupported AND kind = 'music' AND key IS DISTINCT FROM %s
-                     AND lower(COALESCE(artist, '')) NOT IN (
-                         SELECT lower(artist) FROM (SELECT artist FROM play_log WHERE station = %s AND kind = 'music'
-                                                    ORDER BY started_at DESC LIMIT %s) a WHERE artist IS NOT NULL)
-                   ORDER BY last_played NULLS FIRST, key LIMIT %s""",
+    # the whole library is filtered and counted without touching media_files; only the pool gets its figures
+    cur.execute(f"""SELECT o.key, m.duration_s, COALESCE(m.trail_set_s, m.trail_s) AS trail_s,
+                           COALESCE(m.lead_set_s, m.lead_in_s) AS lead_in_s, o.n
+                    FROM (SELECT key, file_id, last_played, count(*) OVER () AS n FROM library
+                          WHERE station = %s AND present AND kind = 'music' AND key IS DISTINCT FROM %s AND {media.supported()}
+                            AND lower(COALESCE(artist, '')) NOT IN (
+                                SELECT lower(artist) FROM (SELECT artist FROM play_log WHERE station = %s AND kind = 'music'
+                                                           ORDER BY started_at DESC LIMIT %s) a WHERE artist IS NOT NULL)
+                          ORDER BY last_played NULLS FIRST, key LIMIT %s) o
+                    JOIN media_files m ON m.id = o.file_id
+                    ORDER BY o.last_played NULLS FIRST, o.key""",
                 (station, on_air['key'], station, int(s['artist_separation']), POOL))
     oldest = cur.fetchall()
     if not oldest:

@@ -5,6 +5,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.6.0] - 2026-10-15
+
+### Changed
+- **A file's figures are shared by every station.** Length, quiet start and
+  end (measured or analyzed), the operator's quiet start / end, average
+  level with its seconds, peak, unsupported and the analysis state now
+  belong to the file, not to the station: one row per file name (no folder)
+  and size in bytes (new table `media_files`, migration 0015), used by every
+  station whose library holds that file, on any Core. A file moved to
+  another folder or station keeps its figures; an edited file (new size)
+  starts afresh, and now loses the operator's quiet start / end and the
+  measured quiet start / end and length too (1.5.0 kept those and reset only
+  the level, peak, unsupported and analysis state); a file whose size is
+  unknown is never shared (a size of 0 from the Core counts as unknown). A
+  station's Core gets the shared figures in its library upload reply, and
+  every play, analysis or unsupported report from any station adds to them.
+- **Trims and Forget measured apply on every station** that has the file:
+  the server queues a rescan on each of those stations, so every Core takes
+  the change at once; the Library page says so. A file analyzed on one
+  station counts as analyzed for all (a run on another station skips it);
+  the other stations' Cores take the analyzed figures at their next library
+  scan (boot, folder change, Rescan). The job itself stays per station. A
+  file's analysis result clears the Analyze request on every station that
+  asked for it.
+- **Per-sync cost.** The next-song pick leaves unsupported files out
+  without a lookup per song; the files owed analysis are read through new
+  indexes (a long run stops after the first 20, the end of a run reads only
+  the files not analyzed); a library upload marks only the files that left
+  the folder as gone. Measured on 14 stations × 3,000 files: the
+  once-a-second sync and a library upload cost what they did in 1.5.0; a
+  station's first upload of files other stations already have takes about
+  0.1 s longer (each new library row is checked against its file).
+
+Redeploy the server, **after a database backup** (README, Installation
+step 11: the `pg_dump` of the app schema): `git pull && sudo systemctl
+restart qsysradio` (runs migration 0015; reload open panel pages). The
+migration moves the per-file figures out of the `library` table into
+`media_files`, merged per file: the quiet start / end of the latest analysis
+(else of the station that saw the file most recently), the latest trims,
+the levels averaged by the seconds each heard, the highest peak, the latest
+analysis state (about 2 s for 14 stations × 3,000 files, during which the
+Core keeps playing). Nothing is measured again. 1.5.0 does not run on the new
+schema, so going back to 1.5.0 afterwards needs that backup (README, step
+13). The Core only changed its version number: paste radio.lua when
+convenient (until then the server logs a version mismatch).
+
 ## [1.5.0] - 2026-10-15
 
 ### Added

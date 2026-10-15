@@ -8,9 +8,7 @@ the Core's "everything after my last ack" request.
 import json
 from datetime import timedelta
 
-from psycopg2.extras import execute_values
-
-from . import ads, analysis, breaks, clock, core_settings, events, logs
+from . import ads, analysis, breaks, clock, core_settings, events, logs, media
 from .db import clean_json, iso, like, number, text
 from .events import BadRequest
 
@@ -160,7 +158,8 @@ def core_sync(conn, payload, now):
 
 def core_library(conn, payload):
     """The Core's file list after a scan. Returns (count, per-file figures the
-    Core uses: {key: {trail, lead, level, peak} | {unsupported}}, log_line)."""
+    Core uses: {key: {trail, lead, level, peak} | {unsupported}}, log_line).
+    The figures are the file's, shared by every station that has it (media.py)."""
     station = _station_name(payload)
     items = payload.get('items')
     if items == {}:                 # Lua encodes an empty table as {}
@@ -171,33 +170,15 @@ def core_library(conn, payload):
     for it in items[:100000]:
         if not isinstance(it, dict) or it.get('kind') not in KINDS or not text(it.get('key'), 1000):
             continue
-        size = it.get('size')
+        size = it.get('size')       # 0: the Core could not tell (unknown, so never shared)
         rows[text(it['key'], 1000)] = (
-            station, text(it['key'], 1000), it['kind'], text(it.get('dir'), 500) or '',
-            text(it.get('file'), 500) or text(it['key'], 500), text(it.get('artist'), 500), text(it.get('title'), 500),
-            size if isinstance(size, int) and not isinstance(size, bool) and 0 <= size < 2 ** 62 else None,
+            it['kind'], text(it.get('dir'), 500) or '', text(it.get('file'), 500) or text(it['key'], 500),
+            text(it.get('artist'), 500), text(it.get('title'), 500),
+            size if isinstance(size, int) and not isinstance(size, bool) and 0 < size < 2 ** 62 else None,
             number(it.get('duration')), number(it.get('lead_in')), number(it.get('trail')), number(it.get('peak')))
     with conn.cursor() as cur:
         _lock_station(cur, station)
-        cur.execute('UPDATE library SET present = FALSE WHERE station = %s AND present', (station,))
-        execute_values(cur, """INSERT INTO library (station, key, kind, directory, file, artist, title, size,
-                                   duration_s, lead_in_s, trail_s, peak_dbfs) VALUES %s
-                               ON CONFLICT (station, key) DO UPDATE SET kind = EXCLUDED.kind,
-                                   directory = EXCLUDED.directory, file = EXCLUDED.file,
-                                   artist = EXCLUDED.artist, title = EXCLUDED.title, size = EXCLUDED.size,
-                                   duration_s = COALESCE(EXCLUDED.duration_s, library.duration_s),
-                                   lead_in_s = COALESCE(EXCLUDED.lead_in_s, library.lead_in_s),
-                                   trail_s = COALESCE(EXCLUDED.trail_s, library.trail_s),
-                                   peak_dbfs = COALESCE(EXCLUDED.peak_dbfs, CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size
-                                                                                 THEN library.peak_dbfs END),
-                                   level_db = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size THEN library.level_db END,
-                                   level_s = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size THEN library.level_s END,
-                                   unsupported = library.unsupported AND library.size IS NOT DISTINCT FROM EXCLUDED.size,
-                                   analyzed_at = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size
-                                                      THEN library.analyzed_at END,
-                                   analyze_failed_at = CASE WHEN library.size IS NOT DISTINCT FROM EXCLUDED.size
-                                                            THEN library.analyze_failed_at END,
-                                   present = TRUE, last_seen = NOW()""", list(rows.values()), page_size=1000)
+        media.link(cur, station, rows)
         cur.execute("""INSERT INTO stations (station, library_at, music_dir, imaging_dir, ads_dir)
                        VALUES (%s, NOW(), %s, %s, %s)
                        ON CONFLICT (station) DO UPDATE SET library_at = NOW(), music_dir = EXCLUDED.music_dir,
@@ -210,7 +191,7 @@ def core_library(conn, payload):
         cur.execute("""SELECT key, unsupported, COALESCE(trail_set_s, trail_s) AS trail, COALESCE(lead_set_s, lead_in_s) AS lead,
                               trail_set_s IS NOT NULL OR lead_set_s IS NOT NULL AS fixed, analyzed_at IS NOT NULL AS analyzed,
                               level_db AS level, CASE WHEN level_db IS NOT NULL THEN peak_dbfs END AS peak
-                       FROM library
+                       FROM library_figures
                        WHERE station = %s AND present
                          AND (unsupported OR trail_s IS NOT NULL OR lead_in_s IS NOT NULL OR trail_set_s IS NOT NULL
                               OR lead_set_s IS NOT NULL OR level_db IS NOT NULL)""", (station,))
@@ -220,7 +201,7 @@ def core_library(conn, payload):
                         **{k: True for k in ('fixed', 'analyzed') if r[k]})
                    for r in cur.fetchall()}
     conn.commit()
-    counts = ' '.join(f'{k}={sum(1 for r in rows.values() if r[2] == k)}' for k in KINDS)
+    counts = ' '.join(f'{k}={sum(1 for r in rows.values() if r[0] == k)}' for k in KINDS)
     return len(rows), learned, (20, f'LIBRARY station={station} {counts}')
 
 
@@ -287,7 +268,7 @@ def _fill_durations(cur, station, state):
              if isinstance(i, dict) and i.get('duration') is None and isinstance(i.get('key'), str)]
     if not items:
         return
-    cur.execute('SELECT key, duration_s FROM library WHERE station = %s AND key = ANY(%s) AND duration_s IS NOT NULL',
+    cur.execute('SELECT key, duration_s FROM library_figures WHERE station = %s AND key = ANY(%s) AND duration_s IS NOT NULL',
                 (station, list({i['key'] for i in items})))
     known = {k: d for k, d in cur.fetchall()}
     for i in items:
@@ -295,8 +276,8 @@ def _fill_durations(cur, station, state):
 
 
 def _library_item(cur, station, key):
-    cur.execute("""SELECT key, kind, artist, title, file FROM library
-                   WHERE station = %s AND key = %s AND present AND NOT unsupported""", (station, key))
+    cur.execute(f"""SELECT key, kind, artist, title, file FROM library
+                    WHERE station = %s AND key = %s AND present AND {media.supported()}""", (station, key))
     return cur.fetchone()
 
 
@@ -349,8 +330,9 @@ def add_command(conn, station, cmd, args, user):
 
 
 def set_trim(conn, station, key, lead, trail, user):
-    """The operator's quiet start / end for a file (seconds; None = use what the Core measures).
-    The caller queues a rescan so the Core picks it up. Returns a log line."""
+    """The operator's quiet start / end for a file (seconds; None = use what the Core measures), for every
+    station that has the file. Returns (log line, the stations to rescan: this one and every other that has
+    the file, so each Core picks it up)."""
     vals = []
     for name, v in (('quiet start', lead), ('quiet end', trail)):
         n = None if v is None else number(v)
@@ -358,30 +340,44 @@ def set_trim(conn, station, key, lead, trail, user):
             raise BadRequest(f'{name} must be 0–600 seconds, or empty to use the measured one')
         vals.append(None if n is None else round(n, 2))
     with conn.cursor() as cur:
-        cur.execute("""UPDATE library SET lead_set_s = %s, trail_set_s = %s
-                       WHERE station = %s AND key = %s AND present""", (*vals, station, key or ''))
-        if not cur.rowcount:
+        cur.execute(f"""UPDATE media_files SET lead_set_s = %(lead)s, trail_set_s = %(trail)s
+                        WHERE {media.file_of(present=True)} RETURNING id""",
+                    dict(lead=vals[0], trail=vals[1], station=station, key=key or ''))
+        ids = [r[0] for r in cur.fetchall()]
+        if not ids:
             raise BadRequest('that file is not in the library')
+        stations = media.stations_of(cur, station, ids)
     conn.commit()
     show = lambda v: 'measured' if v is None else f'{v}s'
-    return 20, f'TRIM station={station} key="{key}" start={show(vals[0])} end={show(vals[1])} by={user.get("username")}'
+    return (20, f'TRIM station={station} key="{key}" start={show(vals[0])} end={show(vals[1])} by={user.get("username")}'), stations
 
 
 def forget_measured(conn, station, key, kind, user):
-    """Forget the measured quiet start / end and level of one file (key) or every file of a kind; they
-    are measured again on the next play. Operator figures stay. Returns (files, log line)."""
+    """Forget the measured quiet start / end and level of one file (key) or of every file of a kind the
+    station has, for every station that has them; they are measured again on the next play. Operator
+    figures stay. Returns (files, log line, the stations to rescan: this one and every other that has
+    one of the files forgotten)."""
     if not key and kind not in KINDS:
         raise BadRequest('give a file (key) or a kind')
     with conn.cursor() as cur:
-        cur.execute("""UPDATE library SET lead_in_s = NULL, trail_s = NULL, analyzed_at = NULL, analyze_failed_at = NULL,
+        cur.execute("""UPDATE media_files SET lead_in_s = NULL, trail_s = NULL, analyzed_at = NULL, analyze_failed_at = NULL,
                               level_db = NULL, level_s = NULL, peak_dbfs = NULL
-                       WHERE station = %s AND (lead_in_s IS NOT NULL OR trail_s IS NOT NULL OR analyzed_at IS NOT NULL
-                                               OR level_db IS NOT NULL OR peak_dbfs IS NOT NULL)
-                         AND """ + ('key = %s' if key else 'kind = %s'), (station, key or kind))
-        n = cur.rowcount
+                       WHERE (lead_in_s IS NOT NULL OR trail_s IS NOT NULL OR analyzed_at IS NOT NULL
+                              OR level_db IS NOT NULL OR peak_dbfs IS NOT NULL)
+                         AND """ + (media.file_of() if key else
+                                    'id IN (SELECT file_id FROM library WHERE station = %(station)s AND present AND kind = %(kind)s)')
+                    + ' RETURNING id', dict(station=station, key=key, kind=kind))
+        ids = [r[0] for r in cur.fetchall()]
+        stations = media.stations_of(cur, station, ids)
     conn.commit()
-    return n, (20, f'FORGET station={station} {"key=" + repr(key) if key else "kind=" + kind} files={n} '
-                   f'by={user.get("username")}')
+    return len(ids), (20, f'FORGET station={station} {"key=" + repr(key) if key else "kind=" + kind} files={len(ids)} '
+                          f'by={user.get("username")}'), stations
+
+
+def rescan(conn, stations, user):
+    """Queue a rescan on each station, so its Core takes the files' figures from its library upload reply.
+    Returns the log lines."""
+    return [add_command(conn, s, 'rescan', {}, user)[1] for s in stations]
 
 
 _SORTS = {
@@ -415,7 +411,7 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
                                              - COALESCE(l.trail_set_s, l.trail_s, 0)) AS audible_s,
                     COALESCE(p.plays, 0) AS plays, p.last_played, COALESCE(p.plays_hour, 0) AS plays_hour,
                     COALESCE(p.plays_today, 0) AS plays_today, COALESCE(r.mode, 'mix') AS mode, r.per_hour
-             FROM library l
+             FROM library_figures l
              LEFT JOIN LATERAL (SELECT count(*) AS plays, MAX(started_at) AS last_played,
                                        count(*) FILTER (WHERE started_at >= date_trunc('hour', NOW())) AS plays_hour,
                                        count(*) FILTER (WHERE started_at >= date_trunc('day', NOW())) AS plays_today

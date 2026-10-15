@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **1.5.0** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.6.0** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **1.5.0** — stable; standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **1.5.0** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **1.5.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings by station, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.6.0** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.6.0** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.6.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings by station, per-file figures shared by every station, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -81,6 +81,12 @@ station settings, the library, syslog.
   with each play; the server keeps them per file and gives the Core back what
   it needs (quiet start / end, average level and peak, unsupported files)
   after each library upload.
+- **A file's figures are the file's.** One set per file name (no folder) and
+  size, shared by every station that has the file, on any Core
+  (`media_files`): a file moved to another folder or zone keeps them, an
+  edited file (new size) starts afresh (trims too), a file of unknown size
+  is never shared. A trim, Forget measured or an analysis on one station
+  counts on all.
 - **Level matching.** Every item plays at the same average level: the Core
   turns each file up or down by its measured average, within limits (see
   [Level matching](#level-matching)). Fades start and end at that level.
@@ -159,15 +165,19 @@ the `CFG` block at the top: player / meter names, `SERVER_URL`,
 - **Level matching.** Each item plays at its kind's level plus the trim that
   brings its measured average to `level_target_db`
   ([Level matching](#level-matching)); every fade starts and ends there.
-- **Learning** (kept on the server, `library` table, every kind; see also
+- **Learning** (kept on the server per file, `media_files`, shared by every
+  station that has the file; every kind; see also
   [File analysis](#file-analysis), which replaces the quiet start / end per
   file): duration, lead-in, minimum trailing silence, highest peak and
   average level at unity; an operator's figures
-  (`lead_set_s`, `trail_set_s`) win over them. After each library upload the
-  server's figures replace the Core's (so edits and forgotten figures apply). Trailing silence counts
+  (`lead_set_s`, `trail_set_s`) win over them. A new size (an edited file)
+  starts afresh, the operator's figures too. After each library upload the
+  server's figures replace the Core's (so edits and forgotten figures apply);
+  a trim or Forget measured queues a rescan on every station that has the
+  file, so each Core takes it at once. Trailing silence counts
   only when it was heard before any fade began (a crossfade hides the rest
   of the file). A file the player cannot play
-  ("Unsupported…") is remembered there until its size changes; any other
+  ("Unsupported…") is remembered there, for every station, until its size changes; any other
   load failure only skips the file until the next scan.
 - **Files on the Core** (`media/_radio/`): `settings.json` (the server's
   settings, so a reboot during an outage plays the right folders) and
@@ -213,6 +223,7 @@ server/
   control.py          Core sync + library, commands, status, settings
   core_settings.py    every station setting: label, range, default, help; the layers
   events.py           Core events -> core_events + play_log
+  media.py            each file's figures, shared by every station (media_files, library_figures)
   plays.py            play log queries
   db.py               pooled PostgreSQL access + small helpers
   logs.py             journald + remote syslog (background thread)
@@ -302,7 +313,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `1.5.0`.
+Expect the version, e.g. `1.6.0`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -434,13 +445,13 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `migrate: schema "qsysradio" at version 0014 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 1.5.0 starting on port
+- In the journal: `migrate: schema "qsysradio" at version 0015 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 1.6.0 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":14,"schema_version":14,"version":"1.5.0"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":15,"schema_version":15,"version":"1.6.0"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -609,14 +620,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 1.5.0 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.6.0 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 1.5.0`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.6.0`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -647,7 +658,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (10 in 1.5.0).
+The last line prints the number of tables (11 in 1.6.0).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -657,7 +668,8 @@ The last line prints the number of tables (10 in 1.5.0).
 - The accounts (`shared`) are 321Theater's to back up.
 - `.env` holds the database password and the Core token. Keep the copy
   private.
-- What the script learns about each file is in the database (`library`).
+- What the script learns about each file is in the database (`media_files`,
+  one row per file shared by every station; `library` lists each station's files).
   The Core's `media/_radio/` only holds the last settings and, during an
   outage, undelivered events.
 
@@ -689,7 +701,7 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 1.4.1, server is 1.5.0`.
+  `station=Main runs radio.lua 1.5.0, server is 1.6.0`.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -715,7 +727,10 @@ code does not know (code rolled back?)…`, and health shows `"ok":false` with
 `schema_version` above `schema_expected`.
 
 If the old code does not work with the newer schema, restore the backup
-taken before the update. Stop the service first:
+taken before the update. 1.5.0 and older never run on the schema of 1.6.0 or
+later (migration 0015 moved each file's figures from `library` to
+`media_files`): going back to 1.5.0 or older always needs that backup. Stop
+the service first:
 
 ```
 sudo systemctl stop qsysradio
@@ -950,7 +965,9 @@ QSYSRADIO_ENV_FILE=/path/to/test.env venv/bin/python -m pytest tests/
 The suite uses its own throw-away schemas (`qsr_test`, `qsr_test_shared`) in
 the database the test .env points at (the PG user needs CREATE on it). It
 covers the Core API, commands, sign-in and permissions, settings, the play
-log, and failure handling. `requirements-dev.txt` also brings `lupa` for the
+log, per-file figures shared between stations (including two stations
+uploading at once), the data migrations (each in a scratch schema), and
+failure handling. `requirements-dev.txt` also brings `lupa` for the
 MockCore scenarios and `live_core.py`.
 
 ## Web control panel
@@ -993,8 +1010,13 @@ MockCore scenarios and `live_core.py`.
   see the measured quiet start and end and set your own (blank = measured;
   the Core never measures over a figure set here), go back to the measured
   ones, or forget them and the level (measured again on the next play). **Forget
-  measured** in the toolbar does that for the whole page. Changes reach the
-  Core with a rescan the server queues. Music: Play next, Queue, Play now. Imaging: Bumper now and the
+  measured** in the toolbar does that for the whole page. The figures are the
+  file's (its name and size), shared by every station that has the file: a
+  figure set here or Forget measured reaches each such station's Core at
+  once (the server queues a rescan on every one of them); an analysis
+  result (Analyze again) reaches the other stations' Cores at their next
+  scan (Rescan). A new size (an edited file) starts afresh, the figures set
+  here too. Music: Play next, Queue, Play now. Imaging: Bumper now and the
   **ID** toggle (marks a station ID). Advertisements: Play now, the schedule (Mix in /
   Per hour with the count / Off) with plays this hour and today, and a
   **This hour** line of every per-hour slot in time order. Rescan. Lists
@@ -1127,7 +1149,7 @@ when the server is unreachable.
   song therefore airs within about 1¼ passes through the library, whatever
   rescans, folder changes or Core restarts happen (`library.last_played`).
 - **Near an ad slot: fairness first.** The server knows every song's
-  length and trailing silence (kept per file in `library`, even while a file
+  length and trailing silence (kept per file in `media_files`, even while a file
   is out of the folder) and when the song on air started. When the next
   per-hour slot is within two songs, it checks how late the fair pick above
   would start the break (that song, then the best follow-up). Within **Ad
@@ -1164,7 +1186,14 @@ the deck that is off air, instead of (or before) learning them from plays:
   sends the next 20 owed files in the sync reply whenever that list changes
   (`analyze`, `analyze_rev`); each result is an `analysis` event. Short
   imaging and ads go first.
-- **Done is done.** An analyzed file is marked (`library.analyzed_at`) and
+- **For every station.** A result is the file's (`media_files`): a file
+  analyzed, or failed, on one station counts on every station that has it
+  (same name and size), so another station's run skips it. The job and the
+  Analyze requests stay per station; a result clears the request on every
+  station that asked for that file. Another station's Core takes the
+  result at its next library scan (boot, folder change, Rescan); until then
+  it plays the file with the figures it had.
+- **Done is done.** An analyzed file is marked (`media_files.analyzed_at`) and
   never analyzed again by itself: the daily run only takes files never
   analyzed. It is analyzed again only when you ask (its row's Analyze
   button, **Re-analyze all**, **Forget measured**) or when the file is
@@ -1182,7 +1211,7 @@ the deck that is off air, instead of (or before) learning them from plays:
   current figures stay in use until the new ones arrive. Each row shows a
   tag: ✓ analyzed (hover for when), "queued", or "failed". The **Not
   analyzed** filter lists the rest.
-- **Final.** An analyzed quiet start and end (`library.analyzed_at`) are not
+- **Final.** An analyzed quiet start and end (`media_files.analyzed_at`) are not
   learned over by plays, on the server or the Core. Figures set by an
   operator still win; **Forget measured** clears the analysis too. The
   average level is not final: plays keep adding to it.
@@ -1200,8 +1229,9 @@ Levels:
   reports that average and the seconds it heard (`level`, `level_s`; from
   10 s of sound, or half of a short file), and [file analysis](#file-analysis)
   measures 20 s from the middle of the file. The server keeps
-  `library.level_db`: the average of every measurement, weighted by the
-  seconds each heard, so it steadies with every play; `library.peak_dbfs`
+  `media_files.level_db`: the average of every measurement (plays on every
+  station that has the file), weighted by the seconds each heard, so it
+  steadies with every play; `media_files.peak_dbfs`
   keeps the highest peak. The Core uses a file's first measurement at once
   and the server's average after each library upload.
 - **Applied.** At each play the deck's gain is the kind's level (Music /
@@ -1221,7 +1251,8 @@ Levels:
   Average level marked; a matched song's rms sits around the mark. Library pages: each file's average (sort Loudest
   / Quietest). Start events carry `trim` (syslog, `core_events`).
 - **Starting over.** Forget measured forgets the level too, and a replaced
-  file (new size) is measured afresh. Updating to 1.3.0 starts a
+  file (new size) is measured afresh (its operator quiet start / end are
+  gone too). Updating to 1.3.0 starts a
   re-analysis of every file once (migration 0013, as Re-analyze all does) so
   each gets an analyzed level; plays measure as they go anyway.
 
@@ -1290,6 +1321,7 @@ complete record.
 | 1.3.0 | Level matching: each file's average level measured, every item played at the same average; deck gain and meters on the dashboard |
 | 1.4.0 | Panel refresh: nav rail with what is on air on every page, smoothed deck meters, pressed / sent / done transport keys, Settings in boxes, pages that reload themselves |
 | 1.5.0 | Settings by station: All stations, each station's own on top; folders per station |
+| 1.6.0 | Each file's figures shared by every station (by name and size): moved files keep them |
 | Next | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
 | Later | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
 

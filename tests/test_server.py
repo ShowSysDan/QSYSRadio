@@ -240,7 +240,7 @@ def test_learned_figures_live_on_the_server(app):
         ev(3, 'track_start', deck='B', file='a.mp3', dir='M/', duration=200.0),
         ev(4, 'track_end', deck='B', file='a.mp3', dir='M/', reason='cut', lead_in=0.6, peak=-5.0),
         ev(5, 'file_unsupported', file='bad.wma', dir='M/', status='Unsupported file format')])
-    row = sql("SELECT duration_s, lead_in_s, trail_s, peak_dbfs FROM qsr_test.library WHERE station='L1' AND key='M/a.mp3'",
+    row = sql("SELECT duration_s, lead_in_s, trail_s, peak_dbfs FROM qsr_test.library_figures WHERE station='L1' AND key='M/a.mp3'",
               fetch=True)[0]
     assert tuple(row) == (200.0, 0.6, 3.0, -4.5)             # a cut play keeps the trail it cannot measure; the highest peak
     assert library_post(app, 'L1', items).json['learned'] == {'M/a.mp3': {'trail': 3.0, 'lead': 0.6},
@@ -418,7 +418,8 @@ def test_forecast_fits_later_songs_to_ad_slots(app):
     songs = [{'key': f'M/{c}.mp3', 'dir': 'M/', 'file': f'{c}.mp3', 'kind': 'music', 'artist': c.upper()} for c in names]
     library_post(app, 'FF', songs + [{'key': 'Ads/h.wav', 'dir': 'Ads/', 'file': 'h.wav', 'kind': 'ad'}], ads_dir='Ads/')
     for i, c in enumerate(names):                   # lengths 2:30 .. 9:00, shuffled over the keys
-        sql("UPDATE qsr_test.library SET duration_s = %s WHERE station = 'FF' AND key = %s",
+        sql("UPDATE qsr_test.media_files SET duration_s = %s WHERE id = (SELECT file_id FROM qsr_test.library "
+            "WHERE station = 'FF' AND key = %s)",
             (64 if c == 'c' else 150 + (i * 97) % 390, f'M/{c}.mp3'))
     op, admin = signed_in(app, 'operator'), signed_in(app, 'admin')
     op.post('/api/v1/ads', json={'station': 'FF', 'key': 'Ads/h.wav', 'mode': 'hourly', 'per_hour': 4}, headers=WEB)
@@ -478,8 +479,8 @@ def test_average_level_and_deck_readout(app):
     """A file's average level is the energy average of its measurements (plays and analysis), weighted by
     the seconds each heard; its peak is the highest. The Core gets both; a replaced file starts again;
     Forget measured forgets them. The decks' gain and meters from each sync reach the panel."""
-    items = [{'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music', 'size': 10},
-             {'key': 'M/b.mp3', 'dir': 'M/', 'file': 'b.mp3', 'kind': 'music', 'size': 20}]
+    items = [{'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music', 'size': 30},
+             {'key': 'M/b.mp3', 'dir': 'M/', 'file': 'b.mp3', 'kind': 'music', 'size': 40}]
     library_post(app, 'LV1', items)
     sync(app, station='LV1', events=[
         ev(1, 'track_start', deck='A', file='a.mp3', dir='M/', duration=200.0),
@@ -493,7 +494,8 @@ def test_average_level_and_deck_readout(app):
         ev(8, 'track_start', deck='B', file='b.mp3', dir='M/', duration=100.0),
         ev(9, 'track_end', deck='B', file='b.mp3', dir='M/', reason='end', level=-9.5, level_s=90.0, peak=2.0)])
     level = 10 * math.log10((10 ** 0.4 * 150 + 10 ** 1.0 * 50) / 200)
-    row = sql("SELECT level_db, level_s, peak_dbfs FROM qsr_test.library WHERE station='LV1' AND key='M/a.mp3'", fetch=True)[0]
+    row = sql("SELECT level_db, level_s, peak_dbfs FROM qsr_test.library_figures WHERE station='LV1' AND key='M/a.mp3'",
+              fetch=True)[0]
     assert (row[0], row[1], row[2]) == (pytest.approx(level), 200.0, 14.0)
     learned = library_post(app, 'LV1', items).json['learned']
     assert learned['M/a.mp3'] == {'trail': 1.5, 'lead': 0.4, 'analyzed': True, 'level': round(level, 1), 'peak': 14.0}
@@ -503,10 +505,10 @@ def test_average_level_and_deck_readout(app):
     assert [r['key'] for r in rows] == ['M/b.mp3', 'M/a.mp3'] and rows[1]['level_db'] == pytest.approx(level)
     assert rows[1]['level_s'] == 200.0 and rows[1]['peak_dbfs'] == 14.0
     assert [r['key'] for r in op.get('/api/v1/library?station=LV1&sort=loudest').json['items']] == ['M/a.mp3', 'M/b.mp3']
-    items[1]['size'] = 21                                  # replaced with a new file: measured afresh
+    items[1]['size'] = 41                                  # replaced with a new file: measured afresh
     assert 'M/b.mp3' not in library_post(app, 'LV1', items).json['learned']
     assert op.post('/api/v1/library/forget', json={'station': 'LV1', 'key': 'M/a.mp3'}, headers=WEB).json['files'] == 1
-    assert tuple(sql("SELECT level_db, level_s, peak_dbfs FROM qsr_test.library WHERE station='LV1' AND key='M/a.mp3'",
+    assert tuple(sql("SELECT level_db, level_s, peak_dbfs FROM qsr_test.library_figures WHERE station='LV1' AND key='M/a.mp3'",
                      fetch=True)[0]) == (None, None, None)
     # the decks' readout: cleaned, and gone when a Core does not send it
     sync(app, station='LV1', state=STATE, meters={'A': {'peak': 3.4, 'rms': -2.1, 'gain': -6.4},
@@ -545,7 +547,7 @@ def test_file_analysis_job(app):
         ev(4, 'analysis', file='c.wav', dir='I/', ok=False, status='Unsupported format'),
         ev(5, 'track_start', deck='B', file='a.mp3', dir='M/', duration=201.0),
         ev(6, 'track_end', deck='B', file='a.mp3', dir='M/', reason='end', lead_in=2.0, trail=0.2)])
-    row = sql("SELECT lead_in_s, trail_s, duration_s, analyzed_at IS NOT NULL FROM qsr_test.library "
+    row = sql("SELECT lead_in_s, trail_s, duration_s, analyzed_at IS NOT NULL FROM qsr_test.library_figures "
               "WHERE station='AN1' AND key='M/a.mp3'", fetch=True)[0]
     assert tuple(row) == (0.4, 1.5, 201.0, True)
     assert library_post(app, 'AN1', items).json['learned']['M/a.mp3'] == {'trail': 1.5, 'lead': 0.4, 'analyzed': True}
@@ -566,7 +568,8 @@ def test_file_analysis_job(app):
     assert analyze(op, key='M/nope.mp3').status_code == 400
     assert analyze(op, key='M/b.mp3').status_code == 200               # just that file: no run, keeps its figures
     assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['M/b.mp3']
-    assert sql("SELECT analyzed_at IS NOT NULL FROM qsr_test.library WHERE station='AN1' AND key='M/b.mp3'", fetch=True)[0][0]
+    assert sql("SELECT analyzed_at IS NOT NULL FROM qsr_test.library_figures WHERE station='AN1' AND key='M/b.mp3'",
+               fetch=True)[0][0]
     now = op.get('/api/v1/now?station=AN1').json['station']['analysis']
     assert (now['active'], now['left']) == (True, 1)
     rows = {i['key']: i for i in op.get('/api/v1/library?station=AN1').json['items']}
@@ -586,6 +589,175 @@ def test_file_analysis_job(app):
     assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['I/c.wav', 'M/a.mp3']
     analyze(op, scope='stop')
     assert sync(app, station='AN1', analyze_rev='x').json['analyze'] == []  # not again today
+
+
+# ── Per-file figures, shared by every station ────────────────────────────────
+
+FIGS = ('duration_s', 'lead_in_s', 'trail_s', 'lead_set_s', 'trail_set_s', 'level_db', 'level_s', 'peak_dbfs', 'unsupported',
+        'analyzed_at')
+
+
+def figures(station, key):
+    """The figures a station sees for one of its files (library_figures), as a dict."""
+    rows = sql(f"SELECT {', '.join(FIGS)}, file_id FROM qsr_test.library_figures WHERE station = %s AND key = %s",
+               (station, key), fetch=True)
+    return dict(zip(FIGS + ('file_id',), rows[0])) if rows else None
+
+
+def test_figures_belong_to_the_file_not_the_station(app):
+    """Name + size is the file: another station (another folder) gets its figures, a move keeps them, an edited
+    file (new size) starts afresh, a file of unknown size is never shared."""
+    a = [{'key': 'Music/x.mp3', 'dir': 'Music/', 'file': 'x.mp3', 'kind': 'music', 'size': 7001},
+         {'key': 'Music/y.mp3', 'dir': 'Music/', 'file': 'y.mp3', 'kind': 'music'},                  # size unknown
+         {'key': 'Music/z.mp3', 'dir': 'Music/', 'file': 'z.mp3', 'kind': 'music', 'size': 0}]       # the Core could not tell
+    assert library_post(app, 'SH1', a).json['learned'] == {}
+    sync(app, station='SH1', events=[
+        ev(1, 'track_start', deck='A', file='x.mp3', dir='Music/', duration=200.0),
+        ev(2, 'track_end', deck='A', file='x.mp3', dir='Music/', reason='end', lead_in=0.9, trail=4.0, level=-6.0, level_s=100.0,
+           peak=3.0),
+        ev(3, 'analysis', file='x.mp3', dir='Music/', ok=True, lead_in=0.5, trail=2.5, duration=201.0, level=-4.0, level_s=20.0,
+           peak=5.0),
+        ev(4, 'track_start', deck='B', file='y.mp3', dir='Music/', duration=100.0),
+        ev(5, 'track_end', deck='B', file='y.mp3', dir='Music/', reason='end', lead_in=0.2, trail=1.0),
+        ev(6, 'track_start', deck='A', file='z.mp3', dir='Music/', duration=90.0),
+        ev(7, 'track_end', deck='A', file='z.mp3', dir='Music/', reason='end', lead_in=0.3, trail=1.1)])
+    level = round(10 * math.log10((10 ** -0.6 * 100 + 10 ** -0.4 * 20) / 120), 1)
+    x = {'trail': 2.5, 'lead': 0.5, 'analyzed': True, 'level': level, 'peak': 5.0}
+    assert library_post(app, 'SH1', a).json['learned'] == {'Music/x.mp3': x, 'Music/y.mp3': {'trail': 1.0, 'lead': 0.2},
+                                                           'Music/z.mp3': {'trail': 1.1, 'lead': 0.3}}
+    # another station, another folder, the same file: its figures straight away (reply and library view)
+    b = [{'key': 'Zone/Sub/x.mp3', 'dir': 'Zone/Sub/', 'file': 'x.mp3', 'kind': 'music', 'size': 7001},
+         {'key': 'Zone/y.mp3', 'dir': 'Zone/', 'file': 'y.mp3', 'kind': 'music'},
+         {'key': 'Zone/z.mp3', 'dir': 'Zone/', 'file': 'z.mp3', 'kind': 'music', 'size': 0}]
+    assert library_post(app, 'SH2', b).json['learned'] == {'Zone/Sub/x.mp3': x}           # unknown sizes: not shared
+    row = next(i for i in signed_in(app, 'viewer').get('/api/v1/library?station=SH2').json['items'] if i['key'] == 'Zone/Sub/x.mp3')
+    assert (row['duration_s'], row['lead_in_s'], row['trail_s'], row['level_s'], row['peak_dbfs']) == (201.0, 0.5, 2.5, 120.0, 5.0)
+    assert row['analyzed_at'] and row['level_db'] == pytest.approx(level, abs=0.05)
+    assert figures('SH1', 'Music/x.mp3')['file_id'] == figures('SH2', 'Zone/Sub/x.mp3')['file_id']
+    assert sql("SELECT count(*) FROM qsr_test.media_files WHERE file = 'x.mp3' AND size = 7001", fetch=True)[0][0] == 1
+    # a play on SH2 counts for SH1 too (the level joins the file's average)
+    sync(app, station='SH2', events=[ev(1, 'track_start', deck='A', file='x.mp3', dir='Zone/Sub/', duration=201.0),
+                                     ev(2, 'track_end', deck='A', file='x.mp3', dir='Zone/Sub/', reason='end', level=-4.0,
+                                        level_s=30.0, peak=6.0)])
+    assert (figures('SH1', 'Music/x.mp3')['level_s'], figures('SH1', 'Music/x.mp3')['peak_dbfs']) == (150.0, 6.0)
+    # moved to another folder: the same figures; the files of unknown size keep theirs on their own station
+    a[0].update(key='Archive/x.mp3', dir='Archive/')
+    learned = library_post(app, 'SH1', a).json['learned']
+    assert learned['Archive/x.mp3']['analyzed'] is True and learned['Archive/x.mp3']['trail'] == 2.5
+    assert learned['Music/y.mp3'] == {'trail': 1.0, 'lead': 0.2} and learned['Music/z.mp3'] == {'trail': 1.1, 'lead': 0.3}
+    # edited (a new size): measured afresh; the other station's file is still the old one
+    b[0]['size'] = 7002
+    assert library_post(app, 'SH2', b).json['learned'] == {}
+    assert figures('SH2', 'Zone/Sub/x.mp3')['analyzed_at'] is None and figures('SH1', 'Archive/x.mp3')['analyzed_at']
+    # a file whose size becomes known moves to the shared row and leaves nothing behind
+    a[1]['size'] = 7003
+    library_post(app, 'SH1', a)
+    assert sql("SELECT count(*) FROM qsr_test.media_files WHERE file = 'y.mp3' AND size IS NULL", fetch=True)[0][0] == 1  # SH2's
+    assert figures('SH1', 'Music/y.mp3')['lead_in_s'] is None
+    # an event about a file a station does not have changes nothing and fails nothing
+    before = figures('SH1', 'Archive/x.mp3')
+    r = sync(app, station='SH3', events=[ev(1, 'track_end', deck='A', file='x.mp3', dir='Archive/', reason='end', lead_in=9.0,
+                                            trail=9.0, level=10.0, level_s=50.0, peak=9.0),
+                                         ev(2, 'analysis', file='x.mp3', dir='Archive/', ok=False, status='nope'),
+                                         ev(3, 'file_unsupported', file='x.mp3', dir='Archive/')]).json
+    assert (r['accepted'], r['rejected']) == (3, 0) and figures('SH1', 'Archive/x.mp3') == before
+    # an old Core's figures in its list still land on the file
+    old = [{'key': 'Old/q.mp3', 'dir': 'Old/', 'file': 'q.mp3', 'kind': 'music', 'size': 7004, 'duration': 99.0, 'lead_in': 0.4,
+            'trail': 1.5, 'peak': -3.0}]
+    assert library_post(app, 'SH4', old).json['learned'] == {'Old/q.mp3': {'trail': 1.5, 'lead': 0.4}}
+    assert figures('SH4', 'Old/q.mp3')['duration_s'] == 99.0 and figures('SH4', 'Old/q.mp3')['peak_dbfs'] == -3.0
+
+
+def test_trims_forget_and_analysis_apply_to_every_station(app):
+    a = [{'key': 'M/t.mp3', 'dir': 'M/', 'file': 't.mp3', 'kind': 'music', 'size': 7101},
+         {'key': 'M/only_a.mp3', 'dir': 'M/', 'file': 'only_a.mp3', 'kind': 'music', 'size': 7102}]
+    b = [{'key': 'Elsewhere/t.mp3', 'dir': 'Elsewhere/', 'file': 't.mp3', 'kind': 'music', 'size': 7101},
+         {'key': 'Elsewhere/w.mp3', 'dir': 'Elsewhere/', 'file': 'w.mp3', 'kind': 'music', 'size': 7103}]
+    library_post(app, 'SA', a)
+    library_post(app, 'SB', b)
+    library_post(app, 'SC', [dict(b[0], size=7999)])                        # same name, another size: another file
+    library_post(app, 'SD', [dict(b[0], key='D/t.mp3', dir='D/')])
+    library_post(app, 'SD', [dict(b[1], key='D/w.mp3', dir='D/')])          # no longer has t.mp3
+    mark = lambda: sql('SELECT COALESCE(max(id), 0) FROM qsr_test.commands', fetch=True)[0][0]
+    rescanned = lambda since: sorted(r[0] for r in sql("SELECT station FROM qsr_test.commands WHERE cmd = 'rescan' AND id > %s",
+                                                       (since,), fetch=True))
+    sync(app, station='SA', events=[
+        ev(1, 'track_start', deck='A', file='t.mp3', dir='M/', duration=180.0),
+        ev(2, 'track_end', deck='A', file='t.mp3', dir='M/', reason='end', lead_in=0.6, trail=3.0, level=-5.0, level_s=60.0, peak=1.0),
+        ev(3, 'track_start', deck='B', file='only_a.mp3', dir='M/', duration=170.0),
+        ev(4, 'track_end', deck='B', file='only_a.mp3', dir='M/', reason='end', lead_in=0.4, trail=2.0)])
+    op, admin = signed_in(app, 'operator'), signed_in(app, 'admin')
+    post = lambda url, **body: op.post(url, json=body, headers=WEB)
+    for st in ('SA', 'SB'):                       # no daily run: only the runs started here
+        assert admin.post('/api/v1/settings', json={'settings': {'analyze_at': 'off'}, 'scope': 'station', 'station': st},
+                          headers=WEB).status_code == 200
+    # a trim on SA is the file's: SB's Core is told at once (a rescan; its upload reply has it); not SC or SD
+    m = mark()
+    assert post('/api/v1/library/trim', station='SA', key='M/t.mp3', lead=None, trail=0.8).status_code == 200
+    assert rescanned(m) == ['SA', 'SB']
+    assert 'rescan' in [c['cmd'] for c in sync(app, station='SB').json['commands']]
+    assert library_post(app, 'SB', b).json['learned']['Elsewhere/t.mp3'] == {'trail': 0.8, 'lead': 0.6, 'level': -5.0, 'peak': 1.0,
+                                                                             'fixed': True}
+    assert [i['key'] for i in op.get('/api/v1/library?station=SB&only=adjusted').json['items']] == ['Elsewhere/t.mp3']
+    # Forget measured on SB (its music): forgotten on SA too (told at once), the trim stays; SA's own other file
+    # is not SB's to forget
+    m = mark()
+    assert post('/api/v1/library/forget', station='SB', kind='music').json['files'] == 1
+    assert rescanned(m) == ['SA', 'SB']
+    learned = library_post(app, 'SA', a).json['learned']
+    assert learned == {'M/t.mp3': {'trail': 0.8, 'fixed': True}, 'M/only_a.mp3': {'trail': 2.0, 'lead': 0.4}}
+    m = mark()
+    assert post('/api/v1/library/forget', station='SB', key='Elsewhere/t.mp3').json['files'] == 0     # nothing left to forget
+    assert rescanned(m) == ['SB']                                                                     # nothing to tell SA
+    # analysis: SA's result is the file's; SB's run owes only what nobody has analyzed
+    assert post('/api/v1/analyze', station='SA', key='M/t.mp3').status_code == 200
+    assert post('/api/v1/analyze', station='SB', key='Elsewhere/t.mp3').status_code == 200
+    assert sync(app, station='SB', analyze_rev='').json['analyze'] == ['Elsewhere/t.mp3']
+    sync(app, station='SA', events=[ev(5, 'analysis', file='t.mp3', dir='M/', ok=True, lead_in=0.1, trail=0.2, duration=180.0)])
+    assert sql("SELECT count(*) FROM qsr_test.library WHERE analyze_wanted AND station IN ('SA', 'SB')", fetch=True)[0][0] == 0
+    assert post('/api/v1/analyze', station='SB', scope='new').status_code == 200
+    assert sync(app, station='SB', analyze_rev='').json['analyze'] == ['Elsewhere/w.mp3']
+    rows = {i['key']: i for i in op.get('/api/v1/library?station=SB').json['items']}
+    assert rows['Elsewhere/t.mp3']['analyzed_at'] and not rows['Elsewhere/t.mp3']['analyze_queued']
+    assert rows['Elsewhere/w.mp3']['analyze_queued'] is True
+    assert op.get('/api/v1/now?station=SB').json['station']['analysis']['left'] == 1
+    post('/api/v1/analyze', station='SB', scope='stop')
+    # unsupported on one station: no station plays it
+    sync(app, station='SA', events=[ev(6, 'file_unsupported', file='t.mp3', dir='M/', status='Unsupported file format')])
+    assert library_post(app, 'SB', b).json['learned']['Elsewhere/t.mp3'] == {'unsupported': True}
+    assert post('/api/v1/control', station='SB', cmd='queue_add', args={'key': 'Elsewhere/t.mp3'}).status_code == 400
+    sync(app, station='SB', state=STATE, events=[ev(1, 'track_start', deck='A', file='w.mp3', dir='Elsewhere/', duration=100.0)])
+    conn = db.connect()
+    try:
+        with conn.cursor() as cur:
+            assert ads.next_song(cur, 'SB') == (None, None)          # w.mp3 on air and t.mp3 unsupported: nothing to name
+    finally:
+        conn.close()
+
+
+def test_stations_uploading_the_same_new_files_at_once(app):
+    """Two stations adding the same new files at the same moment (in opposite orders): one row per file, no deadlock."""
+    errors, rounds = [], 3
+
+    def upload(station, names):
+        conn = db.connect()
+        try:
+            control.core_library(conn, {'station': station, 'items': [
+                {'key': f'C/{n}', 'dir': 'C/', 'file': n, 'kind': 'music', 'size': 7200} for n in names]})
+        except Exception as exc:              # noqa: BLE001 (reported below)
+            errors.append(exc)
+        finally:
+            conn.close()
+    for r in range(rounds):
+        names = [f'r{r}-{i:04d}.mp3' for i in range(1500)]
+        threads = [threading.Thread(target=upload, args=('CC1', names)), threading.Thread(target=upload, args=('CC2', names[::-1]))]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+    assert errors == []
+    assert tuple(sql("SELECT count(*), count(DISTINCT file) FROM qsr_test.media_files WHERE size = 7200", fetch=True)[0]) == (
+        1500 * rounds,) * 2
+    assert sql("""SELECT count(*) FROM qsr_test.library a JOIN qsr_test.library b ON b.station = 'CC2' AND b.key = a.key
+                  WHERE a.station = 'CC1' AND a.file_id = b.file_id""", fetch=True)[0][0] == 1500 * rounds
 
 
 def test_holds_and_station_ids(app):
@@ -961,7 +1133,7 @@ def test_settings_views_all_stations_and_one_station(app):
 def test_server_only_settings_per_station(app):
     """ident_schedule, ad_fit_tolerance_s, ident_window_min, analyze_at: per station, like the rest."""
     items = [{'key': 'I/id.wav', 'dir': 'I/', 'file': 'id.wav', 'kind': 'imaging'},
-             {'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music', 'size': 1}]
+             {'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music', 'size': 50}]
     op, admin = signed_in(app, 'operator'), signed_in(app, 'admin')
     for st in ('SO1', 'SO2'):
         library_post(app, st, items)
@@ -1014,6 +1186,71 @@ def test_migration_0014_moves_the_folders_to_every_station():
         assert [r[0] for r in left] == ['core.crossfade_s', 'syslog.host']
     finally:
         sql('DROP SCHEMA IF EXISTS qsr_test_m14 CASCADE')
+
+
+def test_migration_0015_merges_each_files_figures():
+    """Up to 1.5.0 each station kept its own figures per file: 0015 merges them per name + size (the latest
+    analysis or the most recently seen station's, trims, levels weighted by seconds, highest peak), gives
+    each file of unknown size its own row, and points every library row at its file."""
+    sql('DROP SCHEMA IF EXISTS qsr_test_m15 CASCADE; CREATE SCHEMA qsr_test_m15')
+    conn = db.connect(search_path=False)
+    try:
+        for version, _, path, _ in migrate.discover():
+            if version > 15:
+                break
+            if version == 15:
+                with conn.cursor() as cur:
+                    cur.execute("""SET LOCAL search_path TO qsr_test_m15;
+                        INSERT INTO library (station, key, kind, directory, file, size, duration_s, lead_in_s, trail_s, lead_set_s,
+                                             trail_set_s, peak_dbfs, level_db, level_s, unsupported, analyzed_at, analyze_failed_at,
+                                             analyze_error, analyze_wanted, ident, first_seen, last_seen) VALUES
+                        ('A', 'M/a.mp3', 'music', 'M/', 'a.mp3', 100, 200, 0.5, 2.0, 1.0, NULL, -2, -10, 100, FALSE,
+                         '2026-01-02Z', '2026-01-05Z', 'e-new', TRUE, FALSE, '2025-01-01Z', '2026-03-01Z'),
+                        ('B', 'Other/a.mp3', 'music', 'Other/', 'a.mp3', 100, 201, 0.7, 3.0, NULL, 4.0, -1, -4, 50, TRUE,
+                         '2026-02-01Z', '2026-01-03Z', 'e-old', FALSE, FALSE, '2025-06-01Z', '2026-02-01Z'),
+                        ('A', 'M/c.mp3', 'music', 'M/', 'c.mp3', 5, NULL, 0.2, 1.0, NULL, NULL, NULL, NULL, NULL, FALSE,
+                         NULL, NULL, NULL, FALSE, FALSE, '2025-01-01Z', '2026-01-01Z'),
+                        ('B', 'X/c.mp3', 'music', 'X/', 'c.mp3', 5, 60, 0.3, NULL, 2.0, NULL, NULL, -8, 0, FALSE,
+                         NULL, NULL, NULL, FALSE, FALSE, '2025-01-01Z', '2026-02-01Z'),
+                        ('A', 'I/b.wav', 'imaging', 'I/', 'b.wav', NULL, 5, 0.1, 0.2, NULL, NULL, -3, NULL, NULL, FALSE,
+                         NULL, NULL, NULL, FALSE, TRUE, '2025-01-01Z', '2026-01-01Z'),
+                        ('B', 'I/b.wav', 'imaging', 'I/', 'b.wav', NULL, 6, 0.4, 0.5, NULL, NULL, -6, NULL, NULL, TRUE,
+                         NULL, NULL, NULL, FALSE, FALSE, '2025-01-01Z', '2026-01-01Z')""")
+            with conn.cursor() as cur:
+                cur.execute('SET LOCAL search_path TO qsr_test_m15')
+                cur.execute(path.read_text(encoding='utf-8'))
+            conn.commit()
+    finally:
+        conn.close()
+    try:
+        cols = ('duration_s', 'lead_in_s', 'trail_s', 'lead_set_s', 'trail_set_s', 'peak_dbfs', 'level_db', 'level_s',
+                'unsupported', 'analyzed_at', 'analyze_failed_at', 'analyze_error')
+        rows = {(r[0], r[1]): r for r in sql(f"""SELECT station, key, file_id, ident, analyze_wanted, {', '.join(cols)}
+                                                 FROM qsr_test_m15.library_figures""", fetch=True)}
+        a, b = rows['A', 'M/a.mp3'], rows['B', 'Other/a.mp3']
+        assert a['file_id'] == b['file_id'] and tuple(a[c] for c in cols) == tuple(b[c] for c in cols)
+        level = 10 * math.log10((10 ** -1.0 * 100 + 10 ** -0.4 * 50) / 150)
+        assert {c: a[c] for c in cols} == {
+            'duration_s': 200.0, 'lead_in_s': 0.7, 'trail_s': 3.0,                   # length: most recently seen; quiet ends: the latest analysis
+            'lead_set_s': 1.0, 'trail_set_s': 4.0, 'peak_dbfs': -1.0, 'level_db': pytest.approx(level), 'level_s': 150.0,
+            'unsupported': True, 'analyzed_at': datetime(2026, 2, 1, tzinfo=timezone.utc),
+            'analyze_failed_at': datetime(2026, 1, 5, tzinfo=timezone.utc), 'analyze_error': 'e-new'}
+        assert (a['analyze_wanted'], b['analyze_wanted']) == (True, False)          # per station, as before
+        c = rows['A', 'M/c.mp3']                                                    # nothing analyzed: the most recently seen
+        assert c['file_id'] == rows['B', 'X/c.mp3']['file_id']
+        assert (c['lead_in_s'], c['trail_s'], c['lead_set_s'], c['duration_s'], c['level_db'], c['level_s']) == (0.3, 1.0, 2.0, 60.0, None, None)
+        ia, ib = rows['A', 'I/b.wav'], rows['B', 'I/b.wav']                         # size unknown: never merged
+        assert ia['file_id'] != ib['file_id'] and ia['ident'] is True
+        assert (ia['duration_s'], ia['lead_in_s'], ia['peak_dbfs'], ia['unsupported']) == (5.0, 0.1, -3.0, False)
+        assert (ib['duration_s'], ib['lead_in_s'], ib['peak_dbfs'], ib['unsupported']) == (6.0, 0.4, -6.0, True)
+        assert sql('SELECT count(*) FROM qsr_test_m15.media_files', fetch=True)[0][0] == 4
+        left = {r[0] for r in sql("""SELECT column_name FROM information_schema.columns
+                                     WHERE table_schema = 'qsr_test_m15' AND table_name = 'library'""", fetch=True)}
+        assert not left & set(cols) and 'file_id' in left
+        assert sql("""SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'qsr_test_m15'
+                      AND table_name = 'library' AND column_name = 'file_id'""", fetch=True)[0][0] == 'NO'
+    finally:
+        sql('DROP SCHEMA IF EXISTS qsr_test_m15 CASCADE')
 
 
 def test_syslog_set_on_the_settings_page(app):

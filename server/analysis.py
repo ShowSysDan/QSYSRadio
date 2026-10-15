@@ -10,26 +10,31 @@ not analyzed again unless asked (Analyze again, Re-analyze all, Forget
 measured) or replaced (new size). A failed one is skipped for the rest of
 that run (analyze_run_at) and tried again by the next. One file asked for on
 its own (analyze_wanted) is analyzed without starting a run; it keeps its
-figures until the new ones come.
+figures until the new ones come. The job is per station, the result is the
+file's: a file analyzed (or failed) on any station counts for every station
+that has it (media.py).
 """
 import hashlib
 import json
 
-from . import core_settings
+from . import core_settings, media
 from .db import iso
 from .events import BadRequest
 
 BATCH = 20
 SCOPES = ('new', 'all', 'stop')
-def owed_sql(lib='library', since='%s', run_at='%s'):
-    """SQL: is this library row owed? Asked for on its own, or by the run (since NULL = none): analyzed before
-    it started, or never, and not failed in it."""
-    return (f'{lib}.present AND NOT {lib}.unsupported AND ({lib}.analyze_wanted OR ({since}::timestamptz IS NOT NULL '
-            f'AND ({lib}.analyzed_at IS NULL OR {lib}.analyzed_at < {since}) '
-            f'AND ({lib}.analyze_failed_at IS NULL OR {lib}.analyze_failed_at < {run_at})))')
 
 
-OWED = 'station = %s AND ' + owed_sql()
+def run_sql(lib='library_figures', since='%s', run_at='%s'):
+    """SQL: does the run (since NULL = none) owe this library_figures row's file? Analyzed (on any station)
+    before the run started, or never, and not failed in it."""
+    return (f'({since}::timestamptz IS NOT NULL AND ({lib}.analyzed_at IS NULL OR {lib}.analyzed_at < {since}) '
+            f'AND ({lib}.analyze_failed_at IS NULL OR {lib}.analyze_failed_at < {run_at}))')
+
+
+def owed_sql(lib='library_figures', since='%s', run_at='%s'):
+    """SQL: is this library_figures row owed? Asked for on its own, or by the run."""
+    return f'{lib}.present AND NOT {lib}.unsupported AND ({lib}.analyze_wanted OR {run_sql(lib, since, run_at)})'
 
 
 def _job(cur, station):
@@ -38,10 +43,18 @@ def _job(cur, station):
 
 
 def owed(cur, station, since, run_at, limit=BATCH):
-    """The next files to analyze (short imaging and ads first, they are quick)."""
-    cur.execute(f"SELECT key FROM library WHERE {OWED} ORDER BY analyze_wanted DESC, kind = 'music', key LIMIT %s",
-                (station, since, since, run_at, limit))
-    return [r['key'] for r in cur.fetchall()]
+    """The next files to analyze: those asked for on their own, then the run's; short imaging and ads first
+    (they are quick). Two queries, so each reads only what it needs: the files asked for through their index,
+    the run's in index order (library_analyze_order: stops after the first few while many are left) or, when
+    few are left, from the files not analyzed (media_files_analyzed)."""
+    some = ("SELECT key FROM library_figures WHERE station = %s AND present AND NOT unsupported AND {} "
+            "ORDER BY kind = 'music', key LIMIT %s")
+    cur.execute(some.format('analyze_wanted'), (station, limit))
+    keys = [r['key'] for r in cur.fetchall()]
+    if since is not None and len(keys) < limit:
+        cur.execute(some.format('NOT analyze_wanted AND ' + run_sql()), (station, since, since, run_at, limit - len(keys)))
+        keys += [r['key'] for r in cur.fetchall()]
+    return keys
 
 
 def sync(cur, station, core_rev):
@@ -84,8 +97,8 @@ def start(conn, station, scope, key, user):
         raise BadRequest('scope must be new, all or stop (or give a file key)')
     with conn.cursor() as cur:
         if key:                        # just this file; its figures stay in use until the new ones come
-            cur.execute("""UPDATE library SET analyze_wanted = TRUE
-                           WHERE station = %s AND key = %s AND present AND NOT unsupported""", (station, key))
+            cur.execute(f"""UPDATE library SET analyze_wanted = TRUE
+                            WHERE station = %s AND key = %s AND present AND {media.supported()}""", (station, key))
             if not cur.rowcount:
                 raise BadRequest('that file is not in the library')
         else:
@@ -104,13 +117,14 @@ def view(cur, station, state):
     (analyzed or failed), so a library page reloads when one comes in."""
     job = _job(cur, station)
     since = job and job['analyze_from']
-    cur.execute(f'SELECT count(*) FROM library WHERE {OWED}', (station, since, since, job and job['analyze_run_at']))
-    left = cur.fetchone()[0]
-    cur.execute("""SELECT count(*) FILTER (WHERE analyzed_at IS NULL) AS never,
-                          count(*) FILTER (WHERE analyzed_at IS NULL AND analyze_failed_at IS NOT NULL) AS failed,
-                          max(GREATEST(analyzed_at, analyze_failed_at)) AS last
-                   FROM library WHERE station = %s AND present AND NOT unsupported""", (station,))
+    cur.execute(f"""SELECT count(*) FILTER (WHERE {owed_sql('f')}) AS left,
+                           count(*) FILTER (WHERE analyzed_at IS NULL) AS never,
+                           count(*) FILTER (WHERE analyzed_at IS NULL AND analyze_failed_at IS NOT NULL) AS failed,
+                           max(GREATEST(analyzed_at, analyze_failed_at)) AS last
+                    FROM library_figures f WHERE station = %s AND present AND NOT unsupported""",
+                (since, since, job and job['analyze_run_at'], station))
     counts = cur.fetchone()
+    left = counts['left']
     can = (state.get('analyze') or {}).get('can') is True
     return {'active': since is not None or left > 0, 'left': left, 'never': counts['never'], 'failed': counts['failed'], 'can': can,
             'auto_at': iso(job and job['analyze_auto_at']), 'last': iso(counts['last']),

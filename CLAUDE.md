@@ -17,7 +17,8 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 - No duplicated code: reuse the helpers (Lua: `push`, `shuffled`, `set`/`trigger`,
   `readJson`/`writeJson`, `timer`, `post`, `emit`; Python: `db.text`,
   `db.number`, `db.clean_json`, `db.like`, `db.iso`, `dbconn()`,
-  `write_logs`; JS: `Radio.api/post/command/setHTML/esc/num/status`).
+  `write_logs`, `core_settings.effective`, `media.file_of` / `media.supported` (per-file
+  figures live in `media_files`; read them through the view `library_figures`); JS: `Radio.api/post/command/setHTML/esc/num/status`).
 
 ## radio.lua: keep it slim and light
 - Real time only. Anything that can live on the server does.

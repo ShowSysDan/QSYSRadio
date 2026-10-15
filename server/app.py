@@ -347,8 +347,8 @@ def post_trim():
     if not station:
         raise BadRequest('no station has connected yet')
     conn, user = dbconn(), auth.current_user()
-    line = control.set_trim(conn, station, body.get('key'), body.get('lead'), body.get('trail'), user)
-    write_logs([line, control.add_command(conn, station, 'rescan', {}, user)[1]])   # the Core picks it up
+    line, stations = control.set_trim(conn, station, body.get('key'), body.get('lead'), body.get('trail'), user)
+    write_logs([line] + control.rescan(conn, stations, user))     # every Core that has the file picks it up
     return jsonify(ok=True)
 
 
@@ -361,8 +361,8 @@ def post_forget():
     if not station:
         raise BadRequest('no station has connected yet')
     conn, user = dbconn(), auth.current_user()
-    n, line = control.forget_measured(conn, station, body.get('key'), body.get('kind'), user)
-    write_logs([line, control.add_command(conn, station, 'rescan', {}, user)[1]])
+    n, line, stations = control.forget_measured(conn, station, body.get('key'), body.get('kind'), user)
+    write_logs([line] + control.rescan(conn, stations, user))
     return jsonify(ok=True, files=n)
 
 

@@ -121,7 +121,9 @@
       '<button type="button" class="linkbtn" data-t="close">close</button>' +
       '<div class="dim small">Quiet start: where the sound begins, in seconds from the start of the file (the Core starts just before it, ' +
       'within Settings → Silence detection). Quiet end: seconds of silence at the end (the next item starts that much early). ' +
-      'Blank = what the Core measures. A figure set here is not measured over.</div></div></td></tr>');
+      'Blank = what the Core measures. A figure set here is not measured over. The figures are the file\'s (its name and size), ' +
+      'shared by every station that has it: a figure set here or Forget measured reaches each one\'s Core at once (a rescan); ' +
+      'an analysis reaches the other stations\' Cores at their next rescan. A new size (edited file) starts afresh.</div></div></td></tr>');
     tr.nextElementSibling.querySelector('input').focus();
   }
 
@@ -138,7 +140,7 @@
         await R.post('/api/v1/analyze', body);
         R.toast(label + ': queued for analysis on the off-air deck', 'ok');
       } else if (t === 'forget') {
-        if (!confirm('Forget the measured quiet start, end and level of “' + label + '”? They are measured again on its next play.')) return;
+        if (!confirm('Forget the measured quiet start, end and level of “' + label + '”, on every station that has it? They are measured again on its next play.')) return;
         await R.post('/api/v1/library/forget', body);
         R.toast(label + ': measured figures forgotten', 'ok');
       }
@@ -273,7 +275,7 @@
   $('btn-rescan').addEventListener('click', (e) => R.command('rescan', {}, 'Rescan library', e.currentTarget));
   $('btn-forget').hidden = !R.canOperate;
   $('btn-forget').addEventListener('click', async () => {
-    if (!confirm('Forget the measured quiet start, end and level of every one of the ' + NOUN[kind] + '? Each is measured again on its next play. Figures set by an operator stay.')) return;
+    if (!confirm('Forget the measured quiet start, end and level of every one of the ' + NOUN[kind] + ', on every station that has them? Each is measured again on its next play. Figures set by an operator stay.')) return;
     try {
       const r = await R.post('/api/v1/library/forget', { station: R.station || undefined, kind });
       R.toast('Forgotten for ' + r.files + ' ' + NOUN[kind], 'ok');

@@ -4,9 +4,11 @@
 so repeats count as duplicates and change nothing. Each event is stored in
 its own savepoint, so one malformed event is rejected on its own instead of
 failing the batch (which would make the Core resend it forever). Only newly
-stored events touch play_log, the library's per-file figures (lead-in,
-trailing silence, average level, peak, unsupported) and the log; log lines are
-returned to the caller to write after the transaction commits.
+stored events touch play_log, the per-file figures (lead-in, trailing silence,
+average level, peak, unsupported; the file's, shared by every station that
+has it: media.py) and the log; log lines are returned to the caller to write
+after the transaction commits. An event about a file the station does not
+have changes no figures.
 """
 import json
 import logging
@@ -14,6 +16,7 @@ from datetime import datetime
 
 import psycopg2
 
+from . import media
 from .db import clean_json, number, text
 
 START_KINDS = {'track_start': 'music', 'bumper_start': 'imaging', 'ad_start': 'ad'}
@@ -107,9 +110,11 @@ def _apply(cur, station, ev):
                        ON CONFLICT (station, boot, start_seq) DO NOTHING""",
                     (station, START_KINDS[kind], file, directory, text(ev.get('artist'), 500),
                      text(ev.get('title'), 500), text(ev.get('deck'), 10), ev['_at'], duration, ev['boot'], ev['seq']))
-        cur.execute("""UPDATE library SET duration_s = COALESCE(%s, duration_s),
-                           last_played = GREATEST(last_played, %s) WHERE station = %s AND key = %s""",
-                    (duration or None, ev['_at'], station, directory + file))
+        cur.execute('UPDATE library SET last_played = GREATEST(last_played, %s) WHERE station = %s AND key = %s',
+                    (ev['_at'], station, directory + file))
+        if duration:
+            cur.execute(f'UPDATE media_files SET duration_s = %(d)s WHERE {media.file_of()} AND duration_s IS DISTINCT FROM %(d)s',
+                        dict(d=duration, station=station, key=directory + file))
     elif kind in END_KINDS:
         # the newest open play on that deck (same file when the Core sent one)
         file = text(ev.get('file'), 500)
@@ -124,27 +129,28 @@ def _apply(cur, station, ev):
         if kind in END_KINDS:
             # this play's measurements (every kind); trailing silence keeps the shortest seen (LEAST skips NULL);
             # an analyzed file keeps its analyzed quiet start / end; the level always counts
-            cur.execute(f"""UPDATE library SET lead_in_s = CASE WHEN analyzed_at IS NULL THEN COALESCE(%(lead)s, lead_in_s) ELSE lead_in_s END,
+            cur.execute(f"""UPDATE media_files SET lead_in_s = CASE WHEN analyzed_at IS NULL THEN COALESCE(%(lead)s, lead_in_s) ELSE lead_in_s END,
                                 trail_s = CASE WHEN analyzed_at IS NULL THEN LEAST(trail_s, %(trail)s) ELSE trail_s END, {LEVEL_SET}
-                            WHERE station = %(station)s AND key = %(key)s""",
+                            WHERE {media.file_of()}""",
                         dict(_levels(ev), lead=number(ev.get('lead_in')), trail=number(ev.get('trail')), station=station,
                              key=(text(ev.get('dir'), 500) or '') + (file or '')))
     elif kind == 'analysis':
         # a file analyzed off air: its quiet start / end replace what plays learned, its level joins them;
-        # a failed one is retried by the next run
-        key = (text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')
+        # a failed one is retried by the next run. Either way no station still asks for that file.
+        args = dict(station=station, key=(text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or ''))
         if ev.get('ok') is True:
-            cur.execute(f"""UPDATE library SET analyzed_at = NOW(), analyze_failed_at = NULL, analyze_error = NULL, analyze_wanted = FALSE,
+            cur.execute(f"""UPDATE media_files SET analyzed_at = NOW(), analyze_failed_at = NULL, analyze_error = NULL,
                                 lead_in_s = %(lead)s, trail_s = %(trail)s, duration_s = COALESCE(%(duration)s, duration_s), {LEVEL_SET}
-                            WHERE station = %(station)s AND key = %(key)s""",
+                            WHERE {media.file_of()}""",
                         dict(_levels(ev), lead=number(ev.get('lead_in')), trail=number(ev.get('trail')),
-                             duration=number(ev.get('duration')), station=station, key=key))
+                             duration=number(ev.get('duration')), **args))
         else:
-            cur.execute("""UPDATE library SET analyze_failed_at = NOW(), analyze_error = %s, analyze_wanted = FALSE
-                           WHERE station = %s AND key = %s""", (text(ev.get('status'), 200) or 'failed', station, key))
+            cur.execute(f'UPDATE media_files SET analyze_failed_at = NOW(), analyze_error = %(error)s WHERE {media.file_of()}',
+                        dict(error=text(ev.get('status'), 200) or 'failed', **args))
+        cur.execute(f'UPDATE library SET analyze_wanted = FALSE WHERE {media.file_of("file_id")} AND analyze_wanted', args)
     elif kind == 'file_unsupported':
-        cur.execute('UPDATE library SET unsupported = TRUE WHERE station = %s AND key = %s',
-                    (station, (text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')))
+        cur.execute(f'UPDATE media_files SET unsupported = TRUE WHERE {media.file_of()} AND NOT unsupported',
+                    dict(station=station, key=(text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')))
     return None
 
 

@@ -14,7 +14,7 @@ ident_window_min of its time is skipped. Bumper holds do not stop IDs.
 import hashlib
 from datetime import datetime, timedelta, timezone
 
-from . import core_settings
+from . import core_settings, media
 from .db import iso
 from .events import BadRequest
 
@@ -78,8 +78,8 @@ def idents(cur, station, now=None):
     s = core_settings.effective(cur, station)
     every = EVERY_MIN.get(s['ident_schedule'], 0)
     window = int(s['ident_window_min']) * 60
-    cur.execute("""SELECT key FROM library WHERE station = %s AND kind = 'imaging' AND ident AND present AND NOT unsupported
-                   ORDER BY key""", (station,))
+    cur.execute(f"""SELECT key FROM library WHERE station = %s AND kind = 'imaging' AND ident AND present AND {media.supported()}
+                    ORDER BY key""", (station,))
     keys = [r['key'] for r in cur.fetchall()]
     out = {'due': None, 'next_at': None, 'window_s': window, 'keys': keys}
     if not every or not keys:
