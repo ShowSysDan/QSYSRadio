@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [2.4.1] - 2026-10-15
+
+The 1.4.1 follow-ups that were left out when 1.4.1 was merged.
+
+### Fixed
+- **Dashboard froze on a second Core outage.** The Library card's note is
+  written as plain text while the Core is online and through the title
+  ticker while it is offline; on the second outage the ticker found its
+  own markup gone and threw, so every poll stopped half way: the header
+  said "server offline", Skip stayed enabled and the cards kept the online
+  state. The ticker now rebuilds its markup whenever it was written over.
+- **Ticker jitter.** A scrolling line re-measures its lap every second;
+  measuring mid-scroll wobbles by a hundredth of a pixel, and for some
+  lengths that rewrote the lap time each second and made the line jump
+  back and forth. It is rewritten only when the width really changes.
+- README: the install transcript and journal lines end at migration 0019,
+  and the install examples show the current version.
+
+### Changed
+- **Softer page glow.** The page's background glow (green top right, blue
+  bottom left) follows `--glow` too, like every halo since 1.4.1: 30 %
+  fainter, and the one knob now sets every coloured glow.
+
+Redeploy the server: `git pull && sudo systemctl restart qsysradio` (reload
+open panel pages). radio.lua only changed its version number: paste it
+when convenient (until then the journal and the Stations page note the
+version difference).
+
 ## [2.4.0] - 2026-10-15
 
 **Run the probe's section F on the Core first** (`qsys/probe/probe.lua`

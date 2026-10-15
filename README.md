@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **2.4.0** · see [CHANGELOG.md](CHANGELOG.md)
+Version **2.4.1** · see [CHANGELOG.md](CHANGELOG.md)
 
 Radio-station automation built on a Q-SYS Core: one script runs every
 station on the Core, each station with two decks, or one for a
@@ -15,9 +15,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.2.0** — done; section F checks file fingerprints (Crypto.Digest, io seek) on the real Core |
-| `qsys/radio` — deck controller | **2.4.0** — stable; every station on the Core from one script (two players, or one for a background-music zone), each faulted and rebuilt on its own; file analysis on analysis players of its own (nothing on air touched); file fingerprints (off by itself on a Core that cannot make them); standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **2.4.0** — offline Core stand-in (any number of players, analysis players, one-player zones, simulated file contents and Crypto.Digest) + a live simulated Core with several stations and zones for demos |
-| `server` — Flask + Postgres | **2.3.0** — stable; own schema, migrate-on-start, play log, control panel (with every station at a glance), shared sign-in, settings by station, per-file figures shared by every station (a file known by its fingerprint once its Core has made one), one sync a second per Core (each station its own transaction), file analysis per Core, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **2.4.1** — stable; every station on the Core from one script (two players, or one for a background-music zone), each faulted and rebuilt on its own; file analysis on analysis players of its own (nothing on air touched); file fingerprints (off by itself on a Core that cannot make them); standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **2.4.1** — offline Core stand-in (any number of players, analysis players, one-player zones, simulated file contents and Crypto.Digest) + a live simulated Core with several stations and zones for demos |
+| `server` — Flask + Postgres | **2.4.1** — stable; own schema, migrate-on-start, play log, control panel (with every station at a glance), shared sign-in, settings by station, per-file figures shared by every station (a file known by its fingerprint once its Core has made one), one sync a second per Core (each station its own transaction), file analysis per Core, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -617,7 +617,9 @@ migrate: applied 0001_app_settings.sql
 migrate: applied 0002_core_events_play_log.sql
 migrate: applied 0003_stations_commands_library.sql
 migrate: applied 0004_events_unique_per_station.sql
-migrate: schema "qsysradio" at version 0004
+...
+migrate: applied 0019_file_fingerprints.sql
+migrate: schema "qsysradio" at version 0019
 ==> systemd service...
 [INFO]  Wrote /etc/systemd/system/qsysradio.service
 [INFO]  Service is running.
@@ -637,7 +639,8 @@ Keep the two `CFG` lines for step 10.
   networks, use the one the Core can reach.
 - Print the token again any time: `grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`.
 - Re-running is safe: the secrets in `.env` are kept and only pending
-  migrations run (`... at version 0012 (nothing to do)`).
+  migrations run (`... at version 0019 (nothing to do)`: the number of the
+  last file in `server/migrations/`).
 - Without sudo (`./install.sh`) it sets up the venv, `.env` and the database,
   ends with `Done (no systemd service without sudo).` and prints no `CFG`
   lines. `./start.sh` then runs the server in the foreground.
@@ -665,13 +668,13 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `migrate: schema "qsysradio" at version 0018 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 2.3.0 starting on port
+- In the journal: `migrate: schema "qsysradio" at version 0019 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 2.4.1 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":18,"schema_version":18,"version":"2.3.0"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":19,"schema_version":19,"version":"2.4.1"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -868,7 +871,7 @@ and the Core one analysis player or more for all of them:
    Settings page (choose it in the header first).
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 2.3.0 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 2.4.1 starting on Core 8 Flex (<design name>)
    16:00:01 Main: library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    16:00:01 Studio2: library: 19 music in media/Audio/Test/Tuning/, …
    16:00:01 Lobby: library: 19 music in media/Audio/Test/Tuning/ (one player: no breaks)
@@ -879,7 +882,7 @@ and the Core one analysis player or more for all of them:
    for the whole Core prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main on <design name> · radio.lua 2.3.0`, and under On air "No
+   becomes `· Main on <design name> · radio.lua 2.4.1`, and under On air "No
    Core has connected yet" becomes the playing track (artist – title). The
    header's drop-down lists every station. The journal shows
    `INFO BOOT station=Main ...` and then `PLAY` lines:
@@ -916,7 +919,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (12 in 2.4.0).
+The last line prints the number of tables (12 in 2.4.1).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -1011,6 +1014,9 @@ Every start (`start.sh`) does three things in order:
   every station once, 20 at a time, one every 0.5 s (2 to 3 hours for
   14,000 files; a file that several stations list on the same Core is read
   once), and again only when its size changes.
+- **From 2.4.0 to 2.4.1** (softer glow, the ticker fixed): the server only,
+  as above (no migration), then reload open panel pages. radio.lua changed
+  only its version number: paste it when convenient.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -1333,6 +1339,17 @@ MockCore scenarios and `live_core.py`.
   with its countdown (not on the Dashboard, which shows it larger), with the
   song's progress as a red line along its bottom edge. The header's
   drop-down lists the stations by name.
+- **Long lines scroll.** A line too long for its place (what is on air in
+  the nav rail and on the Stations cards, a title or note on the Dashboard
+  cards) scrolls by like a ticker, round and round (about 35 px a second; a
+  dot marks where it starts again, and it fades in and out at the ends of
+  its line), also when the computer asks for reduced motion (Remote
+  Desktop, Windows with animation effects off): everything else then stops
+  moving.
+- **Glow.** Every coloured glow (the halos around lamps, the active tab,
+  the on-air deck, big numbers and primary buttons, the tiles' corner tint,
+  the page's background) follows one strength, `--glow` at the top of
+  `server/static/css/radio.css`: 0.7 (1 = the brighter 1.4.0 look, 0 = none).
 - **Stations** (the second tab): every station on one page, a card each, by
   name, so 14 stations can be watched and run without switching the
   header's station. A line at the top counts them: stations, on air,
@@ -1376,10 +1393,6 @@ MockCore scenarios and `live_core.py`.
   measured: the numbers are the Core's), and the peak line holds a second
   before it falls. The queue (reorder, remove, clear);
   activity (every command, who sent it, and the Core's answer); recent plays.
-  Titles too long for their card scroll by like a ticker, round and round
-  (about 35 px a second; a dot marks where the title starts again), also
-  when the computer asks for reduced motion (Remote Desktop, Windows with
-  animation effects off): everything else then stops moving.
 - **Music**, **Imaging & IDs** and **Advertisements** pages (one tab each): search
   (`/` jumps to it, Esc clears), sort, quick filters (never played,
   unsupported; station IDs; per hour / mix in / off; adjusted), all kept in
