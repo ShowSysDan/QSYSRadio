@@ -1,7 +1,7 @@
 --[[---------------------------------------------------------------------------
   MockCore :: an offline stand-in for the Q-SYS Lua runtime
   File:    qsys/test/mock_core.lua
-  Version: 0.4.0
+  Version: 0.5.0
 
   Enough of Component / Timer / dir / Design / Network / Controls / json / io
   to run radio.lua (and probe.lua) under plain Lua 5.3 with a simulated
@@ -13,8 +13,13 @@
     - the meter is post-gain, floors at -120, releases at ~60 dB/s; rms.N reads
       the file's crest (default 3 dB) under peak.N
     - `playing` goes false at end of file (and `stopped` true)
+    - files load from root + directory (MockCore.dirs is relative to Audio/)
   Any number of players, meters and mixers by name (spec.players: the wiring),
-  and a fake server for the 2.x Core protocol (batched sync, library in parts).
+  analysis players (a player + meter channel routed nowhere: MockCore.analyzers),
+  and a fake server for the 2.1 Core protocol (batched sync, library in parts,
+  the per-Core analysis list: MockCore.analysisQueue).
+  A file entry may say hang = true (its load never completes) or noEnd = true
+  (the player never reports its end: it plays on, silent).
 
   Usage (see run_mock.py / scenario_basic.lua):
     dofile("qsys/test/mock_core.lua")
@@ -203,14 +208,21 @@ local function mkPlayer(name, meterCtl)
   return p
 end
 
+-- the folder a player's root + directory names, relative to Audio/ (MockCore.dirs' keys); nil = outside Audio/
+local function audioDir(root, dirRel)
+  local full = ((root or "") .. "/" .. (dirRel or "")):gsub("/+", "/"):gsub("^/", "")
+  return full:match("^Audio/(.*)$")
+end
+
 function Player:requestLoad(fname)
   self.ctl["filename"].String = fname
-  local dirRel = self.ctl["directory"].String
+  local dirRel = audioDir(self.ctl["root"].String, self.ctl["directory"].String)
+  local entry = dirRel and MockCore.lookup(dirRel, fname)
+  if entry and entry.hang then MockCore.note(self.name .. " LOAD HANGS " .. fname) return end
   local at = MockCore.clock + 0.08
   MockCore.pending[#MockCore.pending + 1] = { at = at, fn = function()
     setStr(self.ctl["filename.ui"], fname)
     fire(self.ctl["filename"])
-    local entry = MockCore.lookup(dirRel, fname)
     if fname == "" then
       self.file = nil
     elseif not entry or entry.unsupported then
@@ -254,7 +266,9 @@ function Player:advance(dt)
   if self.playing and self.file then
     self.pos = self.pos + dt
     local f = self.file
-    if self.pos >= f.duration then
+    if self.pos >= f.duration and f.noEnd then
+      self.pos = f.duration              -- a stuck player: plays on, silent, never reports the end
+    elseif self.pos >= f.duration then
       MockCore.note(self.name .. " EOF " .. f.name)
       self.playing = false
       self.pos = 0
@@ -294,25 +308,38 @@ function MockCore.lookup(dirRel, fname)
   return nil
 end
 
--- the classic design: two players on PlayerMeter 1 / 2 and RadioOut inputs 1 / 2 (radio.lua's CFG.STATIONS[1])
-local function classicWiring(noMixer)
-  local mixer = not noMixer and "RadioOut" or nil
-  return { { name = "Audio_Player23", label = "A", meter = "PlayerMeter", channel = 1, mixer = mixer, input = 1 },
-           { name = "Audio_Player24", label = "B", meter = "PlayerMeter", channel = 2, mixer = mixer, input = 2 } }
+-- n analysis players added to wiring (routed nowhere): Analysis_Player, Analysis_Player2, ... on AnalysisMeter 1, 2, ...
+-- Returns the CFG.ANALYZERS entries (n = 1: radio.lua's default)
+function MockCore.analyzers(n, wiring)
+  local cfg = {}
+  for i = 1, n do
+    local name = "Analysis_Player" .. (i > 1 and i or "")
+    wiring[#wiring + 1] = { name = name, label = "X" .. i, meter = "AnalysisMeter", channel = i }
+    cfg[i] = { player = name, meter = "AnalysisMeter", meter_idx = i }
+  end
+  return cfg
 end
 
--- n two-player stations: ids <prefix>1.. (or opts.ids), players <id>_A / <id>_B on meter <id>_Meter 1 / 2 and
--- mixer <id>_Mix inputs 1 / 2 (opts.noMixer: none). Returns the wiring (spec.players) and the CFG.STATIONS entries.
+-- the classic design (radio.lua's default CFG): two players on PlayerMeter 1 / 2 into the RadioOut mixer
+-- (the station's output; radio.lua never touches it), and an analysis player (noAnalyzer: none)
+local function classicWiring(noAnalyzer)
+  local w = { { name = "Audio_Player23", label = "A", meter = "PlayerMeter", channel = 1, mixer = "RadioOut", input = 1 },
+              { name = "Audio_Player24", label = "B", meter = "PlayerMeter", channel = 2, mixer = "RadioOut", input = 2 } }
+  if not noAnalyzer then MockCore.analyzers(1, w) end
+  return w
+end
+
+-- n two-player stations: ids <prefix>1.. (or opts.ids), players <id>_A / <id>_B on meter <id>_Meter 1 / 2 into
+-- their output mixer <id>_Mix. Returns the wiring (spec.players) and the CFG.STATIONS entries.
 function MockCore.stations(n, opts)
   opts = opts or {}
   local wiring, cfg = {}, {}
   for i = 1, n do
     local id = opts.ids and opts.ids[i] or ((opts.prefix or "S") .. i)
-    local mixer = not opts.noMixer and (id .. "_Mix") or nil
     for k, deck in ipairs({ "A", "B" }) do
-      wiring[#wiring + 1] = { name = id .. "_" .. deck, label = id .. deck, meter = id .. "_Meter", channel = k, mixer = mixer, input = k }
+      wiring[#wiring + 1] = { name = id .. "_" .. deck, label = id .. deck, meter = id .. "_Meter", channel = k, mixer = id .. "_Mix", input = k }
     end
-    cfg[i] = { id = id, players = { id .. "_A", id .. "_B" }, meter = id .. "_Meter", meters = { 1, 2 }, mixer = mixer or "", mix = { 1, 2 } }
+    cfg[i] = { id = id, players = { id .. "_A", id .. "_B" }, meter = id .. "_Meter", meters = { 1, 2 } }
   end
   return wiring, cfg
 end
@@ -352,7 +379,7 @@ function MockCore.setup(spec)
   end
 
   MockCore.players, MockCore.meters, MockCore.mixers = {}, {}, {}
-  for _, w in ipairs(spec.players or classicWiring(spec.noMixer)) do MockCore.wire(w) end
+  for _, w in ipairs(spec.players or classicWiring(spec.noAnalyzer)) do MockCore.wire(w) end
   MockCore.meter, MockCore.mixer = MockCore.meters["PlayerMeter"], MockCore.mixers["RadioOut"]
 
   Component = {
@@ -450,8 +477,9 @@ function MockCore.loadRadio(patch, path)
 end
 
 -------------------------------------------------------------------------------
--- a fake QSYSRadio server speaking the 2.x Core protocol
+-- a fake QSYSRadio server speaking the 2.1 Core protocol
 --   h.sync(part, body, req) -> that station's reply entry (nil = { commands = {} })
+--   h.core(body, req) -> more top-level reply fields (e.g. analyze, analyze_rev: MockCore.analysisQueue), or nil
 --   h.library(station, items, body) -> the learned figures for a complete scan (nil = none sent)
 --   h.down(req) -> code, body, err: fail the whole request (an outage), or nil
 --   h.lose(body) -> true: this library part is lost (answered, not staged: its last part gets 409)
@@ -469,7 +497,9 @@ function MockCore.serve(h)
     if req.Url:match("/api/v1/core/sync$") then
       local out = {}
       for _, part in ipairs(body.stations or {}) do out[part.station] = (h.sync and h.sync(part, body, req)) or { commands = {} } end
-      return 200, json.encode({ stations = out })
+      local reply = { stations = out }
+      for k, v in pairs(h.core and h.core(body, req) or {}) do reply[k] = v end
+      return 200, json.encode(reply)
     elseif req.Url:match("/api/v1/core/library$") then
       local lib = MockCore.libraries[body.station] or { items = {}, uploads = 0, parts = 0, conflicts = 0 }
       MockCore.libraries[body.station] = lib
@@ -496,6 +526,39 @@ function MockCore.serve(h)
     end
     return 404, ""
   end
+end
+
+-- the server's per-Core analysis job, faked: owed = { { station, key }, ... } in the order to measure. Up to
+-- q.batch (20) at a time, sent when the Core's analyze_rev differs; a file leaves the list when its 'analysis'
+-- event arrives (ok or not). q.results[station .. "|" .. key] = that event; q.lists = lists sent; q.bodies = sync
+-- bodies seen. Use as MockCore.serve{ core = q.core } (or call q.core(body) from your own h.core).
+function MockCore.analysisQueue(owed)
+  local q = { owed = owed or {}, batch = 20, results = {}, lists = {}, bodies = {}, version = 0, last = nil }
+  function q.add(station, key) q.owed[#q.owed + 1] = { station = station, key = key } end
+  function q.core(body)
+    q.bodies[#q.bodies + 1] = body
+    for _, part in ipairs(body.stations or {}) do
+      for _, e in ipairs(part.events or {}) do
+        if e.kind == "analysis" then
+          local id = part.station .. "|" .. (e.dir or "") .. (e.file or "")
+          q.results[id] = e
+          for i = #q.owed, 1, -1 do if q.owed[i].station .. "|" .. q.owed[i].key == id then table.remove(q.owed, i) end end
+        end
+      end
+    end
+    if body.analyze_rev == nil then return nil end         -- this Core has no analysis player
+    local list, ids = {}, {}
+    for i = 1, math.min(q.batch, #q.owed) do
+      list[i], ids[i] = { station = q.owed[i].station, key = q.owed[i].key }, q.owed[i].station .. "|" .. q.owed[i].key
+    end
+    local now = table.concat(ids, "\n")
+    if now ~= q.last then q.version, q.last = q.version + 1, now end
+    local rev = #list > 0 and ("q" .. q.version) or ""
+    if rev == body.analyze_rev then return nil end
+    q.lists[#q.lists + 1] = { at = MockCore.clock, list = list, rev = rev }
+    return { analyze = list, analyze_rev = rev }
+  end
+  return q
 end
 
 -- simulate an operator button press (momentary)

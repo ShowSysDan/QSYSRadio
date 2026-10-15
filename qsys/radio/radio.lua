@@ -1,16 +1,19 @@
--- QSYSRadio deck controller (Q-SYS Lua 5.3): every station on this Core, two Audio Players each. Docs: README.md.
+-- QSYSRadio deck controller (Q-SYS Lua 5.3): every station on this Core (two Audio Players each) and its file
+-- analysis players. Docs: README.md.
 -- Station settings are edited on the server's web page and pushed here; SETTINGS below are only the
 -- fallback until the server has been reached once.
-RADIO_VERSION = "2.0.0"
+RADIO_VERSION = "2.1.0"
 
 CFG = {
   SERVER_URL = "",     -- e.g. "http://10.0.0.20:5410"; "" = run standalone
   SERVER_TOKEN = "",   -- RADIO_API_TOKEN from the server's .env
   AUTOSTART = true,
   CORE_ID = "",        -- "" = the design name; names this Core to the server
-  STATIONS = {         -- id: unique, never ""; mixer: the players' mixer (a deck's input is muted while it analyzes; "" = no analysis)
-    { id = "Main", players = { "Audio_Player23", "Audio_Player24" }, meter = "PlayerMeter", meters = { 1, 2 },
-      mixer = "RadioOut", mix = { 1, 2 } },
+  STATIONS = {         -- id: unique, never ""; players: its two Audio Players; meter / meters: their peak + rms channels
+    { id = "Main", players = { "Audio_Player23", "Audio_Player24" }, meter = "PlayerMeter", meters = { 1, 2 } },
+  },
+  ANALYZERS = {        -- file analysis: an Audio Player routed nowhere + a meter channel like the stations'; {} = none
+    { player = "Analysis_Player", meter = "AnalysisMeter", meter_idx = 1 },
   },
 }
 
@@ -28,9 +31,9 @@ SETTINGS = {
 -- internals (not settings)
 local K = {
   floor_db = -100, tick_s = 0.25, fast_s = 0.05, load_timeout_s = 1.5, chores_s = 30,
-  quiet_s = 0.5, scan_head_s = 6, scan_body_s = 20, scan_tail_s = 15, scan_need_s = 50, scan_settle_s = 0.5, level_min_s = 10,
+  quiet_s = 0.5, scan_head_s = 6, scan_body_s = 20, scan_tail_s = 15, scan_settle_s = 0.5, scan_spare_s = 30, level_min_s = 10,
   sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, library_chunk = 1000,
-  outbox_max = 10000, outbox_big = 2000, outbox_big_s = 120, events_max = 500, history_max = 50, queue_max = 100, analyze_max = 5000,
+  outbox_max = 10000, outbox_big = 2000, outbox_big_s = 120, events_max = 500, history_max = 50, queue_max = 100, analyze_max = 100,
   fault_after = 5, retry_s = 30, retry_max_s = 300, healthy_s = 600,
 }
 -- only what must survive a reboot while the server is unreachable; everything else lives on the server
@@ -195,6 +198,7 @@ local function control(comp, name)
   return ok and ctl or nil
 end
 
+-- st: its owner (its id names it in the log; onDeckEnded): a station, or the Analyzer for an analysis player
 function Deck.new(st, id, player, meter, meterName, meterIdx)
   local self = setmetatable({ st = st, id = id, state = "idle", gain = K.floor_db, pow = 0, powN = 0, shownPeak = -120 }, Deck)
   local ok, comp = pcall(Component.New, player)
@@ -209,6 +213,10 @@ function Deck.new(st, id, player, meter, meterName, meterIdx)
   self.rms = control(meter, "rms." .. tostring(meterIdx))
   if not self.rms then log("! %s: meter '%s' has no control rms.%s: average levels are not measured", st.id, meterName, tostring(meterIdx)) end
   self.c.playing.EventHandler = function(ctl) guard(st, "player", Deck.onPlaying, self, ctl) end
+  self:stop()
+  set(self.c.mute, "Boolean", false)
+  set(self.c.loop, "Boolean", false)
+  set(self.c.gain, "Value", K.floor_db)
   return self
 end
 
@@ -216,8 +224,13 @@ function Deck:onPlaying(ctl)
   if not ctl.Boolean and (self.state == "playing" or self.state == "fading") and not self.expectStop then self:ended() end
 end
 
--- an analyzing deck is not busy: on-air use takes it over (Station:startTrack)
-function Deck:isBusy() return not self.job and (self.state == "loading" or self.state == "playing" or self.state == "fading") end
+-- the folder its files are found under: its root, Audio/ when blank
+function Deck:root()
+  local root = self.c.root.String
+  return normDir(root ~= "" and root or "Audio/")
+end
+
+function Deck:isBusy() return self.state == "loading" or self.state == "playing" or self.state == "fading" end
 
 function Deck:setGain(g)
   g = clamp(g, K.floor_db, 20)
@@ -237,7 +250,7 @@ function Deck:load(track, cb)
     if f and f.onDone then f.onDone(self) else self.st:finishTrack(self, "cut") end
   end
   self:stop()
-  self.prevRem, self.prevStatus = self.c.remaining.Value, self.c.status.String
+  self.prevRem, self.prevStatus, self.prevName = self.c.remaining.Value, self.c.status.String, self.c["filename.ui"].String
   if self.c.directory.String ~= track.dir then set(self.c.directory, "String", track.dir) end
   set(self.c.filename, "String", track.name)
   self.pending, self.loadCb, self.loadStart, self.state = track, cb, now(), "loading"
@@ -256,7 +269,8 @@ function Deck:pollLoad(t)
   elseif fnui == pending.name and st ~= "" and not startsWith(st, "OK") and st ~= self.prevStatus then
     result = st
   elseif waited > K.load_timeout_s then
-    result = loaded or ("timeout (" .. st .. ")")
+    -- a second unsupported file in a row leaves the status string as it was: the echo of the new name says it was refused
+    result = loaded or (fnui == pending.name and fnui ~= self.prevName and startsWith(st, "Unsupported") and st) or ("timeout (" .. st .. ")")
   end
   if result == nil then return end
   self.pending, self.loadCb = nil, nil
@@ -281,7 +295,6 @@ function Deck:play(gainDb, fadeInS, skip)
     self:setGain(gainDb)
   end
   self.expectStop = false
-  if self.mix then set(self.mix, "Boolean", self.job ~= nil) end   -- off air only while analyzing
   trigger(self.c.play)
   if skip > 0 then set(self.c.locate, "Value", skip) end
   self.state, self.playStart, self.fadedIn = "playing", now() - skip, fadeInS and fadeInS > 0   -- times stay file positions
@@ -307,7 +320,6 @@ end
 
 -- the player stopped by itself (end of file)
 function Deck:ended()
-  if self.job then return self.st:analyzeFinish(self, true) end
   local f = self.fade
   self.fade = nil
   if f and f.onDone then f.onDone(self)      -- a fade-out was already handling this deck
@@ -326,14 +338,13 @@ function Deck:remainingEst(t)
   return math.max(0, est)
 end
 
--- one meter read per station tick; it is learned from only during clean playback (no fade), so
--- learned lead-in / trail / peak / average level are never skewed by the gain moving
-function Deck:sample(t)
+-- one meter read per tick (S: the settings it is measured by); it is learned from only during clean playback
+-- (no fade), so learned lead-in / trail / peak / average level are never skewed by the gain moving
+function Deck:sample(t, S)
   local m = self.peak.Value
   if type(m) ~= "number" then return end
   if m > self.shownPeak then self.shownPeak = m end    -- the panel's readout: the loudest since the last sync
   if self.state ~= "playing" or self.fade or t < (self.settleUntil or 0) then return end
-  local S = self.st.settings
   local unity = (m > -118) and (m - self.gain) or -200
   if unity > S.silence_threshold_dbfs then
     self.lastAudioAt, self.firstAudioAt, self.silentSince = t, self.firstAudioAt or t, nil
@@ -397,8 +408,7 @@ function Station.new(cfg, prev, saved)
   local st = setmetatable({
     cfg = cfg, id = cfg.id, decks = {}, rev = prev and prev.rev or 0, sentRev = -1, stateAt = -1e9,
     lib = { music = {}, imaging = {}, ad = {}, byKey = {}, root = "Audio/", folders = {}, gen = 0 },
-    learned = {}, an = { todo = {}, done = {}, rev = "", pos = 1 },
-    settings = fallback(), settingsRev = "", adsRev = "", lastCmd = 0, dropped = 0, replyFails = 0, libraryDirty = false,
+    learned = {}, settings = fallback(), settingsRev = "", adsRev = "", lastCmd = 0, dropped = 0, replyFails = 0, libraryDirty = false,
     state = "idle",          -- idle | playing | crossfading | bumper | ad | off | fault
     automation = false, live = nil, other = nil, spotDeck = nil, freeDeck = nil,
     tracksSinceBumper = 0, tracksSinceAd = 0,   -- songs started since the last bumper / ad
@@ -424,10 +434,7 @@ function Station.new(cfg, prev, saved)
   return st
 end
 
--- analysis needs the players' mixer (each deck's input mute)
-local function namesMixer(cfg) return type(cfg.mixer) == "string" and cfg.mixer ~= "" end
-
--- its players, meter and mixer from CFG; then the first library scan
+-- its players and meter from CFG; then the first library scan
 function Station:build()
   local cfg = self.cfg
   local players, meters = cfg.players, type(cfg.meters) == "table" and cfg.meters or { 1, 2 }
@@ -441,24 +448,6 @@ function Station:build()
   self.decks[1] = Deck.new(self, "A", players[1], meter, tostring(cfg.meter), meters[1])
   self.decks[2] = Deck.new(self, "B", players[2], meter, tostring(cfg.meter), meters[2])
   Radio.players[players[1]], Radio.players[players[2]] = self.id, self.id
-  if namesMixer(cfg) then
-    local mix = type(cfg.mix) == "table" and cfg.mix or { 1, 2 }
-    local okM, mx = pcall(Component.New, cfg.mixer)
-    local a = okM and mx and control(mx, "input." .. tostring(mix[1]) .. ".mute.1")
-    local b = okM and mx and control(mx, "input." .. tostring(mix[2]) .. ".mute.1")
-    if a and b then
-      self.decks[1].mix, self.decks[2].mix = a, b
-    else
-      log("! %s: mixer '%s' with input.%s/%s.mute.1 not found: file analysis is off", self.id, cfg.mixer, tostring(mix[1]), tostring(mix[2]))
-    end
-  end
-  for _, d in ipairs(self.decks) do
-    d:stop()
-    if d.mix then set(d.mix, "Boolean", false) end
-    set(d.c.mute, "Boolean", false)
-    set(d.c.loop, "Boolean", false)
-    set(d.c.gain, "Value", K.floor_db)
-  end
   self:scan()
 end
 
@@ -486,7 +475,7 @@ function Station:faultNow(reason)
   self.fault, self.retryAt = reason, now() + self.backoff
   self.backoff = math.min(self.backoff * 2, K.retry_max_s)
   for _, d in ipairs(self.decks) do
-    if d.track and not d.job then pcall(self.finishTrack, self, d, "fault") end   -- a play cut short (never an analysis)
+    if d.track then pcall(self.finishTrack, self, d, "fault") end   -- a play cut short
     pcall(Deck.stop, d)
   end
   self.automation, self.state, self.live, self.other, self.spotDeck, self.freeDeck, self.armed = false, "fault", nil, nil, nil, nil, nil
@@ -534,14 +523,13 @@ end
 
 function Station:scan()
   local lib, S = self.lib, self.settings
-  local root = self.decks[1].c.root.String
-  lib.root = normDir(root ~= "" and root or "Audio/")
+  lib.root = self.decks[1]:root()
   local byKey, learned = {}, {}
   for _, kind in ipairs(KIND_ORDER) do
     lib[kind] = self:listAudio(S[KINDS[kind].dir], kind, learned)
     for _, tr in ipairs(lib[kind]) do byKey[tr.key] = tr end
   end
-  lib.byKey, lib.gen, self.an.pos = byKey, lib.gen + 1, 1   -- files back in the library are tried again
+  lib.byKey, lib.gen = byKey, lib.gen + 1
   self.learned = learned               -- figures only for the files listed now: nothing grows with uptime
   local keep = {}                      -- keep the shuffle cycle going (new files join at the next refill)
   for _, tr in ipairs(self.bag) do keep[#keep + 1] = byKey[tr.key] end
@@ -561,17 +549,22 @@ function Station:removeTrack(track)
   self.lib.byKey[track.key] = nil
 end
 
+function Station:figures(key)            -- its figures for a file (made when it has none yet)
+  local L = self.learned[key] or {}
+  self.learned[key] = L
+  return L
+end
+
 -- the server's per-file figures (reply to the library upload): they replace this boot's (edits, forgotten figures)
 function Station:learn(map)
   if type(map) ~= "table" then return end
   for _, L in pairs(self.learned) do L.trail, L.lead, L.fixed, L.analyzed, L.level, L.peak = nil, nil, nil, nil, nil, nil end
   for key, v in pairs(map) do
     if type(v) == "table" then
-      local L = self.learned[key] or {}
+      local L = self:figures(key)
       L.trail, L.lead, L.fixed, L.analyzed = tonumber(v.trail), tonumber(v.lead), v.fixed == true or nil, v.analyzed == true or nil
       L.level, L.peak = tonumber(v.level), tonumber(v.peak)
       if v.unsupported == true then L.unsupported = true end
-      self.learned[key] = L
       if L.unsupported and self.lib.byKey[key] then self:removeTrack(self.lib.byKey[key]) end
     end
   end
@@ -700,8 +693,7 @@ function Station:finishTrack(d, reason)
   d.track = nil                        -- finish each play exactly once
   local ev = { deck = d.id, file = tr.name, dir = tr.dir, reason = reason,
                played = d.playStart and round(now() - d.playStart, 1) or nil }
-  local L = self.learned[tr.key] or {}  -- this play's measurements; the server keeps them per file
-  self.learned[tr.key] = L
+  local L = self:figures(tr.key)       -- this play's measurements; the server keeps them per file
   local keep = L.fixed or L.analyzed    -- set by an operator or analyzed: plays don't learn over it
   if d.firstAudioAt and d.playStart and not d.fadedIn then   -- a fade-in hides where the sound starts
     ev.lead_in = round(d.firstAudioAt - d.playStart, 2)
@@ -728,16 +720,12 @@ function Station:startTrack(deck, track, opts, attempt)
     self.state = "idle"
     return
   end
-  self:analyzeAbort(deck)
   deck:load(track, function(d, ok, err)
     local S = self.settings
     if not ok then
       local permanent = startsWith(err, "Unsupported")
       log("! %s: load failed on deck %s: %s (%s)", self.id, d.id, track.name, tostring(err))
-      if permanent then                -- the player can never play it (the server remembers it)
-        self.learned[track.key] = self.learned[track.key] or {}
-        self.learned[track.key].unsupported = true
-      end
+      if permanent then self:figures(track.key).unsupported = true end   -- never playable (the server remembers it)
       self:removeTrack(track)          -- otherwise skipped until the next scan
       emit(self, permanent and "file_unsupported" or "file_failed", { file = track.name, dir = track.dir, status = tostring(err) })
       if attempt < 5 then
@@ -859,8 +847,7 @@ function Station:setAutomation(on, why)
   self:clearRequests()
   if not on then
     for _, d in ipairs(self.decks) do
-      if d.job then -- analyzing: off air, carries on
-      elseif d.state == "playing" or d.state == "fading" then self:fadeAndFinish(d, self.settings.stop_fade_s, "cut")
+      if d.state == "playing" or d.state == "fading" then self:fadeAndFinish(d, self.settings.stop_fade_s, "cut")
       elseif d.state == "loading" then d:stop() end
     end
     return self:goOff(why or "control")
@@ -891,9 +878,8 @@ end
 
 function Station:tick(t)
   local d1, d2, S = self.decks[1], self.decks[2], self.settings
-  d1:sample(t)
-  d2:sample(t)
-  self:analyzeTick(t)
+  d1:sample(t, S)
+  d2:sample(t, S)
   if not self.automation then return end
 
   local live, spot = self.live, self.spotDeck
@@ -935,49 +921,109 @@ function Station:statusLine()
   return self.id .. ": " .. self.state .. (tr and (" " .. tr.name) or "")
 end
 
--- ── ANALYZER: quiet start / end and average level of the files the server lists, on a deck that is off air ──
--- (its mixer input muted; the meter is before the mixer): the first K.scan_head_s, K.scan_body_s from the
--- middle (the average level), then the last K.scan_tail_s
-function Station:analyze(list, rev)
-  local an, todo, keep = self.an, {}, {}
-  for _, key in ipairs(list) do
-    if type(key) == "string" and #todo < K.analyze_max then todo[#todo + 1], keep[key] = key, true end
+-- ── ANALYZER: the Core's analysis players (CFG.ANALYZERS; routed nowhere, never a station's) measure the files the
+-- server lists for any station of this Core, at unity gain: the quiet start (the first K.scan_head_s), K.scan_body_s
+-- from the middle (the average level), then the last K.scan_tail_s. On-air decks are never touched.
+-- todo: the server's list ({ id, station, key }), worked through from pos; done[id]: measured from this list
+Analyzer = { id = "analysis", decks = {}, todo = {}, done = {}, rev = "", pos = 1, changed = 0, sentChanged = -1, stateAt = -1e9 }
+
+function Analyzer:can() return #self.decks > 0 end
+
+-- one CFG.ANALYZERS entry; taken[player] = the station that has it (or true: an analysis player already)
+function Analyzer:add(a, taken)
+  if type(a) ~= "table" or type(a.player) ~= "string" or a.player == "" then error("no player named", 0) end
+  local owner = taken[a.player]
+  if owner then error("player '" .. a.player .. "' is " .. (owner == true and "listed twice" or ("station " .. owner .. "'s")), 0) end
+  local ok, meter = pcall(Component.New, a.meter)
+  if not ok or not meter then error("meter '" .. tostring(a.meter) .. "' not found", 0) end
+  self.decks[#self.decks + 1] = Deck.new(self, a.player, a.player, meter, tostring(a.meter), a.meter_idx or 1)
+  taken[a.player] = true
+end
+
+-- boot: an entry that cannot be used is logged and left out (the stations never notice)
+function Analyzer:build(list, cfgs)
+  local taken = {}
+  for _, c in ipairs(cfgs) do for _, p in ipairs(type(c.players) == "table" and c.players or NONE) do taken[p] = c.id end end
+  for i, a in ipairs(type(list) == "table" and list or NONE) do
+    local ok, err = pcall(self.add, self, a, taken)
+    if not ok then log("! CFG.ANALYZERS[%d]: %s: left out", i, tostring(err)) end
   end
-  for key in pairs(an.done) do if not keep[key] then an.done[key] = nil end end   -- asked again later = analyze again
-  an.todo, an.rev, an.pos = todo, tostring(rev or ""), 1
-  self.rev = self.rev + 1
+  log("analysis: %d player(s)%s", #self.decks, self:can() and "" or ": files are not analyzed (figures are learned from plays)")
 end
 
--- may this deck analyze now? stopped: either deck; on air: the other deck, with time to spare before the next song
-function Station:analyzeFree(d, t)
-  if not d.mix or d.state ~= "idle" or d.job then return false end
-  if not self.automation then return self.state == "off" end
-  local live = self.live
-  return self.state == "playing" and d == self.other and live ~= nil and (live:remainingEst(t) or 0) > K.scan_need_s
-    and not (self.skipRequested or self.bumperRequested or self.adRequested)
-end
-
-function Station:analyzeStart(d, t)
-  local an, byKey, other = self.an, self.lib.byKey, self:otherDeck(d)
-  local busyKey = other.job and other.job.key
-  for i = an.pos, #an.todo do
-    local key = an.todo[i]
-    local tr = byKey[key]
-    if tr and not an.done[key] and key ~= busyKey then
-      local job = { key = key, track = tr, started = t }
-      d.job = job
-      set(d.mix, "Boolean", true)       -- off air before anything loads
-      d:load(tr, function(x, ok, err)
-        if x.job ~= job then return end
-        if not ok then return self:analyzeFinish(x, false, err) end
-        x:play(0, 0, 0)
-        job.phase = "head"
-      end)
-      return
-    elseif i == an.pos and not (tr and not an.done[key]) then
-      an.pos = i + 1                    -- measured, or gone until the next scan
+-- the server's list for this Core: { station, key } in the order to measure
+function Analyzer:list(list, rev)
+  local todo, keep = {}, {}
+  for _, e in ipairs(list) do
+    if type(e) == "table" and type(e.station) == "string" and type(e.key) == "string" and #todo < K.analyze_max then
+      local id = e.station .. "|" .. e.key
+      todo[#todo + 1], keep[id] = { id = id, station = e.station, key = e.key }, true
     end
   end
+  for id in pairs(self.done) do if not keep[id] then self.done[id] = nil end end   -- asked again later = analyze again
+  self.todo, self.rev, self.pos = todo, tostring(rev or ""), 1
+end
+
+-- measured (or given up): not again from this list. An id no longer listed is not marked: listed again later
+-- (Stop, then Analyze again; out of the first K.analyze_max and back), it is measured again
+function Analyzer:markDone(id)
+  local todo = self.todo
+  for i = 1, #todo do if todo[i].id == id then self.done[id] = true return end end
+end
+
+function Analyzer:busyWith(id)
+  local decks = self.decks
+  for i = 1, #decks do if decks[i].job and decks[i].job.id == id then return true end end
+  return false
+end
+
+-- an idle player takes the first listed file not measured yet nor on another player (of a station of this Core).
+-- A station whose build failed has no scanned library (its players' root is unknown): its files wait until it is built
+function Analyzer:start(d, t)
+  local todo = self.todo
+  for i = self.pos, #todo do
+    local e = todo[i]
+    local st = not self.done[e.id] and Radio.byId[e.station]
+    if st and st.built and not self:busyWith(e.id) then return self:begin(d, e, st, t) end
+    if i == self.pos and not st then self.pos = i + 1 end   -- measured, or not a station of this Core
+  end
+end
+
+-- the file's folder as this player sees it: its root is the station's players' root (normally Audio/), or one
+-- of the two roots is a folder of the other
+function Analyzer:dirFor(d, st, dir)
+  local mine, theirs = d:root(), st.lib.root
+  if mine == theirs then return dir end
+  if startsWith(theirs, mine) then return theirs:sub(#mine + 1) .. dir end
+  local sub = mine:sub(#theirs + 1)
+  if startsWith(mine, theirs) and startsWith(dir, sub) then return dir:sub(#sub + 1) end
+  return nil, "outside the analysis player's root " .. mine .. " (station " .. st.id .. "'s players' root is " .. theirs
+    .. "): give the analysis player the same root, normally Audio/"
+end
+
+-- a file its station does not list now (a load failed on air, or the list is a moment old) is tried all the same:
+-- the list never sticks
+function Analyzer:begin(d, e, st, t)
+  local tr = st.lib.byKey[e.key]
+  local job = { id = e.id, station = st.id, key = e.key, listed = tr ~= nil, S = st.settings, started = t }
+  if not tr then
+    local folder = e.key:match("^(.*/)") or ""
+    tr = { key = e.key, dir = folder, name = e.key:sub(#folder + 1) }
+  end
+  job.track, job.path = tr, st:mediaPath(tr.dir) .. tr.name
+  d.job, self.changed = job, self.changed + 1
+  local dir, err = self:dirFor(d, st, tr.dir)
+  if not dir then
+    d.warned = d.warned or {}
+    if not d.warned[st.id] then d.warned[st.id] = true; log("! %s: %s", d.id, err) end
+    return self:finish(d, false, err)
+  end
+  d:load(dir == tr.dir and tr or { key = tr.key, dir = dir, name = tr.name, kind = tr.kind }, function(x, ok, loadErr)
+    if x.job ~= job then return end
+    if not ok then return self:finish(x, false, loadErr) end
+    job.duration, job.phase = x.duration, "head"
+    x:play(0, 0, 0)                     -- unity gain: the figures are the file's own
+  end)
 end
 
 -- jump within the file being analyzed: times stay file positions; the meter settles before it counts again
@@ -986,9 +1032,9 @@ local function seek(d, t, pos)
   d.playStart, d.lastAudioAt, d.silentSince, d.settleUntil = t - pos, nil, nil, t + K.scan_settle_s
 end
 
-function Station:analyzeStep(d, t)
+function Analyzer:step(d, t)
   local j = d.job
-  if t - j.started > (d.duration or 0) + 30 then return self:analyzeFinish(d, false, "timed out") end
+  if t - j.started > (j.duration or 0) + K.scan_spare_s then return self:finish(d, false, "timed out") end   -- never stuck
   if not d.playStart or not (j.phase == "head" or j.phase == "body") then return end
   local played, dur = t - d.playStart, d.duration
   if j.phase == "head" then
@@ -1010,8 +1056,27 @@ function Station:analyzeStep(d, t)
   if pos > played + 1 then seek(d, t, pos) end   -- jump to the end (a short file just plays on)
 end
 
--- ok: played to its end; else err says why. Results go to the server, which keeps them
-function Station:analyzeFinish(d, ok, err)
+-- figures (ev.ok) or "never playable", at once, on every station of this Core that lists the file at path
+function Analyzer:share(path, ev, unsupported)
+  if not (ev.ok or unsupported) then return end
+  for _, st in ipairs(Radio.stations) do
+    local root = st:mediaPath("")
+    local key = startsWith(path, root) and path:sub(#root + 1)
+    local tr = key and st.lib.byKey[key]
+    if tr and unsupported then
+      st:figures(key).unsupported = true
+      st:removeTrack(tr)
+    elseif tr then
+      local L = st:figures(key)
+      if not L.fixed then L.lead, L.trail, L.analyzed = ev.lead_in, ev.trail, true end   -- final: plays don't learn over them
+      learnLevel(L, ev)
+    end
+  end
+end
+
+-- ok: played to its end; else err says why. The result goes to the server as the job's station's event (the
+-- server keeps it for the file); a listed file the player cannot play (Unsupported...) is also reported as such
+function Analyzer:finish(d, ok, err)
   local j = d.job
   local ev = { file = j.track.name, dir = j.track.dir, ok = ok and j.lead ~= nil, status = err }
   if ev.ok then
@@ -1020,29 +1085,60 @@ function Station:analyzeFinish(d, ok, err)
     ev.level, ev.level_s = j.level, j.levelS
     if not ev.level then ev.level, ev.level_s = d:level() end   -- no middle (a short file): everything heard
     if d.peakMax then ev.peak = round(d.peakMax, 1) end
-    local L = self.learned[j.key] or {}
-    self.learned[j.key] = L
-    if not L.fixed then L.lead, L.trail, L.analyzed = ev.lead_in, ev.trail, true end
-    learnLevel(L, ev)
   end
-  d.job, d.settleUntil = nil, nil
+  d.job, d.settleUntil, self.changed = nil, nil, self.changed + 1
+  self:markDone(j.id)
   d:stop()
-  self.an.done[j.key] = true
-  emit(self, "analysis", ev)
+  local st, never = Radio.byId[j.station], not ok and j.listed and startsWith(err, "Unsupported")
+  self:share(j.path, ev, never)
+  emit(st, "analysis", ev)
+  if never then emit(st, "file_unsupported", { file = ev.file, dir = ev.dir, status = err }) end
 end
 
--- give the deck back to the station (it is muted until its next on-air play)
-function Station:analyzeAbort(d)
-  if not d.job then return end
-  d.job, d.settleUntil = nil, nil
-  d:stop()
+function Analyzer:onDeckEnded(d) if d.job then self:finish(d, true) end end
+
+function Analyzer:deckTick(d, t)
+  local j = d.job
+  if j then
+    d:sample(t, j.S)
+    self:step(d, t)
+  elseif d.state == "idle" and self.pos <= #self.todo then
+    self:start(d, t)
+  end
 end
 
-function Station:analyzeTick(t)
-  local d1, d2 = self.decks[1], self.decks[2]
-  if self.an.pos > #self.an.todo and not (d1.job or d2.job) then return end
-  if d1.job then self:analyzeStep(d1, t) elseif self:analyzeFree(d1, t) then self:analyzeStart(d1, t) end
-  if d2.job then self:analyzeStep(d2, t) elseif self:analyzeFree(d2, t) then self:analyzeStart(d2, t) end
+-- every tick, whatever the stations do; an error fails that player's file (or passes a listed one): never every tick
+function Analyzer:tick(t)
+  local decks = self.decks
+  for i = 1, #decks do
+    local d = decks[i]
+    if not guard(self, "analysis", self.deckTick, self, d, t) then
+      local j = d.job
+      if not j then
+        self.pos = self.pos + 1
+      else
+        self:markDone(j.id)
+        if not guard(self, "analysis", self.finish, self, d, false, "error on the Core") then d.job = nil; pcall(Deck.stop, d) end
+      end
+    end
+  end
+end
+
+-- each analysis player for the server (the Library page): idle, or measuring a station's file
+function Analyzer:state()
+  local out = {}
+  for i, d in ipairs(self.decks) do
+    local j = d.job
+    out[i] = { name = d.id, state = j and "measuring" or "idle", station = j and j.station, key = j and j.key }
+  end
+  return out
+end
+
+function Analyzer:statusLine()
+  local parts, left = {}, 0
+  for i, d in ipairs(self.decks) do parts[i] = d.id .. " " .. (d.job and (d.job.station .. " " .. d.job.track.name) or "idle") end
+  for _, e in ipairs(self.todo) do if not self.done[e.id] then left = left + 1 end end
+  return "analysis: " .. table.concat(parts, ", ") .. ", " .. left .. " listed"
 end
 
 -- ── COMMANDS (from the web panel, via the server) ─────────────────────────────
@@ -1194,7 +1290,7 @@ end
 function Station:snapshot(t)
   local function deck(d)
     local info = trackInfo(d.track or d.pending) or {}
-    info.state, info.live, info.analyzing = d.state, (d == self.live) or nil, d.job and true or nil
+    info.state, info.live = d.state, (d == self.live) or nil
     if d.playStart and (d.state == "playing" or d.state == "fading") then
       info.elapsed, info.gain, info.trim = round(t - d.playStart, 1), d.playGain and round(d.playGain, 1), d.trim
       local rem = d:remainingEst(t)
@@ -1217,7 +1313,7 @@ function Station:snapshot(t)
     next_ad = trackInfo(self.nextAd), ad_requested = self.adRequested, tracks_since_ad = self.tracksSinceAd,
     ad_every = S.ad_every_n_tracks, ads_due = self.adPlan and #self.adPlan.due or 0,
     library = { music = #lib.music, imaging = #lib.imaging, ad = #lib.ad },
-    analyze = { can = self.decks[1].mix ~= nil, left = #self.an.todo },
+    analyze = { can = Analyzer:can() },
     settings = S, uptime = round(t - BOOT_T, 0), outbox = #Server.outbox,
   }
 end
@@ -1226,7 +1322,7 @@ end
 function Station:faultState(t)
   return { fault = self.fault, automation = false, state = "fault", retry_s = round(math.max(0, self.retryAt - t), 0),
            decks = {}, queue = {}, library = { music = 0, imaging = 0, ad = 0 }, settings = self.settings,
-           analyze = { can = namesMixer(self.cfg), left = #self.an.todo }, uptime = round(t - BOOT_T, 0), outbox = #Server.outbox }
+           analyze = { can = Analyzer:can() }, uptime = round(t - BOOT_T, 0), outbox = #Server.outbox }
 end
 
 -- ── SERVER: one sync request a second for every station, plus each station's library after a scan ────────
@@ -1323,7 +1419,6 @@ function Station:applyReply(r)
   if tonumber(r.ack_reset) then self.lastCmd = tonumber(r.ack_reset) end
   if type(r.settings) == "table" then self:applySettings(r.settings, r.settings_rev) end
   if type(r.ads) == "table" then self:applyAdPlan(r.ads, r.ads_rev) end
-  if type(r.analyze) == "table" then self:analyze(r.analyze, r.analyze_rev) end
   for _, c in ipairs(type(r.commands) == "table" and r.commands or NONE) do
     local id = type(c) == "table" and tonumber(c.id)
     if id and id > self.lastCmd then
@@ -1413,7 +1508,6 @@ function Station:syncPart(t)
     return part
   end
   local d = self.decks
-  part.analyze_rev = d[1].mix and self.an.rev or nil
   part.meters = { A = meterReadout(d[1]), B = meterReadout(d[2]) }
   if fresh then part.state = self:snapshot(t) end
   return part
@@ -1458,11 +1552,15 @@ function Server.sync()
     parts[i], sent[i] = part, { st = st, rev = st.rev, state = part.state ~= nil, events = part.events, dropped = part.dropped }
   end
   local body = { version = RADIO_VERSION, boot = BOOT_ID, core = coreName(), mem_kb = memKb(), stations = parts }
-  post("sync", "/api/v1/core/sync", body, function(code, data, httpErr) Server.synced(sent, t, code, data, httpErr) end)
+  local A, shown = Analyzer, nil                  -- the analysis players: their list's rev, and how they are (when that changed)
+  if A:can() then body.analyze_rev = A.rev end
+  if A.changed ~= A.sentChanged or t - A.stateAt >= K.state_every_s then body.analyzers, shown = A:state(), A.changed end
+  post("sync", "/api/v1/core/sync", body, function(code, data, httpErr) Server.synced(sent, shown, t, code, data, httpErr) end)
 end
 
--- the reply: each station's entry applied on its own; a station answered with { error } (or nothing) keeps its events
-function Server.synced(sent, t, code, data, httpErr)
+-- the reply: each station's entry applied on its own; a station answered with { error } (or nothing) keeps its events;
+-- the analysis list (top level) when it changed
+function Server.synced(sent, shown, t, code, data, httpErr)
   local resp = decoded(code, data)
   local replies = resp and resp.stations
   if type(replies) ~= "table" then
@@ -1504,6 +1602,8 @@ function Server.synced(sent, t, code, data, httpErr)
   end
   if kept then Server.outboxDirty = true end        -- events the server did not take: on disk, as in an outage
   if changed then Server.saveSettings() end
+  if shown then Analyzer.sentChanged, Analyzer.stateAt = shown, t end
+  if type(resp.analyze) == "table" and Analyzer:can() then guard(Analyzer, "analysis list", Analyzer.list, Analyzer, resp.analyze, resp.analyze_rev) end
 end
 
 -- settings.json: { stations = { [id] = { rev, settings } } } (a 1.x { rev, settings } is the first station's);
@@ -1532,13 +1632,14 @@ function Server.loadLocal(ids)
 end
 
 -- ── CORE: every station, the global timers ────────────────────────────────────
--- the arrays the timers walk: rebuilt only when a station is built or faulted
+-- the arrays the timers walk: rebuilt only when a station is built or faulted (the analysis players: always)
 function Radio.refresh()
   local byId, decks = {}, {}
   for _, st in ipairs(Radio.stations) do
     byId[st.id] = st
     if not st.fault then for _, d in ipairs(st.decks) do decks[#decks + 1] = d end end
   end
+  for _, d in ipairs(Analyzer.decks) do decks[#decks + 1] = d end
   Radio.byId, Radio.decks = byId, decks
 end
 
@@ -1571,17 +1672,29 @@ function Radio.tick()
       if not st.fault and st.backoff > K.retry_s and t - st.builtAt >= K.healthy_s then st.backoff = K.retry_s end   -- healthy again
     end
   end
+  if Analyzer.decks[1] then Analyzer:tick(t) end
 end
 
 function Radio.chores()
   local parts = {}
   for i, st in ipairs(Radio.stations) do parts[i] = st:statusLine() end
+  if Analyzer:can() then parts[#parts + 1] = Analyzer:statusLine() end
   log("heartbeat: Lua %s KB, outbox %d | %s", tostring(memKb()), #Server.outbox, table.concat(parts, " | "))
   Server.saveOutbox()
   pruneShared()
 end
 
 -- ── STARTUP ───────────────────────────────────────────────────────────────────
+-- a 2.0.0 entry's mixer inputs (mixer / mix): 2.0.0 left a deck's input muted after it analyzed, until that deck's
+-- next play on air; unmuted once here, never touched again
+local function unmute2(c)
+  local ok, mx = pcall(Component.New, c.mixer)
+  for _, i in ipairs(type(c.mix) == "table" and c.mix or { 1, 2 }) do
+    local ctl = ok and mx and control(mx, "input." .. tostring(i) .. ".mute.1")
+    if ctl then set(ctl, "Boolean", false) end
+  end
+end
+
 local function timer(name, fn, seconds)    -- seconds = nil: started later
   local tm = Timer.New()
   tm.EventHandler = function()
@@ -1601,14 +1714,20 @@ local function boot()
   BOOT_T = now()
   BOOT_ID = os.date("!%Y%m%dT%H%M%SZ") .. string.format("-%04x", math.random(0, 0xffff))
   DESIGN_NAME = tostring(info.DesignName or "core")
-  local cfgs, ids, seen = {}, {}, {}          -- every station needs an id of its own; a bad entry is skipped
+  local cfgs, ids, seen, mixers = {}, {}, {}, {}   -- every station needs an id of its own; a bad entry is skipped
   for i, c in ipairs(type(CFG.STATIONS) == "table" and CFG.STATIONS or NONE) do
     local id = type(c) == "table" and c.id
     if type(id) ~= "string" or id == "" then log("! CFG.STATIONS[%d] has no id: skipped", i)
     elseif seen[id] then log("! CFG.STATIONS[%d]: the id '%s' is taken: skipped", i, id)
-    else seen[id], cfgs[#cfgs + 1], ids[#ids + 1] = true, c, id end
+    else
+      seen[id], cfgs[#cfgs + 1], ids[#ids + 1] = true, c, id
+      if c.mixer ~= nil or c.mix ~= nil then mixers[#mixers + 1] = id; unmute2(c) end
+    end
   end
   if #cfgs == 0 then log("! CFG.STATIONS lists no station: nothing to play") end
+  if #mixers > 0 then   -- a 2.0.0 entry: analysis has its own players now
+    log("CFG.STATIONS: mixer / mix no longer used (%s; their inputs unmuted once): file analysis uses CFG.ANALYZERS", table.concat(mixers, ", "))
+  end
   local saved = Server.loadLocal(ids)
 
   Fast = timer("fast tick", function() Engine.fast() end)   -- started by Engine.wake() only while a deck fades or loads
@@ -1616,6 +1735,7 @@ local function boot()
   Sync = timer("sync", Server.sync, K.sync_s)
   Chores = timer("chores", Radio.chores, K.chores_s)
   for i, c in ipairs(cfgs) do Radio.stations[i] = Station.new(c, nil, saved[c.id]) end
+  Analyzer:build(CFG.ANALYZERS, cfgs)
   Radio.refresh()
   for _, st in ipairs(Radio.stations) do
     emit(st, "boot", { version = RADIO_VERSION, platform = tostring(info.Platform), design = DESIGN_NAME, core = coreName(),

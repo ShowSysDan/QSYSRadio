@@ -57,7 +57,10 @@ local function boot(spec)
   if spec.settings then writeFile(SETTINGS_FILE, spec.settings) end
   if spec.outbox then writeFile(OUTBOX_FILE, spec.outbox) end
   MockCore.serve(spec.server)
-  MockCore.loadRadio(function(cfg) cfg.SERVER_URL, cfg.STATIONS = "http://radio-server:5410", spec.stations end)
+  MockCore.loadRadio(function(cfg)
+    cfg.SERVER_URL, cfg.STATIONS = "http://radio-server:5410", spec.stations
+    if spec.analyzers then cfg.ANALYZERS = spec.analyzers end
+  end)
 end
 local function libraryPosts()
   local o = {}
@@ -74,7 +77,7 @@ do
   print("-- three stations play side by side; a fourth whose player is missing is faulted and retried")
   local wiring, cfg = MockCore.stations(4)
   local s4b = table.remove(wiring)                -- S4_B is not in the design yet
-  cfg[2].mixer = ""                               -- S2: no mixer, so no file analysis
+  local analyzers = MockCore.analyzers(1, wiring)
   cfg[5] = { id = "" }                            -- bad entries: skipped and logged, never a script error
   cfg[6] = { id = "S1", players = { "S1_A", "S1_B" }, meter = "S1_Meter" }
   cfg[7] = { id = "S5", players = { "S1_A", "S2_B" }, meter = "S1_Meter" }   -- another station's player
@@ -89,11 +92,12 @@ do
     S3 = { { id = 7, at = 500, cmd = "queue_add", args = { key = "Pop/Pop3 - Song003.mp3", position = "next" } } },
   } }
   for id, e in pairs(FILE_SETTINGS) do SRV.settings[id] = { rev = e.rev, values = e.settings } end
-  local got, gotAt, faultSeen, noFaultAfter, analyzeRev, memOk, partsOk = {}, {}, {}, {}, {}, true, true
+  local got, gotAt, faultSeen, noFaultAfter, memOk, partsOk = {}, {}, {}, {}, true, true
+  local analyzeRev = { top = 0, parts = 0 }
   local faultAnalyze = {}
   local settingsSent = {}
   boot{
-    players = wiring, stations = cfg, settings = { stations = FILE_SETTINGS },
+    players = wiring, stations = cfg, settings = { stations = FILE_SETTINGS }, analyzers = analyzers,
     dirs = { ["Rock/"] = songs("Rock", 12, 40, 9), ["Jazz/"] = songs("Jazz", 12, 50, 7), ["Pop/"] = songs("Pop", 12, 35, 11),
              ["Lounge/"] = songs("Lounge", 8, 45, 5),
              ["Imaging/"] = { { name = "id1.wav", duration = 5, level = -6 }, { name = "id2.wav", duration = 4, level = -6 } },
@@ -107,7 +111,8 @@ do
           faultSeen[id], faultAnalyze[id] = faultSeen[id] or part.state.fault, faultAnalyze[id] or part.state.analyze or false
         end
         if part.state and not part.state.fault and faultSeen[id] then noFaultAfter[id] = t end
-        if part.analyze_rev ~= nil then analyzeRev[id] = true end
+        if part.analyze_rev ~= nil then analyzeRev.parts = analyzeRev.parts + 1 end
+        if id == "S1" and type(body.analyze_rev) == "string" then analyzeRev.top = analyzeRev.top + 1 end
         if t >= 300 and t < 330 and id == "S2" then return "garbage" end            -- not a reply at all: its events stay
         if t >= 300 and t < 330 and id == "S3" then return { error = "boom" } end   -- the server failed this station's part
         for _, e in ipairs(part.events or {}) do
@@ -196,8 +201,8 @@ do
   check(s4Starts[1] and s4Starts[1].at >= 90 and s4Starts[1].at < 94 and not st.S4.fault,
     string.format("once its player exists it is rebuilt at the next retry (60 s later) and plays (first song at t=%s)", s4Starts[1] and s4Starts[1].at or "-"))
   check(faultSeen.S4 and faultSeen.S4:find("S4_B", 1, true) and noFaultAfter.S4, "a faulted station still syncs: its state reports the fault, then clears")
-  check(faultAnalyze.S4 and faultAnalyze.S4.can == true and faultAnalyze.S5 and faultAnalyze.S5.can == false,
-    "a faulted station's state still says whether its CFG entry names a mixer (S4 yes, S5 no): the Music page names the fault, not the CFG")
+  check(faultAnalyze.S4 and faultAnalyze.S4.can == true and faultAnalyze.S5 and faultAnalyze.S5.can == true,
+    "a faulted station's state still says this Core can analyze (S4, S5): the Music page names the fault, not the CFG")
   local s1Fault = delivered("station_fault", "S1")
   local s1Rebuilt = delivered("station_rebuilt", "S1")
   local s1Back = delivered("track_start", "S1", 200)
@@ -253,7 +258,7 @@ do
   check(table.concat(ran, " ") == "S2#7 S2#8 S3#7" and queued[1] and queued[1].file == "Pop3 - Song003.mp3",
     "each station acknowledges its own commands (the same id on two stations: " .. table.concat(ran, " ") .. ")")
   check(memOk and partsOk, "every sync body: core, boot, mem_kb; each station's part: ack, revs, its own events")
-  check(analyzeRev.S1 and analyzeRev.S3 and not analyzeRev.S2, "analyze_rev only from stations with a mixer")
+  check(analyzeRev.top > 600 and analyzeRev.parts == 0, "analyze_rev once per sync body (the Core's analysis player), never in a station's part")
   local rock = true
   for i, tr in ipairs(st.S1.lib.music) do if st.S4.lib.music[i] ~= tr then rock = false end end
   check(rock and #st.S1.lib.music == 12 and st.S1.lib.music ~= st.S4.lib.music, "a rebuilt station shares the folder's records again")
@@ -272,7 +277,7 @@ end
 do
   print("-- a long outage: the outbox stays bounded; every station's events arrive afterwards, shared fairly")
   local OUT_FROM, OUT_TO = 20, 20 + 4500
-  local wiring, cfg = MockCore.stations(5, { noMixer = true })
+  local wiring, cfg = MockCore.stations(5)
   local short = {}
   for id in pairs({ S1 = 1, S2 = 1, S3 = 1, S4 = 1, S5 = 1 }) do short[id] = { rev = "s", settings = { music_dir = "Short/", imaging_dir = "",
     crossfade_s = 1, bumper_every_n_tracks = 0, artist_separation = 0 } } end
@@ -377,7 +382,7 @@ end
 do
   print("-- a station's folder changes again and again: it keeps figures only for the files it lists now; a library")
   print("   reply for an older listing is not taken (2.0.0 dev kept every file it had ever seen)")
-  local wiring, cfg = MockCore.stations(2, { noMixer = true })
+  local wiring, cfg = MockCore.stations(2)
   local function folder(f) return { music_dir = "F" .. f .. "/", imaging_dir = "", bumper_every_n_tracks = 0 } end
   local dirs = { ["Keep/"] = songs("Keep", 8, 30) }
   for f = 1, 6 do dirs["F" .. f .. "/"] = songs("F" .. f .. "x", 8, 30) end
@@ -437,9 +442,10 @@ end
 do
   print("-- hours of play: Lua memory does not grow")
   local wiring, cfg = MockCore.stations(3)
+  local analyzers = MockCore.analyzers(1, wiring)
   local plays, analyzed, cmdId = 0, 0, 0
   boot{
-    players = wiring, stations = cfg, seed = 11,
+    players = wiring, stations = cfg, seed = 11, analyzers = analyzers,
     settings = { stations = {
       S1 = { rev = "m", settings = { music_dir = "A/", imaging_dir = "I/", ads_dir = "Ads/", ad_every_n_tracks = 4, bumper_every_n_tracks = 3 } },
       S2 = { rev = "m", settings = { music_dir = "B/", imaging_dir = "I/", bumper_every_n_tracks = 2, fade_in_s = 1 } },
@@ -461,12 +467,15 @@ do
         if part.station == "S1" and part.ads_rev ~= "p" .. slot then
           reply.ads, reply.ads_rev = { due = {}, mix = { "Ads/ad1.wav", "Ads/ad2.wav" }, next = "A/A3 - Song003.mp3", next_why = "rotation" }, "p" .. slot
         end
-        local hour = math.floor(t / 3600)                         -- every hour: two other files to analyze
-        if part.station == "S1" and part.analyze_rev ~= "z" .. hour then
-          local a, b = hour % 2 * 2 + 1, hour % 2 * 2 + 2
-          reply.analyze, reply.analyze_rev = { string.format("A/A%d - Song%03d.mp3", a % 7, a), string.format("A/A%d - Song%03d.mp3", b % 7, b) }, "z" .. hour
-        end
         return reply
+      end,
+      core = function(body)                                       -- every hour: two other files to analyze (S1's, S2's)
+        local hour = math.floor(MockCore.clock / 3600)
+        if body.analyze_rev ~= "z" .. hour then
+          local a = hour % 2 * 2 + 1
+          return { analyze = { { station = "S1", key = string.format("A/A%d - Song%03d.mp3", a % 7, a) },
+                               { station = "S2", key = string.format("B/B%d - Song%03d.mp3", (a + 1) % 7, a + 1) } }, analyze_rev = "z" .. hour }
+        end
       end,
     },
   }

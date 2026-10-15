@@ -16,14 +16,16 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 - Tell the user what to redeploy: the Core (paste radio.lua), the server
   (`git pull && sudo systemctl restart qsysradio`), both, or neither.
 - No duplicated code: reuse the helpers (Lua: `push`, `shuffled`, `set`/`trigger`,
-  `readJson`/`writeJson`, `timer`, `post`, `emit(st, kind, data)`, `guard`;
+  `readJson`/`writeJson`, `timer`, `post`, `emit(st, kind, data)`, `guard`,
+  `Station:figures(key)`;
   Python: `db.text`, `db.number`, `db.clean_json`, `db.like`, `db.iso`,
   `db.lock_station`, `dbconn()`, `write_logs`, `core_settings.effective`, `media.file_of` /
   `media.supported` (per-file figures live in `media_files`; read them
   through the view `library_figures`), `ads.stale` (call it in the
   transaction of any change a station's ads plan is made from, which took
-  `db.lock_station` first),
-  `cores.seen`; JS: `Radio.api/post/command/setHTML/esc/num/status`).
+  `db.lock_station` first), `analysis.stale` (the same for a Core's list
+  of files to analyze), `cores.seen`; JS:
+  `Radio.api/post/command/setHTML/esc/num/status`).
 
 ## radio.lua: keep it slim and light
 - Real time only. Anything that can live on the server does.
@@ -34,8 +36,10 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   `FILES`, not settings.
 - No header essays; one-line comments only where the line needs one.
 - Overhead budget, for every station together: one 250 ms timer (`Tick`
-  loops over the prebuilt `Radio.stations`); the 50 ms `Fast` timer only
-  while a deck fades or loads (`Engine.wake()`, loops over `Radio.decks`);
+  loops over the prebuilt `Radio.stations`, then `Analyzer:tick` over the
+  analysis players); the 50 ms `Fast` timer only while a deck fades or
+  loads (`Engine.wake()`, loops over `Radio.decks`: every station's decks
+  and the analysis players);
   one sync request per second for all stations (plus one library part at a
   time after a scan); control objects cached in `Deck.new`; panel writes
   only on change; files written only from `Chores` (every 30 s) or once per
@@ -86,11 +90,11 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 
 ## Core <-> server protocol
 - `POST /api/v1/core/sync` (≈1/s, X-Radio-Token), ONE request for all the
-  Core's stations: `{version, boot, core, mem_kb, stations: [{station, ack,
-  settings_rev, ads_rev, analyze_rev?, meters, state?, events?, dropped?}]}`;
-  reply `{stations: {id: {commands, settings, settings_rev, ads, ads_rev,
-  analyze, analyze_rev, ack_reset, accepted, duplicates, rejected} |
-  {error}}}`. Events (station, boot, seq unique; stored once, each in a
+  Core's stations: `{version, boot, core, mem_kb, analyze_rev?, analyzers?,
+  stations: [{station, ack, settings_rev, ads_rev, meters, state?, events?,
+  dropped?}]}`; reply `{stations: {id: {commands, settings, settings_rev,
+  ads, ads_rev, ack_reset, accepted, duplicates, rejected} | {error}},
+  analyze?, analyze_rev?}`. Events (station, boot, seq unique; stored once, each in a
   savepoint; at most `K.sync_batch` per request, shared round-robin);
   optional state (with `fault` when faulted); command ack; `meters` (each
   deck's gain, peak, rms; kept on `stations` for the panel). Server: one
@@ -104,8 +108,9 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   leak warning. One advisory lock per station (`db.lock_station`)
   serialises the sync and EVERY web write to that station's rows (commands,
   holds, IDs, ad rules, settings, analysis, figures): take it first, before
-  touching any row (All stations: every station's, in name order). Lua
-  sends `{}` for an empty table: accept `{}` where a list is expected.
+  touching any row (All stations: every station's, in name order; a Core's
+  analysis run: every station of that Core, in name order, then its `cores`
+  row). Lua sends `{}` for an empty table: accept `{}` where a list is expected.
 - `POST /api/v1/core/library` after every scan, in parts of at most
   `K.library_chunk` (1000) items: `{station, boot, scan, part, parts,
   music_dir, imaging_dir, ads_dir, items}`, one upload in flight per Core.
@@ -121,11 +126,22 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   seconds-weighted energy average (`events.LEVEL_SET`) and the highest peak.
   The Core plays each item at its kind's gain + `levelTrim`; fades start from
   the deck's current gain, never from 0 dB.
-- File analysis (`analysis.py`): the server sends `analyze` [keys] when `analyze_rev` differs
-  (only for a station that sends `analyze_rev`, i.e. has a `mixer` in its CFG entry); the Core measures
-  them on the off-air deck (its mixer input muted; every on-air `Deck:play` unmutes) and
-  reports `analysis` events. Analyzed figures are final (plays don't learn over them); a failure is
-  retried by the next run, never the same one; one file (`analyze_wanted`) goes without a run.
+- File analysis (`analysis.py`) is per Core, on its own analysis players (`CFG.ANALYZERS`: an
+  Audio Player + a peak/rms meter channel, routed to no output; `Analyzer` in radio.lua, its decks
+  are `Deck` objects of no station). On-air decks never analyze (no mixer, no take-over). The body
+  carries top-level `analyze_rev` (only with an analysis player) and `analyzers` [{name, state,
+  station?, key?}] (when changed or every 10 s; kept on `cores.analyzers`); the reply carries
+  top-level `analyze` [{station, key}] (at most 20, in the order to measure) and `analyze_rev` when
+  the rev differs. The list is cached on the `cores` row (`owed`, made again on a result, on
+  `analysis.stale()`, or after 60 s), built after the stations' parts in its own transaction.
+  Results are `analysis` events in the named station's part. The job (`cores.analyze_from`,
+  `analyze_run_at`, `analyze_auto_at`) and the setting `analyze_at` ('right away' (default; a
+  failure retried after 24 h) / 'HH:00' / 'off') are the Core's: All stations only. Analyzed
+  figures are final (plays don't learn over them); a failure is retried by the next run, never
+  the same one; one file (`analyze_wanted`) goes without a run. A pre-2.1 Core (per-station
+  `analyze_rev`) gets `analyze: []` once, then nothing; a 1.x station's run stays on its
+  `stations.analyze_*` columns until its first 2.x sync (`analysis.adopt`). A Core without an
+  analysis player owes nothing (`analysis.run_of` gives `can` False).
 - Ads: the server sends `ads` {due, mix, next, next_why, ident, no_bumpers} when `ads_rev` differs
   (`ads.py`); the Core only plays the plan (without one, every ad is a mix-in). The plan
   is cached per station (`ads.cached_plan`: made again when the station's events were

@@ -4,11 +4,13 @@ standing in for the Q-SYS runtime (players, meters, mixers, media folders) and
 real HTTP for the Core's HttpClient. For demos and end-to-end testing of the web
 control panel without a Core.  Needs: pip install lupa
 
-    python3 qsys/test/live_core.py --server http://127.0.0.1:5410 [--token T] [--station Main] [--stations 3]
+    python3 qsys/test/live_core.py --server http://127.0.0.1:5410 [--token T] [--station Main] [--stations 3] [--analyzers 1]
 
 Ctrl-C to stop. One simulated Core runs --stations two-player stations (ids
 Main, Main-2, Main-3, ...), all on the same small library of fictional songs,
-bumpers and ads with realistic lengths; --speed 4 runs the clock four times faster.
+bumpers and ads with realistic lengths, and --analyzers analysis players
+(Analysis_Player, Analysis_Player2, ...; 0 = none: no file analysis); --speed 4
+runs the clock four times faster.
 """
 import argparse
 import os
@@ -72,6 +74,7 @@ def main():
     ap.add_argument('--station', default='Main', help="the first station's id; the others get -2, -3, ...")
     ap.add_argument('--stations', type=int, default=1, help='how many stations this Core runs')
     ap.add_argument('--core', default='', help='CFG.CORE_ID ("" = the design name, "mock")')
+    ap.add_argument('--analyzers', type=int, default=1, help='analysis players on this Core (0 = no file analysis)')
     ap.add_argument('--speed', type=float, default=1.0)
     args = ap.parse_args()
     ids = [args.station] + [f'{args.station}-{i}' for i in range(2, max(1, args.stations) + 1)]
@@ -84,8 +87,9 @@ def main():
     L = lupa.LuaRuntime(unpack_returned_tuples=True)
     L.execute('dofile("qsys/test/mock_core.lua")')
     g = L.globals()
-    g.LIVE_LIBRARY, g.LIVE_IDS = L.execute(LIBRARY), L.table(*ids)
+    g.LIVE_LIBRARY, g.LIVE_IDS, g.LIVE_N_ANALYZERS = L.execute(LIBRARY), L.table(*ids), max(0, args.analyzers)
     L.execute('LIVE_WIRING, LIVE_STATIONS = MockCore.stations(#LIVE_IDS, { ids = LIVE_IDS }); '
+              'LIVE_ANALYZERS = MockCore.analyzers(LIVE_N_ANALYZERS, LIVE_WIRING); '
               'MockCore.setup{ seed = os.time(), dirs = LIVE_LIBRARY, players = LIVE_WIRING }')
 
     done = queue.Queue()
@@ -110,10 +114,11 @@ def main():
     # CFG before radio.lua boots; the folders of the simulated library are every station's fallback
     L.execute('MockCore.loadRadio(function(cfg) '
               'cfg.SERVER_URL, cfg.SERVER_TOKEN, cfg.CORE_ID, cfg.STATIONS = LIVE_SERVER, LIVE_TOKEN, LIVE_CORE, LIVE_STATIONS; '
+              'cfg.ANALYZERS = LIVE_ANALYZERS; '
               'SETTINGS.music_dir, SETTINGS.imaging_dir, SETTINGS.ads_dir = "Music/", "Imaging/", "Ads/" end)')
     run = L.eval('MockCore.run')
     step = 0.05
-    print(f'simulated Core ({", ".join(ids)}) -> {args.server} (Ctrl-C to stop)')
+    print(f'simulated Core ({", ".join(ids)}; {max(0, args.analyzers)} analysis player(s)) -> {args.server} (Ctrl-C to stop)')
     nxt = time.monotonic()
     try:
         while True:

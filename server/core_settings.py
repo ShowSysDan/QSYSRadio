@@ -4,7 +4,8 @@ page, pushed to the Core on its next sync.
 Three layers, the most specific wins: radio.lua's fallback (its SETTINGS
 table; the `default` column below must match it) <- All stations (app_settings
 key 'core.<name>') <- this station (station_settings). Each layer stores only
-what differs. The folders (STATION_ONLY) are never set for all stations. The
+what differs. The folders (STATION_ONLY) are never set for all stations; what
+applies to a whole Core (ALL_ONLY: file analysis) never per station. The
 Core reports the values it is running, which the settings page shows next to
 each field.
 """
@@ -12,6 +13,8 @@ import hashlib
 import json
 import math
 import re
+
+RIGHT_AWAY = 'right away'      # analyze_at: each new file as soon as the Core's analysis player is free
 
 # name, label, group, type, min, max, step, radio.lua default, help
 # (types: int, float, dir, choice (min holds the choices); logs.spec() adds host and name)
@@ -81,11 +84,13 @@ SPEC = [
     ('fade_out_drop_db', 'Fade-out level', 'Silence detection', 'float', 6, 40, 1, 20,
      'The end counts as faded once it stays this far below the file\'s own peak for half a second (dB).'),
 
-    ('analyze_at', 'Analyze new files daily at', 'Silence detection', 'choice',
-     ('off',) + tuple(f'{h:02d}:00' for h in range(24)), None, None, '04:00',
-     'Each day at this time (server time) the Core measures the quiet start, end and average level of every file not analyzed yet, '
-     'on the deck that is off air (its input on the station\'s mixer muted), between songs. An analyzed quiet start and end are final: '
-     'plays no longer learn over them (the level keeps learning). The library pages can also start a run.'),
+    ('analyze_at', 'Analyze new files', 'Silence detection', 'choice',
+     (RIGHT_AWAY, 'off') + tuple(f'{h:02d}:00' for h in range(24)), None, None, RIGHT_AWAY,
+     'The Core\'s analysis player (CFG.ANALYZERS in radio.lua: an Audio Player of its own, routed to no output; nothing on air is '
+     'touched) measures the quiet start, end and average level of each file, at any hour. Right away: new files within minutes '
+     '(one that fails is tried again a day later). 00:00 to 23:00: each day at this time (server time), every file not analyzed yet. '
+     'Off: only when a library page starts it. An analyzed quiet start and end are final: plays no longer learn over them (the '
+     'level keeps learning). One setting for every station of the Core: set for All stations only.'),
 
     ('artist_separation', 'Artist separation', 'Rotation', 'int', 0, 20, 1, 2,
      'Avoid repeating an artist within the last N songs.'),
@@ -106,6 +111,7 @@ DEFAULTS = {s[0]: s[7] for s in SPEC}
 REQUIRED = {'music_dir'}
 SERVER_ONLY = {'ad_fit_tolerance_s', 'ident_schedule', 'ident_window_min', 'analyze_at'}   # the server's own; not sent to the Core
 STATION_ONLY = {'music_dir', 'imaging_dir', 'ads_dir'}      # each station its own folders; never set for all stations
+ALL_ONLY = {'analyze_at'}       # the whole Core's (its analysis players serve every station on it): never set per station
 PREFIX = 'core.'
 
 
@@ -170,13 +176,14 @@ def load(cur, prefix=PREFIX, by_name=None):
 
 
 def layers(cur, station=None):
-    """(All stations, the station's own) values, in one query; the folders only ever from the station's own."""
+    """(All stations, the station's own) values, in one query; the folders only ever from the station's own, the
+    whole Core's settings (ALL_ONLY) only ever from All stations."""
     cur.execute("""SELECT FALSE AS own, substr(key, %s) AS name, value FROM app_settings WHERE key LIKE %s
                    UNION ALL SELECT TRUE, name, value FROM station_settings WHERE station = %s""",
                 (len(PREFIX) + 1, PREFIX + '%', station))
     rows = cur.fetchall()
     return (_decode((r['name'], r['value']) for r in rows if not r['own'] and r['name'] not in STATION_ONLY),
-            _decode((r['name'], r['value']) for r in rows if r['own']))
+            _decode((r['name'], r['value']) for r in rows if r['own'] and r['name'] not in ALL_ONLY))
 
 
 def layer(cur, station=None):
@@ -191,7 +198,8 @@ def merged(cur, station):
 
 
 def effective(cur, station):
-    """Every station setting in force for this station (the server's reads: ads, IDs, analysis, forecast)."""
+    """Every station setting in force for this station (the server's reads: ads, IDs, forecast); station None:
+    the All-stations values (the whole Core's: analysis)."""
     return {**DEFAULTS, **merged(cur, station)}
 
 

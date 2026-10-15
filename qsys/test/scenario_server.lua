@@ -1,7 +1,9 @@
 -- Scenario: play log delivery to the app server. The server is down (timeouts,
 -- then 503s) from t=30 to t=120; events must queue in the outbox, persist to
 -- outbox.json, and all arrive once it is back (in the batched sync: each
--- station's events in its own part of the body). Run with run_mock.py.
+-- station's events in its own part of the body; the Core's own fields at the
+-- top: analyze_rev, its analysis players, the analysis list in the reply).
+-- Run with run_mock.py.
 -- Set MOCK_EVENTS_OUT=/path.json to also write every POST body (for feeding a
 -- real server in an integration test).
 dofile("qsys/test/mock_core.lua")
@@ -25,7 +27,9 @@ MockCore.setup{
 }
 
 local bodies = {}
+local q = MockCore.analysisQueue({ { station = "Main", key = "Test/Imaging/bumper_01.wav" }, { station = "Main", key = "Test/Tuning/Alpha - One.flac" } })
 MockCore.serve{
+  core = q.core,
   down = function()
     local t = MockCore.clock
     if t >= 30 and t < 80 then return 0, "", "timeout" end
@@ -90,6 +94,20 @@ local ts = nil
 for _, ev in pairs(got) do if ev.kind == "track_start" then ts = ev; break end end
 check(ts and ts.boot == BOOT_ID and ts.t and ts.file and ts.dir and ts.title and ts.duration,
   "track_start carries boot, seq, t, file, dir, title, duration")
+local topOk, measuring, idle = true, false, false
+for _, h in ipairs(MockCore.http) do
+  if h.req.Url:match("/core/sync$") then
+    local d = json.decode(h.req.Data)
+    if type(d.analyze_rev) ~= "string" or d.stations[1].analyze_rev ~= nil then topOk = false end
+    local a = d.analyzers and d.analyzers[1]
+    if a and a.name == "Analysis_Player" and a.state == "measuring" and a.station == "Main" and a.key then measuring = true end
+    if a and a.name == "Analysis_Player" and a.state == "idle" and a.station == nil and a.key == nil then idle = true end
+  end
+end
+check(topOk and measuring and idle, "the body's top: analyze_rev, and each analysis player (idle, or measuring a station's file)")
+local an1, an2 = q.results["Main|Test/Imaging/bumper_01.wav"], q.results["Main|Test/Tuning/Alpha - One.flac"]
+check(an1 and an1.ok and an2 and an2.ok and #q.owed == 0 and an1.station == "Main" and an1.lead_in and an2.level,
+  "the analysis list from the reply's top: both files measured, each result in the station's part")
 
 local out = os.getenv("MOCK_EVENTS_OUT")
 if out then

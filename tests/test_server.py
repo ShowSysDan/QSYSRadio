@@ -249,7 +249,7 @@ def test_web_writes_take_the_station_lock_first(app, writer):
              {'key': 'Ads/a.wav', 'dir': 'Ads/', 'file': 'a.wav', 'kind': 'ad'},
              {'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music'}]
     assert library_post(app, st, items, ads_dir='Ads/').status_code == 200
-    sync(app, station=st, state=STATE, analyze_rev='')
+    batch(app, {'station': st, 'state': STATE}, core=f'{st}CORE', analyze_rev='')       # on a Core: a run is the Core's
     sql("""UPDATE qsr_test.media_files SET lead_in_s = 1.5 WHERE id IN (SELECT file_id FROM qsr_test.library WHERE station = %s);
            UPDATE qsr_test.library SET analyze_wanted = TRUE WHERE station = %s""", (st, st))
     who, path, body = WRITERS[writer]
@@ -520,6 +520,12 @@ def test_every_song_gets_played_end_to_end(app, tmp_path, monkeypatch):
         core, scan = sql("SELECT core, scan FROM qsr_test.stations WHERE station = 'E2E'", fetch=True)[0]
         assert core and scan and not scan.startswith('whole-'), (core, scan)
         assert sql('SELECT mem_kb > 0 FROM qsr_test.cores WHERE core = %s', (core,), fetch=True)[0][0]
+    if 'ANALYZERS' in src:           # 2.1: its analysis player measured files (new files right away) while it played
+        analyzed = sql("""SELECT count(*) FILTER (WHERE analyzed_at IS NOT NULL), count(*) FROM qsr_test.library_figures
+                           WHERE station = 'E2E' AND present""", fetch=True)[0]
+        assert analyzed[0] >= 5, f'{analyzed[0]} of {analyzed[1]} files analyzed'
+        players = sql('SELECT analyzers FROM qsr_test.cores WHERE core = %s', (core,), fetch=True)[0][0]
+        assert [p['name'] for p in players] == ['Analysis_Player'], players
 
 
 def test_three_stations_on_one_core_end_to_end(app, tmp_path, monkeypatch):
@@ -572,7 +578,7 @@ def test_three_stations_on_one_core_end_to_end(app, tmp_path, monkeypatch):
     assert sql("SELECT count(*) FROM qsr_test.library WHERE station = 'ME1' AND present", fetch=True)[0][0] == 1100
     now = signed_in(app, 'viewer').get('/api/v1/now?station=ME3').json
     assert 'Missing_Player' in now['station']['state']['fault'] and now['station']['online']
-    assert now['station']['analysis']['can'] is True        # its mixer is in its CFG entry: the fault is the reason, not the CFG
+    assert isinstance(now['station']['analysis']['players'], list)      # the Core reports its analysis players (2.1)
     assert sql("SELECT mem_kb > 0 FROM qsr_test.cores WHERE core = 'E2ECORE'", fetch=True)[0][0]
 
 
@@ -707,76 +713,298 @@ def test_average_level_and_deck_readout(app):
     assert op.get('/api/v1/now?station=LV1').json['station']['meters'] is None
 
 
+def analyzer_sync(app, *parts, core='AC1', rev='', players=('Analysis_Player',), **body):
+    """A 2.1 Core with analysis players: its stations' parts, its list's rev and its players' report."""
+    body.setdefault('analyzers', [{'name': p, 'state': 'idle'} for p in players])
+    return batch(app, *parts, core=core, analyze_rev=rev, **body)
+
+
+def all_stations(app, **settings):
+    """Save settings for All stations (None: back to the default)."""
+    r = signed_in(app, 'admin').post('/api/v1/settings', json={'settings': settings}, headers=WEB)
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+
 def test_file_analysis_job(app):
+    """The job is the Core's (its analysis players measure files for every station on it): a run started on a
+    library page, the results (final figures) in the reply to the sync that brings them, a failure waiting for
+    the next run, one file again, a changed file, Stop, the daily run."""
     items = [{'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music', 'size': 1},
              {'key': 'M/b.mp3', 'dir': 'M/', 'file': 'b.mp3', 'kind': 'music', 'size': 2},
              {'key': 'I/c.wav', 'dir': 'I/', 'file': 'c.wav', 'kind': 'imaging', 'size': 3}]
     library_post(app, 'AN1', items)
-    sql("""INSERT INTO qsr_test.app_settings (key, value) VALUES ('core.analyze_at', '"off"')
-           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""")
     op, viewer = signed_in(app, 'operator'), signed_in(app, 'viewer')
     analyze = lambda c, **b: c.post('/api/v1/analyze', json=dict(station='AN1', **b), headers=WEB)
-    state = dict(STATE, analyze={'can': True, 'left': 0})
-    assert 'analyze' not in sync(app, station='AN1', analyze_rev='', state=state).json          # no job: nothing to do
-    assert op.get('/api/v1/now?station=AN1').json['station']['analysis'] == {
-        'active': False, 'left': 0, 'never': 3, 'failed': 0, 'can': True, 'auto_at': None, 'at': 'off', 'last': None}
-    assert analyze(viewer, scope='new').status_code == 403
-    assert analyze(op, scope='bogus').status_code == 400
-    assert analyze(op, scope='new').status_code == 200
-    r = sync(app, station='AN1', analyze_rev='').json
-    assert r['analyze'] == ['I/c.wav', 'M/a.mp3', 'M/b.mp3'] and r['analyze_rev']       # short files first
-    assert 'analyze' not in sync(app, station='AN1', analyze_rev=r['analyze_rev']).json  # unchanged: not resent
-    assert 'analyze' not in sync(app, station='AN1').json                                # a Core without the mixer
-    # results: figures replace what plays learned, and plays no longer learn over them
-    sync(app, station='AN1', events=[
-        ev(1, 'track_start', deck='A', file='a.mp3', dir='M/', duration=200.0),
-        ev(2, 'track_end', deck='A', file='a.mp3', dir='M/', reason='end', lead_in=3.0, trail=9.0),
-        ev(3, 'analysis', file='a.mp3', dir='M/', ok=True, lead_in=0.4, trail=1.5, duration=201.0),
-        ev(4, 'analysis', file='c.wav', dir='I/', ok=False, status='Unsupported format'),
-        ev(5, 'track_start', deck='B', file='a.mp3', dir='M/', duration=201.0),
-        ev(6, 'track_end', deck='B', file='a.mp3', dir='M/', reason='end', lead_in=2.0, trail=0.2)])
-    row = sql("SELECT lead_in_s, trail_s, duration_s, analyzed_at IS NOT NULL FROM qsr_test.library_figures "
-              "WHERE station='AN1' AND key='M/a.mp3'", fetch=True)[0]
-    assert tuple(row) == (0.4, 1.5, 201.0, True)
-    assert library_post(app, 'AN1', items).json['learned']['M/a.mp3'] == {'trail': 1.5, 'lead': 0.4, 'analyzed': True}
-    r = sync(app, station='AN1', analyze_rev=r['analyze_rev']).json
-    assert r['analyze'] == ['M/b.mp3']                                     # a failed file waits for the next run
-    now = op.get('/api/v1/now?station=AN1').json['station']['analysis']
-    assert (now['active'], now['left'], now['never'], now['failed'], now['can']) == (True, 1, 2, 1, True)
-    assert now['last']                                                     # the latest result: library pages reload on it
-    rows = {i['key']: i for i in op.get('/api/v1/library?station=AN1&only=not_analyzed').json['items']}
-    assert set(rows) == {'M/b.mp3', 'I/c.wav'}
-    assert rows['M/b.mp3']['analyze_queued'] is True and rows['I/c.wav']['analyze_queued'] is False
-    assert rows['I/c.wav']['analyze_error'] == 'Unsupported format' and rows['I/c.wav']['analyze_failed_at']
-    sync(app, station='AN1', events=[ev(7, 'analysis', file='b.mp3', dir='M/', ok=True, lead_in=0.1, trail=0.3, duration=100.0)])
-    r = sync(app, station='AN1', analyze_rev=r['analyze_rev']).json
-    assert r['analyze'] == [] and r['analyze_rev'] == ''                   # done: the Core's list is cleared
-    assert sql("SELECT analyze_from FROM qsr_test.stations WHERE station='AN1'", fetch=True)[0][0] is None
-    # one file again; a changed file is owed again; re-analyze all; stop
-    assert analyze(op, key='M/nope.mp3').status_code == 400
-    assert analyze(op, key='M/b.mp3').status_code == 200               # just that file: no run, keeps its figures
-    assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['M/b.mp3']
-    assert sql("SELECT analyzed_at IS NOT NULL FROM qsr_test.library_figures WHERE station='AN1' AND key='M/b.mp3'",
-               fetch=True)[0][0]
-    now = op.get('/api/v1/now?station=AN1').json['station']['analysis']
-    assert (now['active'], now['left']) == (True, 1)
-    rows = {i['key']: i for i in op.get('/api/v1/library?station=AN1').json['items']}
-    assert rows['M/b.mp3']['analyze_queued'] is True and rows['M/a.mp3']['analyze_queued'] is False
-    analyze(op, scope='stop')
-    assert sync(app, station='AN1', analyze_rev='x').json['analyze'] == []
-    items[0]['size'] = 99
-    library_post(app, 'AN1', items)
-    analyze(op, scope='new')                                               # a new run: the failed file is tried again
-    assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['I/c.wav', 'M/a.mp3']
-    analyze(op, scope='all')
-    assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['I/c.wav', 'M/a.mp3', 'M/b.mp3']
-    # the daily run starts by itself once its time has passed today, once a day
-    analyze(op, scope='stop')
-    sql("""INSERT INTO qsr_test.app_settings (key, value) VALUES ('core.analyze_at', '"00:00"')
-           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""")
-    assert sync(app, station='AN1', analyze_rev='').json['analyze'] == ['I/c.wav', 'M/a.mp3']
-    analyze(op, scope='stop')
-    assert sync(app, station='AN1', analyze_rev='x').json['analyze'] == []  # not again today
+    job = lambda rev='', *evs: analyzer_sync(app, {'station': 'AN1', 'events': list(evs)}, core='ANC', rev=rev).json
+    files = lambda *keys: [{'station': 'AN1', 'key': k} for k in keys]
+    view = lambda: op.get('/api/v1/now?station=AN1').json['station']['analysis']
+    all_stations(app, analyze_at='off')
+    try:
+        assert analyze(op, scope='new').status_code == 400                # no Core yet (1.x): nowhere to run it
+        assert 'analyze' not in job()                                     # no run: nothing to do
+        assert view() == {'active': False, 'left': 0, 'never': 3, 'failed': 0, 'run': False, 'can': True, 'gone': False,
+                          'online': True, 'players': [{'name': 'Analysis_Player', 'state': 'idle'}], 'auto_at': None, 'at': 'off',
+                          'last': None}
+        assert analyze(viewer, scope='new').status_code == 403
+        assert analyze(op, scope='bogus').status_code == 400
+        assert analyze(op, scope='new').status_code == 200
+        r = job()
+        assert r['analyze'] == files('I/c.wav', 'M/a.mp3', 'M/b.mp3') and r['analyze_rev']      # short files first
+        assert 'analyze' not in job(r['analyze_rev'])                                          # unchanged: not resent
+        assert 'analyze' not in batch(app, {'station': 'AN1'}, core='ANC').json                 # no analysis player
+        # results: figures replace what plays learned, and plays no longer learn over them; the list in the same reply
+        r = job(r['analyze_rev'],
+                ev(1, 'track_start', deck='A', file='a.mp3', dir='M/', duration=200.0),
+                ev(2, 'track_end', deck='A', file='a.mp3', dir='M/', reason='end', lead_in=3.0, trail=9.0),
+                ev(3, 'analysis', file='a.mp3', dir='M/', ok=True, lead_in=0.4, trail=1.5, duration=201.0),
+                ev(4, 'analysis', file='c.wav', dir='I/', ok=False, status='Unsupported format'),
+                ev(5, 'track_start', deck='B', file='a.mp3', dir='M/', duration=201.0),
+                ev(6, 'track_end', deck='B', file='a.mp3', dir='M/', reason='end', lead_in=2.0, trail=0.2))
+        assert r['analyze'] == files('M/b.mp3')                                # a failed file waits for the next run
+        row = sql("SELECT lead_in_s, trail_s, duration_s, analyzed_at IS NOT NULL FROM qsr_test.library_figures "
+                  "WHERE station='AN1' AND key='M/a.mp3'", fetch=True)[0]
+        assert tuple(row) == (0.4, 1.5, 201.0, True)
+        assert library_post(app, 'AN1', items).json['learned']['M/a.mp3'] == {'trail': 1.5, 'lead': 0.4, 'analyzed': True}
+        now = view()
+        assert (now['active'], now['left'], now['never'], now['failed'], now['can'], now['run']) == (True, 1, 2, 1, True, True)
+        assert now['last']                                                     # the latest result: library pages reload on it
+        rows = {i['key']: i for i in op.get('/api/v1/library?station=AN1&only=not_analyzed').json['items']}
+        assert set(rows) == {'M/b.mp3', 'I/c.wav'}
+        assert rows['M/b.mp3']['analyze_queued'] is True and rows['I/c.wav']['analyze_queued'] is False
+        assert rows['I/c.wav']['analyze_error'] == 'Unsupported format' and rows['I/c.wav']['analyze_failed_at']
+        with logged() as lines:
+            r = job(r['analyze_rev'], ev(7, 'analysis', file='b.mp3', dir='M/', ok=True, lead_in=0.1, trail=0.3, duration=100.0))
+        assert r['analyze'] == [] and r['analyze_rev'] == ''                   # done: the Core's list is cleared
+        assert (20, 'ANALYSIS core=ANC done') in lines
+        assert sql("SELECT analyze_from FROM qsr_test.cores WHERE core = 'ANC'", fetch=True)[0][0] is None
+        assert view()['run'] is False
+        # one file again; a changed file is owed again; re-analyze all; stop
+        assert analyze(op, key='M/nope.mp3').status_code == 400
+        assert analyze(op, key='M/b.mp3').status_code == 200               # just that file: no run, keeps its figures
+        assert job()['analyze'] == files('M/b.mp3')
+        assert sql("SELECT analyzed_at IS NOT NULL FROM qsr_test.library_figures WHERE station='AN1' AND key='M/b.mp3'",
+                   fetch=True)[0][0]
+        now = view()
+        assert (now['active'], now['left'], now['run']) == (True, 1, True)
+        rows = {i['key']: i for i in op.get('/api/v1/library?station=AN1').json['items']}
+        assert rows['M/b.mp3']['analyze_queued'] is True and rows['M/a.mp3']['analyze_queued'] is False
+        analyze(op, scope='stop')
+        assert job('x')['analyze'] == [] and view()['run'] is False
+        items[0]['size'] = 99
+        library_post(app, 'AN1', items)
+        assert analyze(op, scope='new').status_code == 200                 # a new run: the failed file is tried again
+        assert job()['analyze'] == files('I/c.wav', 'M/a.mp3')
+        analyze(op, scope='all')
+        assert job()['analyze'] == files('I/c.wav', 'M/a.mp3', 'M/b.mp3')
+        # the daily run starts by itself once its time has passed today, once a day
+        analyze(op, scope='stop')
+        all_stations(app, analyze_at='00:00')
+        with logged() as lines:
+            assert job()['analyze'] == files('I/c.wav', 'M/a.mp3')
+        assert (20, 'ANALYSIS core=ANC daily run at 00:00: files not analyzed yet') in lines
+        assert view()['auto_at'] and view()['at'] == '00:00'
+        analyze(op, scope='stop')
+        assert job('x')['analyze'] == []                                       # not again today
+    finally:
+        all_stations(app, analyze_at=None)
+
+
+def test_analysis_list_is_per_core(app):
+    """A Core's list: the files of every station on it, each file once, nothing of another Core's stations nor of a
+    station gone from it; Re-analyze all and Stop on a station's page act on its Core; the players' report is cleaned,
+    kept and shown. A Core before 2.1.0 (a 2.0.0 part's analyze_rev, or the 1.x body) gets no work: its list is cleared."""
+    item = lambda d, f, size, kind='music': {'key': d + f, 'dir': d, 'file': f, 'kind': kind, 'size': size}
+    library_post(app, 'PA1', [item('M/', 's.mp3', 8001), item('M/', 'p1.mp3', 8002), item('I/', 'i1.wav', 8003, 'imaging')])
+    library_post(app, 'PA2', [item('Zone/', 's.mp3', 8001), item('Zone/', 'p2.mp3', 8004)])
+    library_post(app, 'PB1', [item('X/', 's.mp3', 8001), item('X/', 'p3.mp3', 8005)])
+    f = lambda st, key: {'station': st, 'key': key}
+    op = signed_in(app, 'operator')
+    view = lambda st: op.get(f'/api/v1/now?station={st}').json['station']['analysis']
+    a = analyzer_sync(app, {'station': 'PA1'}, {'station': 'PA2'}, core='PCA').json           # 'right away' (the default)
+    assert a['analyze'] == [f('PA1', 'I/i1.wav'), f('PA1', 'M/p1.mp3'), f('PA1', 'M/s.mp3'), f('PA2', 'Zone/p2.mp3')]
+    b = analyzer_sync(app, {'station': 'PB1'}, core='PCB').json
+    assert b['analyze'] == [f('PB1', 'X/p3.mp3'), f('PB1', 'X/s.mp3')]
+    # the shared file measured for PA2: the file's, so PA1's row is done too (PCB's list drops it when made again)
+    a = analyzer_sync(app, {'station': 'PA2', 'events': [ev(1, 'analysis', file='s.mp3', dir='Zone/', ok=True, lead_in=0.1,
+                                                            trail=0.2, duration=60.0)]},
+                      {'station': 'PA1'}, core='PCA', rev=a['analyze_rev']).json
+    assert a['analyze'] == [f('PA1', 'I/i1.wav'), f('PA1', 'M/p1.mp3'), f('PA2', 'Zone/p2.mp3')]
+    sql("UPDATE qsr_test.cores SET owed_at = NOW() - INTERVAL '61 seconds' WHERE core = 'PCB'")
+    b = analyzer_sync(app, {'station': 'PB1'}, core='PCB', rev=b['analyze_rev']).json
+    assert b['analyze'] == [f('PB1', 'X/p3.mp3')]
+    # Re-analyze all on PA2's page: the files of PA1 and PA2 (the Core's run), not PB1's
+    assert op.post('/api/v1/analyze', json={'station': 'PB9', 'scope': 'all'}, headers=WEB).status_code == 400
+    with logged() as lines:
+        assert op.post('/api/v1/analyze', json={'station': 'PA2', 'scope': 'all'}, headers=WEB).status_code == 200
+    assert (20, 'ANALYSIS station=PA2 core=PCA every file by=operator') in lines
+    a = analyzer_sync(app, {'station': 'PA1'}, {'station': 'PA2'}, core='PCA', rev=a['analyze_rev']).json
+    assert a['analyze'] == [f('PA1', 'I/i1.wav'), f('PA1', 'M/p1.mp3'), f('PA1', 'M/s.mp3'), f('PA2', 'Zone/p2.mp3')]
+    assert 'analyze' not in analyzer_sync(app, {'station': 'PB1'}, core='PCB', rev=b['analyze_rev']).json
+    assert [(view(st)['run'], view(st)['left']) for st in ('PA1', 'PA2', 'PB1')] == [(True, 3), (True, 2), (False, 1)]
+    # Stop on PA1's page: the Core's run and every request of its stations end; new files still go right away
+    assert op.post('/api/v1/analyze', json={'station': 'PA2', 'key': 'Zone/s.mp3'}, headers=WEB).status_code == 200
+    assert op.post('/api/v1/analyze', json={'station': 'PB1', 'key': 'X/s.mp3'}, headers=WEB).status_code == 200
+    assert op.post('/api/v1/analyze', json={'station': 'PA1', 'scope': 'stop'}, headers=WEB).status_code == 200
+    wanted = sql("SELECT station FROM qsr_test.library WHERE analyze_wanted AND station IN ('PA1', 'PA2', 'PB1')", fetch=True)
+    assert [r[0] for r in wanted] == ['PB1']                                     # another Core's request stays
+    a = analyzer_sync(app, {'station': 'PA1'}, {'station': 'PA2'}, core='PCA', rev=a['analyze_rev']).json
+    assert a['analyze'] == [f('PA1', 'I/i1.wav'), f('PA1', 'M/p1.mp3'), f('PA2', 'Zone/p2.mp3')] and not view('PA2')['run']
+    # a station its Core no longer syncs (taken out of CFG.STATIONS) is left out
+    sql("UPDATE qsr_test.stations SET last_seen = NOW() - INTERVAL '11 minutes' WHERE station = 'PA2'")
+    sql("UPDATE qsr_test.cores SET owed_at = NULL WHERE core = 'PCA'")
+    a = analyzer_sync(app, {'station': 'PA1'}, core='PCA', rev=a['analyze_rev']).json
+    assert a['analyze'] == [f('PA1', 'I/i1.wav'), f('PA1', 'M/p1.mp3')]
+    # ... and its page says so: not Analyzing, no row queued (its files are never listed), not even one asked for
+    assert op.post('/api/v1/analyze', json={'station': 'PA2', 'key': 'Zone/p2.mp3'}, headers=WEB).status_code == 200
+    assert (view('PA2')['gone'], view('PA2')['can'], view('PA2')['active'], view('PA2')['left']) == (True, False, False, 1)
+    assert not any(i['analyze_queued'] for i in op.get('/api/v1/library?station=PA2').json['items'])
+    assert (view('PA1')['gone'], view('PA1')['can']) == (False, True)
+    # the players' report: cleaned, kept while the Core sends none, shown on the library page; a new boot forgets it
+    report = [{'name': 'Analysis_Player', 'state': 'measuring', 'station': 'PA1', 'key': 'M/p1.mp3', 'extra': {'x': 1}},
+              {'name': 'Analysis_Player2', 'state': 'idle', 'station': None}, {'state': 'idle'}, 'junk', {'name': '<b>' * 50}]
+    players = [{'name': 'Analysis_Player', 'state': 'measuring', 'station': 'PA1', 'key': 'M/p1.mp3'},
+               {'name': 'Analysis_Player2', 'state': 'idle'}, {'name': ('<b>' * 50)[:100], 'state': 'idle'}]
+    analyzer_sync(app, {'station': 'PA1'}, core='PCA', rev=a['analyze_rev'], analyzers=report)
+    assert view('PA1')['players'] == players and view('PA1')['can'] is True and view('PA1')['active'] is True
+    # the Core stops syncing (off, or the server unreachable): its last report is not what its players do, so not
+    # 'measuring', Analyzing (the header) nor queued rows, until it syncs again
+    queued = lambda: {i['key']: i['analyze_queued'] for i in op.get('/api/v1/library?station=PA1').json['items']}
+    assert queued()['M/p1.mp3'] is True
+    sql("UPDATE qsr_test.cores SET last_seen = NOW() - INTERVAL '11 seconds' WHERE core = 'PCA'")
+    assert (view('PA1')['online'], view('PA1')['active'], view('PA1')['can']) == (False, False, True)
+    assert not any(queued().values())
+    batch(app, {'station': 'PA1'}, core='PCA', analyze_rev=a['analyze_rev'])
+    assert view('PA1')['players'] == players and (view('PA1')['online'], view('PA1')['active']) == (True, True)
+    assert queued()['M/p1.mp3'] is True
+    batch(app, {'station': 'PA1'}, core='PCA', boot='B2', analyzers={})              # restarted with none (Lua's empty list)
+    assert (view('PA1')['players'], view('PA1')['can'], view('PA1')['active']) == ([], False, False)
+    # a Core before 2.1.0 gets no work: its list is cleared once, then nothing; a page cannot start a run for it
+    r = batch(app, {'station': 'PO1', 'analyze_rev': 'abc123'}, core='OLDCORE').json
+    assert (r['stations']['PO1']['analyze'], r['stations']['PO1']['analyze_rev']) == ([], '') and 'analyze' not in r
+    assert 'analyze' not in batch(app, {'station': 'PO1', 'analyze_rev': ''}, core='OLDCORE').json['stations']['PO1']
+    assert (view('PO1')['can'], view('PO1')['players']) == (False, None)
+    old = sync(app, station='PO2', analyze_rev='abc123').json                         # 1.x
+    assert (old['analyze'], old['analyze_rev']) == ([], '') and 'analyze' not in sync(app, station='PO2', analyze_rev='').json
+    assert op.post('/api/v1/analyze', json={'station': 'PO2', 'scope': 'new'}, headers=WEB).status_code == 400
+
+
+def test_a_1x_stations_run_goes_on_from_its_core(app):
+    """A run a station had on a 1.x Core (kept on its row by migration 0017: such as 1.3.0's level re-analysis of
+    every file) waits while the 1.x Core syncs, then goes on as its Core's at its first 2.x sync: the files analyzed
+    before the run started are owed again, not only those never analyzed."""
+    item = lambda f, size: {'key': 'M/' + f, 'dir': 'M/', 'file': f, 'kind': 'music', 'size': size}
+    library_post(app, 'OX1', [item('u1.mp3', 8301), item('u2.mp3', 8302)])
+    sync(app, station='OX1', analyze_rev='abc')                                        # the 1.x Core
+    sql("UPDATE qsr_test.media_files SET analyzed_at = NOW() - INTERVAL '2 days' WHERE file = 'u1.mp3' AND size = 8301")
+    sql("""UPDATE qsr_test.stations SET analyze_from = NOW() - INTERVAL '1 day', analyze_run_at = NOW() - INTERVAL '1 day'
+           WHERE station = 'OX1'""")
+    old = sync(app, station='OX1', analyze_rev='').json
+    assert 'analyze' not in old                                                        # still no work for the 1.x Core
+    job = lambda: tuple(sql("SELECT analyze_from IS NOT NULL, analyze_run_at IS NOT NULL FROM qsr_test.stations "
+                            "WHERE station = 'OX1'", fetch=True)[0])
+    assert job() == (True, True)
+    with logged() as lines:
+        r = analyzer_sync(app, {'station': 'OX1'}, core='OXC').json                    # radio.lua 2.1.0 pasted
+    assert (20, "ANALYSIS station=OX1 core=OXC its run goes on as the Core's") in lines
+    assert job() == (False, False)
+    assert sql("SELECT analyze_from < NOW() - INTERVAL '23 hours' FROM qsr_test.cores WHERE core = 'OXC'", fetch=True)[0][0]
+    assert r['analyze'] == [{'station': 'OX1', 'key': 'M/u1.mp3'}, {'station': 'OX1', 'key': 'M/u2.mp3'}]
+    view = signed_in(app, 'viewer').get('/api/v1/now?station=OX1').json['station']['analysis']
+    assert (view['run'], view['left']) == (True, 2)
+    with logged() as lines:
+        analyzer_sync(app, {'station': 'OX1'}, core='OXC', rev=r['analyze_rev'])
+    assert not [m for _, m in lines if 'goes on' in m]                                   # once
+
+
+def test_nothing_queued_on_a_core_without_an_analysis_player(app):
+    """A Core that cannot measure files (radio.lua 2.0.0, until 2.1.0 is pasted; or CFG.ANALYZERS = {}) owes nothing:
+    no row of its stations is shown queued, even in 'right away' mode (the default) or asked for on its own; once it
+    reports an analysis player, they are."""
+    item = lambda f, size: {'key': 'M/' + f, 'dir': 'M/', 'file': f, 'kind': 'music', 'size': size}
+    library_post(app, 'NQ1', [item('n1.mp3', 8401), item('n2.mp3', 8402)])
+    op = signed_in(app, 'operator')
+    queued = lambda: {i['key']: i['analyze_queued'] for i in op.get('/api/v1/library?station=NQ1').json['items']}
+    batch(app, {'station': 'NQ1'}, core='NQC')                                         # 2.0.0: no analysis player report
+    assert queued() == {'M/n1.mp3': False, 'M/n2.mp3': False}
+    assert op.post('/api/v1/analyze', json={'station': 'NQ1', 'key': 'M/n1.mp3'}, headers=WEB).status_code == 200
+    assert queued() == {'M/n1.mp3': False, 'M/n2.mp3': False}
+    analyzer_sync(app, {'station': 'NQ1'}, core='NQC', boot='B2', players=())        # 2.1.0 with CFG.ANALYZERS = {}
+    assert queued() == {'M/n1.mp3': False, 'M/n2.mp3': False}
+    assert op.get('/api/v1/now?station=NQ1').json['station']['analysis']['can'] is False
+    r = analyzer_sync(app, {'station': 'NQ1'}, core='NQC', boot='B3').json            # an analysis player added
+    assert queued() == {'M/n1.mp3': True, 'M/n2.mp3': True}
+    assert r['analyze'] == [{'station': 'NQ1', 'key': 'M/n1.mp3'}, {'station': 'NQ1', 'key': 'M/n2.mp3'}]
+
+
+def test_analyze_new_files_right_away_or_off(app):
+    """'right away' (the default): a new file is listed at once, no run needed; one that fails is not tried again in a
+    loop but RETRY_H hours later; off: only what a library page starts (the daily run: test_file_analysis_job)."""
+    item = lambda f, size: {'key': 'M/' + f, 'dir': 'M/', 'file': f, 'kind': 'music', 'size': size}
+    files = lambda *keys: [{'station': 'RA1', 'key': k} for k in keys]
+    view = lambda: signed_in(app, 'viewer').get('/api/v1/now?station=RA1').json['station']['analysis']
+    library_post(app, 'RA1', [item('r1.mp3', 8101)])
+    r = analyzer_sync(app, {'station': 'RA1'}, core='RAC').json
+    assert r['analyze'] == files('M/r1.mp3')
+    assert (view()['active'], view()['left'], view()['run'], view()['at']) == (True, 1, False, 'right away')
+    library_post(app, 'RA1', [item('r1.mp3', 8101), item('r2.mp3', 8102)])             # a new file: listed at the next sync
+    r = analyzer_sync(app, {'station': 'RA1'}, core='RAC', rev=r['analyze_rev']).json
+    assert r['analyze'] == files('M/r1.mp3', 'M/r2.mp3')
+    r = analyzer_sync(app, {'station': 'RA1', 'events': [ev(1, 'analysis', file='r1.mp3', dir='M/', ok=False, status='timed out'),
+                                                          ev(2, 'analysis', file='r2.mp3', dir='M/', ok=True, lead_in=0.0,
+                                                             trail=0.0, duration=30.0)]}, core='RAC', rev=r['analyze_rev']).json
+    assert r['analyze'] == [] and r['analyze_rev'] == ''                                 # the failed one waits
+    assert (view()['active'], view()['never'], view()['failed']) == (False, 1, 1)
+    sql("UPDATE qsr_test.cores SET owed_at = NULL WHERE core = 'RAC'")
+    assert 'analyze' not in analyzer_sync(app, {'station': 'RA1'}, core='RAC').json      # still waiting: no tight loop
+    # a day later it is tried again (the list made again by the clock)
+    sql("UPDATE qsr_test.media_files SET analyze_failed_at = NOW() - INTERVAL '25 hours' WHERE file = 'r1.mp3' AND size = 8101")
+    sql("UPDATE qsr_test.cores SET owed_at = NOW() - INTERVAL '61 seconds' WHERE core = 'RAC'")
+    r = analyzer_sync(app, {'station': 'RA1'}, core='RAC').json
+    assert r['analyze'] == files('M/r1.mp3')
+    # off: nothing until a run is started; right away again: at once
+    all_stations(app, analyze_at='off')
+    try:
+        assert analyzer_sync(app, {'station': 'RA1'}, core='RAC', rev=r['analyze_rev']).json['analyze'] == []
+        assert (view()['active'], view()['left'], view()['at']) == (False, 0, 'off')
+    finally:
+        all_stations(app, analyze_at=None)
+    assert analyzer_sync(app, {'station': 'RA1'}, core='RAC').json['analyze'] == files('M/r1.mp3')
+
+
+def test_analysis_list_is_cached(app, monkeypatch):
+    """The Core's list is made again when a result comes in, when something it is made from changes (a library upload,
+    a file asked for, a run started or stopped, the setting, Forget measured) or once a minute; not on every sync."""
+    items = [{'key': f'M/c{i}.mp3', 'dir': 'M/', 'file': f'c{i}.mp3', 'kind': 'music', 'size': 8200 + i} for i in (1, 2)]
+    library_post(app, 'CA1', items)
+    made, real = [], control.analysis.owed
+    monkeypatch.setattr(control.analysis, 'owed', lambda cur, core, *a, **k: made.append(core) or real(cur, core, *a, **k))
+    op = signed_in(app, 'operator')
+    send = lambda rev, *evs: analyzer_sync(app, {'station': 'CA1', 'events': list(evs)}, core='CAC', rev=rev).json
+    rev = send('')['analyze_rev']
+    assert made == ['CAC']
+    for seq in (1, 2, 3):              # plays and the usual second: the cached list
+        assert 'analyze' not in send(rev, ev(seq, 'track_start', deck='A', file='c1.mp3', dir='M/', duration=60.0))
+    assert made == ['CAC'] and analyzer_sync(app, {'station': 'CA1'}, core='CAC', rev='').json['analyze_rev'] == rev
+    changes = [
+        lambda: send(rev, ev(10, 'analysis', file='c2.mp3', dir='M/', ok=True, lead_in=0.2, trail=1.0, duration=60.0)),
+        lambda: library_post(app, 'CA1', items),
+        lambda: op.post('/api/v1/analyze', json={'station': 'CA1', 'key': 'M/c2.mp3'}, headers=WEB),
+        lambda: op.post('/api/v1/analyze', json={'station': 'CA1', 'scope': 'stop'}, headers=WEB),
+        lambda: op.post('/api/v1/analyze', json={'station': 'CA1', 'scope': 'all'}, headers=WEB),
+        lambda: op.post('/api/v1/library/forget', json={'station': 'CA1', 'kind': 'music'}, headers=WEB),
+        lambda: all_stations(app, analyze_at='off'),
+        lambda: all_stations(app, analyze_at=None),
+        lambda: sql("UPDATE qsr_test.cores SET owed_at = NOW() - INTERVAL '61 seconds' WHERE core = 'CAC'"),
+    ]
+    try:
+        for i, change in enumerate(changes):
+            n = len(made)
+            change()
+            send(rev)
+            send(rev)
+            assert made.count('CAC') == n + 1, i
+    finally:
+        all_stations(app, analyze_at=None)
 
 
 # ── Per-file figures, shared by every station ────────────────────────────────
@@ -874,11 +1102,8 @@ def test_trims_forget_and_analysis_apply_to_every_station(app):
         ev(2, 'track_end', deck='A', file='t.mp3', dir='M/', reason='end', lead_in=0.6, trail=3.0, level=-5.0, level_s=60.0, peak=1.0),
         ev(3, 'track_start', deck='B', file='only_a.mp3', dir='M/', duration=170.0),
         ev(4, 'track_end', deck='B', file='only_a.mp3', dir='M/', reason='end', lead_in=0.4, trail=2.0)])
-    op, admin = signed_in(app, 'operator'), signed_in(app, 'admin')
+    op = signed_in(app, 'operator')
     post = lambda url, **body: op.post(url, json=body, headers=WEB)
-    for st in ('SA', 'SB'):                       # no daily run: only the runs started here
-        assert admin.post('/api/v1/settings', json={'settings': {'analyze_at': 'off'}, 'scope': 'station', 'station': st},
-                          headers=WEB).status_code == 200
     # a trim on SA is the file's: SB's Core is told at once (a rescan; its upload reply has it); not SC or SD
     m = mark()
     assert post('/api/v1/library/trim', station='SA', key='M/t.mp3', lead=None, trail=0.8).status_code == 200
@@ -897,19 +1122,25 @@ def test_trims_forget_and_analysis_apply_to_every_station(app):
     m = mark()
     assert post('/api/v1/library/forget', station='SB', key='Elsewhere/t.mp3').json['files'] == 0     # nothing left to forget
     assert rescanned(m) == ['SB']                                                                     # nothing to tell SA
-    # analysis: SA's result is the file's; SB's run owes only what nobody has analyzed
-    assert post('/api/v1/analyze', station='SA', key='M/t.mp3').status_code == 200
-    assert post('/api/v1/analyze', station='SB', key='Elsewhere/t.mp3').status_code == 200
-    assert sync(app, station='SB', analyze_rev='').json['analyze'] == ['Elsewhere/t.mp3']
-    sync(app, station='SA', events=[ev(5, 'analysis', file='t.mp3', dir='M/', ok=True, lead_in=0.1, trail=0.2, duration=180.0)])
-    assert sql("SELECT count(*) FROM qsr_test.library WHERE analyze_wanted AND station IN ('SA', 'SB')", fetch=True)[0][0] == 0
-    assert post('/api/v1/analyze', station='SB', scope='new').status_code == 200
-    assert sync(app, station='SB', analyze_rev='').json['analyze'] == ['Elsewhere/w.mp3']
-    rows = {i['key']: i for i in op.get('/api/v1/library?station=SB').json['items']}
-    assert rows['Elsewhere/t.mp3']['analyzed_at'] and not rows['Elsewhere/t.mp3']['analyze_queued']
-    assert rows['Elsewhere/w.mp3']['analyze_queued'] is True
-    assert op.get('/api/v1/now?station=SB').json['station']['analysis']['left'] == 1
-    post('/api/v1/analyze', station='SB', scope='stop')
+    # analysis (SA and SB on two Cores): SA's result is the file's; SB's run owes only what nobody has analyzed
+    all_stations(app, analyze_at='off')           # no run but those started here
+    try:
+        assert post('/api/v1/analyze', station='SA', key='M/t.mp3').status_code == 200
+        assert post('/api/v1/analyze', station='SB', key='Elsewhere/t.mp3').status_code == 200
+        assert analyzer_sync(app, {'station': 'SB'}, core='TFB').json['analyze'] == [{'station': 'SB', 'key': 'Elsewhere/t.mp3'}]
+        analyzer_sync(app, {'station': 'SA', 'events': [ev(5, 'analysis', file='t.mp3', dir='M/', ok=True, lead_in=0.1, trail=0.2,
+                                                           duration=180.0)]}, core='TFA')
+        assert sql("SELECT count(*) FROM qsr_test.library WHERE analyze_wanted AND station IN ('SA', 'SB')", fetch=True)[0][0] == 0
+        assert post('/api/v1/analyze', station='SB', scope='new').status_code == 200
+        assert analyzer_sync(app, {'station': 'SB'}, core='TFB').json['analyze'] == [{'station': 'SB', 'key': 'Elsewhere/w.mp3'}]
+        rows = {i['key']: i for i in op.get('/api/v1/library?station=SB').json['items']}
+        assert rows['Elsewhere/t.mp3']['analyzed_at'] and not rows['Elsewhere/t.mp3']['analyze_queued']
+        assert rows['Elsewhere/w.mp3']['analyze_queued'] is True
+        assert op.get('/api/v1/now?station=SB').json['station']['analysis']['left'] == 1
+        assert op.get('/api/v1/now?station=SA').json['station']['analysis']['run'] is False      # another Core's run
+        post('/api/v1/analyze', station='SB', scope='stop')
+    finally:
+        all_stations(app, analyze_at=None)
     # unsupported on one station: no station plays it
     sync(app, station='SA', events=[ev(6, 'file_unsupported', file='t.mp3', dir='M/', status='Unsupported file format')])
     assert library_post(app, 'SB', b).json['learned']['Elsewhere/t.mp3'] == {'unsupported': True}
@@ -1126,13 +1357,13 @@ def test_one_stations_bad_part_does_not_fail_the_others(app, monkeypatch):
     assert r['BB1']['accepted'] == 1 and r['BB3']['accepted'] == 1 and 'commands' in r['BB3']
     assert any(lvl == 30 and 'station=BB2 sync failed' in msg and 'events must be a list' in msg for lvl, msg in lines)
     # a database error in the middle of one station's work (its transaction aborted): the others go on, on the same connection
-    real = control.analysis.sync
+    real = control.ads.cached_plan
 
-    def failing(cur, station, rev):
+    def failing(cur, station, fresh=False):
         if station == 'BB2':
             cur.execute('SELECT 1 / 0')
-        return real(cur, station, rev)
-    monkeypatch.setattr(control.analysis, 'sync', failing)
+        return real(cur, station, fresh)
+    monkeypatch.setattr(control.ads, 'cached_plan', failing)
     with logged() as lines:
         r = batch(app, {'station': 'BB1', 'events': evs('BB1', 11)}, {'station': 'BB2', 'events': evs('BB2', 12), 'state': STATE},
                   {'station': 'BB3', 'events': evs('BB3', 13)}).json['stations']
@@ -1142,13 +1373,13 @@ def test_one_stations_bad_part_does_not_fail_the_others(app, monkeypatch):
     played = lambda st: sql('SELECT count(*) FROM qsr_test.play_log WHERE station = %s', (st,), fetch=True)[0][0]
     assert (played('BB1'), played('BB2'), played('BB3')) == (2, 0, 2)        # BB2's events rolled back
     assert sql("SELECT count(*) FROM qsr_test.stations WHERE station = 'BB2'", fetch=True)[0][0] == 0
-    monkeypatch.setattr(control.analysis, 'sync', real)
+    monkeypatch.setattr(control.ads, 'cached_plan', real)
     r = batch(app, {'station': 'BB2', 'events': evs('BB2', 12)}).json['stations']
     assert r['BB2']['accepted'] == 1 and played('BB2') == 1                 # sent again: stored now, once
     # the database itself gone: the whole request is 503 and the Core backs off
-    def lost(cur, station, rev):
+    def lost(cur, station, fresh=False):
         raise db.psycopg2.OperationalError('server closed the connection unexpectedly')
-    monkeypatch.setattr(control.analysis, 'sync', lost)
+    monkeypatch.setattr(control.ads, 'cached_plan', lost)
     assert batch(app, {'station': 'BB1'}, {'station': 'BB3'}).status_code == 503
 
 
@@ -1348,16 +1579,17 @@ def test_faulted_station_shows_on_the_panel(app):
     # the state exactly as radio.lua sends it for a faulted station (Lua's empty tables arrive as {}): the dashboard's poll
     core_state = {'fault': "player 'X' not found", 'automation': False, 'state': 'fault', 'retry_s': 30, 'decks': {}, 'queue': {},
                   'library': {'music': 0, 'imaging': 0, 'ad': 0}, 'settings': {'crossfade_s': 4},
-                  'analyze': {'can': True, 'left': 0}, 'uptime': 12, 'outbox': 0}
-    batch(app, {'station': 'FT3', 'ack': 0, 'settings_rev': '', 'ads_rev': '', 'state': core_state})
+                  'analyze': {'can': True}, 'uptime': 12, 'outbox': 0}
+    analyzer_sync(app, {'station': 'FT3', 'ack': 0, 'settings_rev': '', 'ads_rev': '', 'state': core_state}, core='FTCORE')
     r = v.get('/api/v1/now?station=FT3&plays=10&ahead=10')
     assert r.status_code == 200 and r.json['station']['state']['queue'] == [] and r.json['station']['state']['retry_s'] == 30
-    # its CFG names a mixer: the Music page does not send the operator to the CFG for it (it names the fault)
+    # its Core has an analysis player: the Music page names the fault, and the players, not the CFG
     assert r.json['station']['analysis']['can'] is True
 
 
 def test_batched_sync_of_14_stations_is_quick(app):
-    """14 stations of 3,000 files each (uploaded in parts) synced in one request: well within the second."""
+    """14 stations of 3,000 files each (uploaded in parts) synced in one request: well within the second, the Core's
+    list of files to analyze included (cached: made again only when something changed)."""
     n_st, n_files = 14, 3000
     names = [f'Q{i:02d}' for i in range(n_st)]
     client = app.test_client()
@@ -1373,23 +1605,36 @@ def test_batched_sync_of_14_stations_is_quick(app):
             assert r.status_code == 200, r.get_data(as_text=True)
         sql("INSERT INTO qsr_test.ad_rules (station, key, mode, per_hour) VALUES (%s, %s, 'hourly', 4)", (st, f'Ads/{st}-0.wav'))
     t0 = datetime.now(timezone.utc) - timedelta(seconds=30)
-    part = lambda i, st, seq: {'station': st, 'ack': 0, 'settings_rev': '', 'ads_rev': '', 'analyze_rev': '',
+    part = lambda i, st, seq: {'station': st, 'ack': 0, 'settings_rev': '', 'ads_rev': '',
                                'meters': {'A': {'peak': -3, 'rms': -12, 'gain': 0}, 'B': {'peak': -120, 'rms': -120, 'gain': -100}},
                                'state': STATE, 'events': [ev(seq + i * 10, 'track_start', t=t0.strftime('%Y-%m-%dT%H:%M:%SZ'),
                                                              deck='A', file=f'{st}-0001.mp3', dir='M/', duration=200.0)]}
     timings = []
     for seq in (1, 2, 3):
         start = time.monotonic()
-        r = batch(app, *[part(i, st, seq) for i, st in enumerate(names)], core='BIGCORE', mem_kb=4000)
+        r = analyzer_sync(app, *[part(i, st, seq) for i, st in enumerate(names)], core='BIGCORE', mem_kb=4000)
         timings.append(time.monotonic() - start)
         assert r.status_code == 200 and all('error' not in x for x in r.json['stations'].values())
         assert len(r.json['stations']) == n_st and all(x['ads']['next'] for x in r.json['stations'].values())
+        listed = r.json['analyze']           # every file new ('right away'): the short ones first (imaging, ads; by key)
+        assert len(listed) == 20 and all(f['key'].startswith('Ads/') for f in listed) and {f['station'] for f in listed} <= set(names)
+    usual = lambda: analyzer_sync(app, *[{'station': st, 'ack': 0, 'settings_rev': x['settings_rev'], 'ads_rev': x['ads_rev'],
+                                          'meters': {}} for st, x in r.json['stations'].items()],
+                                  core='BIGCORE', rev=r.json['analyze_rev'], mem_kb=4000)
     start = time.monotonic()
-    r = batch(app, *[{'station': st, 'ack': 0, 'settings_rev': x['settings_rev'], 'ads_rev': x['ads_rev'], 'analyze_rev': '',
-                      'meters': {}} for st, x in r.json['stations'].items()], core='BIGCORE', mem_kb=4000)
-    timings.append(time.monotonic() - start)                 # the usual second: nothing new, plans cached
-    assert r.status_code == 200 and not any('ads' in x or 'settings' in x for x in r.json['stations'].values())
-    assert max(timings[:3]) < 1.5 and timings[3] < 0.5, timings          # measured: about 0.2 s and 0.05 s
+    again = usual()
+    timings.append(time.monotonic() - start)                 # the usual second: nothing new, plans and list cached
+    assert again.status_code == 200 and not any('ads' in x or 'settings' in x for x in again.json['stations'].values())
+    assert 'analyze' not in again.json
+    # every file analyzed: the list made again reads every library of the Core (the most it costs), once
+    sql('UPDATE qsr_test.media_files SET analyzed_at = NOW() WHERE id IN (SELECT file_id FROM qsr_test.library WHERE station = ANY(%s))',
+        (names,))
+    sql("UPDATE qsr_test.cores SET owed_at = NULL WHERE core = 'BIGCORE'")
+    start = time.monotonic()
+    done = usual()
+    timings.append(time.monotonic() - start)
+    assert done.json['analyze'] == [] and done.json['analyze_rev'] == ''
+    assert max(timings[:3]) < 1.5 and timings[3] < 0.5 and timings[4] < 1.0, timings   # measured: about 0.2, 0.05 and 0.12 s
 
 
 # ── Sign-in and permissions ──────────────────────────────────────────────────
@@ -1642,7 +1887,7 @@ def test_settings_views_all_stations_and_one_station(app):
         one = viewer.get('/api/v1/settings?station=SV1').json
         assert (one['scope'], one['station']) == ('station', 'SV1') and one['rev'] and 'in_sync' in one
         rows = {x['name']: x for x in one['settings']}
-        assert set(rows) == set(core_settings.BY_NAME) and rows['music_dir']['station_only'] is True
+        assert set(rows) == set(core_settings.BY_NAME) - core_settings.ALL_ONLY and rows['music_dir']['station_only'] is True
         pick = lambda n: {k: rows[n][k] for k in ('override', 'own', 'all', 'source', 'running')}
         assert pick('crossfade_s') == {'override': None, 'own': None, 'all': 5, 'source': 'all', 'running': 4}
         assert pick('fade_in_s') == {'override': 2, 'own': 2, 'all': None, 'source': 'station', 'running': 0}
@@ -1665,7 +1910,8 @@ def test_settings_views_all_stations_and_one_station(app):
 
 
 def test_server_only_settings_per_station(app):
-    """ident_schedule, ad_fit_tolerance_s, ident_window_min, analyze_at: per station, like the rest."""
+    """ident_schedule, ad_fit_tolerance_s, ident_window_min: per station, like the rest. analyze_at is the whole
+    Core's (its analysis players serve every station on it): set for All stations only."""
     items = [{'key': 'I/id.wav', 'dir': 'I/', 'file': 'id.wav', 'kind': 'imaging'},
              {'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music', 'size': 50}]
     op, admin = signed_in(app, 'operator'), signed_in(app, 'admin')
@@ -1683,15 +1929,26 @@ def test_server_only_settings_per_station(app):
         assert op.get('/api/v1/now?station=SO1').json['station']['ident']['next_at']
         assert op.get('/api/v1/now?station=SO2').json['station']['ident']['next_at'] is None
         assert 'ident_schedule' not in settings_for(app, 'SO1')[0]                     # still not sent to the Core
-        # analyze_at: SO1's daily run starts (its time has passed today); SO2 stays off
-        assert save('SO1', analyze_at='00:00').status_code == 200
-        assert sync(app, station='SO1', analyze_rev='').json['analyze'] == ['I/id.wav', 'M/a.mp3']
-        assert 'analyze' not in sync(app, station='SO2', analyze_rev='').json
-        assert op.get('/api/v1/now?station=SO1').json['station']['analysis']['at'] == '00:00'
-        assert op.get('/api/v1/now?station=SO2').json['station']['analysis']['at'] == 'off'
-        assert 'analyze_at' not in settings_for(app, 'SO1')[0]
+        # analyze_at: All stations only; not in a station's view; a station's own value (left by 2.0) never read
+        r = save('SO1', analyze_at='00:00')
+        assert r.status_code == 400 and r.json['error'] == ('Analyze new files applies to every station of the Core: '
+                                                             'set it for All stations')
+        assert save('SO1', analyze_at=None, crossfade_s=5).status_code == 400              # nothing of it is saved
+        assert 'analyze_at' not in {x['name'] for x in admin.get('/api/v1/settings?station=SO1').json['settings']}
+        row = {x['name']: x for x in admin.get('/api/v1/settings?scope=all').json['settings']}['analyze_at']
+        assert (row['label'], row['default'], row['override']) == ('Analyze new files', 'right away', 'off')
+        assert row['choices'] == ['right away', 'off'] + [f'{h:02d}:00' for h in range(24)]
+        sql("""INSERT INTO qsr_test.station_settings (station, name, value) VALUES ('SO1', 'analyze_at', '"00:00"')""")
+        try:
+            assert op.get('/api/v1/now?station=SO1').json['station']['analysis']['at'] == 'off'
+        finally:
+            sql("DELETE FROM qsr_test.station_settings WHERE station = 'SO1'")
+        assert save(analyze_at='04:00').status_code == 200
+        assert op.get('/api/v1/now?station=SO2').json['station']['analysis']['at'] == '04:00'
+        assert 'analyze_at' not in settings_for(app, 'SO1')[0]                          # the server's own
     finally:
         save(ident_schedule=None, analyze_at=None)
+    assert op.get('/api/v1/now?station=SO2').json['station']['analysis']['at'] == 'right away'      # the default
 
 
 def test_migration_0014_moves_the_folders_to_every_station():
@@ -1787,6 +2044,50 @@ def test_migration_0015_merges_each_files_figures():
         sql('DROP SCHEMA IF EXISTS qsr_test_m15 CASCADE')
 
 
+def test_migration_0017_moves_the_analysis_job_to_the_core():
+    """A run in progress on a Core's stations goes on as the Core's (the widest: the latest start), a daily run
+    started on one of them counts for the Core, and their own columns are emptied; a station with no Core yet (a
+    1.x Core's) keeps its job until it syncs from a 2.x Core (test_a_1x_stations_run_goes_on_from_its_core);
+    any station's own analyze_at goes."""
+    sql('DROP SCHEMA IF EXISTS qsr_test_m17 CASCADE; CREATE SCHEMA qsr_test_m17')
+    conn = db.connect(search_path=False)
+    try:
+        for version, _, path, _ in migrate.discover():
+            if version > 17:
+                break
+            if version == 17:
+                with conn.cursor() as cur:
+                    cur.execute("""SET LOCAL search_path TO qsr_test_m17;
+                        INSERT INTO cores (core) VALUES ('C1'), ('C2'), ('C3');
+                        INSERT INTO stations (station, core, analyze_from, analyze_run_at, analyze_auto_at) VALUES
+                        ('A', 'C1', '-infinity', '2026-10-01Z', '2026-10-14T04:00Z'),
+                        ('B', 'C1', '2026-10-02Z', '2026-10-02Z', NULL),
+                        ('C', 'C2', NULL, NULL, '2026-10-13T04:00Z'),
+                        ('D', NULL, '2026-10-03Z', '2026-10-03Z', '2026-10-15T04:00Z');
+                        INSERT INTO station_settings (station, name, value) VALUES ('A', 'analyze_at', '"off"'),
+                        ('A', 'crossfade_s', '5'), ('C', 'analyze_at', '"03:00"')""")
+            with conn.cursor() as cur:
+                cur.execute('SET LOCAL search_path TO qsr_test_m17')
+                cur.execute(path.read_text(encoding='utf-8'))
+            conn.commit()
+    finally:
+        conn.close()
+    try:
+        utc = lambda *a: datetime(*a, tzinfo=timezone.utc)
+        rows = {r[0]: tuple(r[1:]) for r in sql("""SELECT core, analyze_from, analyze_run_at, analyze_auto_at, owed_at, analyzers
+                                                   FROM qsr_test_m17.cores""", fetch=True)}
+        assert rows == {'C1': (utc(2026, 10, 2), utc(2026, 10, 2), utc(2026, 10, 14, 4), None, None),
+                        'C2': (None, None, utc(2026, 10, 13, 4), None, None), 'C3': (None, None, None, None, None)}
+        jobs = {r[0]: tuple(r[1:]) for r in sql("""SELECT station, analyze_from, analyze_run_at, analyze_auto_at
+                                                   FROM qsr_test_m17.stations""", fetch=True)}
+        assert jobs == {'A': (None,) * 3, 'B': (None,) * 3, 'C': (None,) * 3,
+                        'D': (utc(2026, 10, 3), utc(2026, 10, 3), utc(2026, 10, 15, 4))}
+        own = sql('SELECT station, name FROM qsr_test_m17.station_settings ORDER BY 1, 2', fetch=True)
+        assert [tuple(r) for r in own] == [('A', 'crossfade_s')]
+    finally:
+        sql('DROP SCHEMA IF EXISTS qsr_test_m17 CASCADE')
+
+
 def test_syslog_set_on_the_settings_page(app):
     import socket
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1874,10 +2175,12 @@ def test_settings_spec_matches_radio_lua():
 
 
 def test_panel_and_help_name_the_stations_cfg_entry():
-    """2.0 sets each station's players, meter and mixer in its CFG.STATIONS entry: no page, script, help text
-    or server message names the 1.x keys (CFG.MIXER, MIX_A, ...) or a fixed RadioOut mixer."""
+    """2.0 sets each station's players and meter in its CFG.STATIONS entry, 2.1 the analysis players in
+    CFG.ANALYZERS: no page, script, help text or server message names the 1.x keys (CFG.MIXER, MIX_A, ...), a fixed
+    RadioOut mixer, or analysis on an off-air deck muted at the mixer."""
     import re
-    old = re.compile(r'CFG\.(MIXER|METER|PLAYER_A|PLAYER_B|STATION_ID)\b|\bMIX_[AB]\b|\bMETER_[AB]\b|RadioOut')
+    old = re.compile(r'CFG\.(MIXER|METER|PLAYER_A|PLAYER_B|STATION_ID)\b|\bMIX_[AB]\b|\bMETER_[AB]\b|RadioOut|off-air deck|'
+                     r'muted at the mixer|\bmixer\b')
     root = os.path.join(os.path.dirname(__file__), '..', 'server')
     hits = []
     for folder, _, names in os.walk(root):
@@ -1888,9 +2191,9 @@ def test_panel_and_help_name_the_stations_cfg_entry():
     assert not hits
     with open(os.path.join(root, 'static', 'js', 'library.js'), encoding='utf-8') as f:
         src = f.read()
-    assert 'station\\\'s <b>CFG.STATIONS</b> entry' in src        # file analysis off: says where to set it
-    # a faulted station: the fault is named before the CFG hint (2.0.0 dev blamed a correct CFG mixer)
-    assert src.index("'<span><b>Station fault</b>: ' + esc(fault)") < src.index('<b>CFG.STATIONS</b> entry')
+    assert '<b>CFG.ANALYZERS</b> in radio.lua 2.1.0' in src        # no analysis player: says where to set it
+    # a faulted station: the fault is named first (2.0.0 dev blamed a correct CFG)
+    assert src.index("(fault ? '<span><b>Station fault</b>: ' + esc(fault)") < src.index('<b>CFG.ANALYZERS</b>')
 
 
 def test_version_matches_everywhere():

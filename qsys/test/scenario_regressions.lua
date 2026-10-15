@@ -10,12 +10,17 @@ local function count(kind) return #evs(kind) end
 local function when(cond, fn) local function chk() if cond() then fn() else MockCore.at(MockCore.clock + 0.05, chk) end end MockCore.at(0.05, chk) end
 
 local S                                 -- the station (CFG.STATIONS[1]) of the current boot
-local function boot(music, imaging, before)
+local function boot(music, imaging, before, patch)   -- patch(CFG) before radio.lua boots
   for _, f in ipairs({ "outbox", "settings" }) do os.remove("media/_radio/" .. f .. ".json") end
   MockCore.setup{ seed = 2, dirs = { ["Test/Tuning/"] = music, ["Test/Imaging/"] = imaging or {} } }
   if before then before() end
-  dofile("qsys/radio/radio.lua")
+  MockCore.loadRadio(patch)
   S = Radio.stations[1]
+end
+local function analyze(keys)                    -- the server's analysis list for this Core: files of station Main
+  local list = {}
+  for i, k in ipairs(keys) do list[i] = { station = "Main", key = k } end
+  Analyzer:list(list, "r" .. MockCore.clock)
 end
 local function songs(n, dur)
   local o = {}
@@ -291,8 +296,8 @@ local retries = {}
 for _, e in ipairs(evs("station_fault")) do retries[#retries + 1] = string.format("%d", e.retry_s) end
 check(table.concat(retries, ",") == "30,60,120", "retry back-off doubles from the first fault (" .. table.concat(retries, ",") .. ")")
 
-print("-- a listed file out of the library for a while (a failed load) is analyzed once a rescan brings it back")
-print("   (2.0.0 dev moved the analysis cursor past it for good)")
+print("-- a listed file out of its station's library for a while (a failed load) is still analyzed (2.0.0 dev moved")
+print("   the analysis cursor past it for good; 2.0.0 waited for a rescan)")
 local FLAKY = { name = "Z - Flaky.flac", duration = 60, lead = 0.4, trail = 0.8, level = -10, unsupported = true, status = "Missing" }
 local flakyMusic = songs(3, 40)
 flakyMusic[4] = FLAKY
@@ -300,18 +305,16 @@ boot(flakyMusic, BUMPERS)
 S.settings.bumper_every_n_tracks = 0
 local listedAt
 when(function() return count("file_failed") >= 1 end, function()
-  S:setAutomation(false, "t")                     -- stopped: both decks may analyze
   FLAKY.unsupported = nil                         -- the file loads again
-  S:analyze({ "Test/Tuning/Z - Flaky.flac", "Test/Tuning/A - Song1.flac" }, "r1")
+  analyze({ "Test/Tuning/Z - Flaky.flac", "Test/Tuning/A - Song1.flac" })
   listedAt = MockCore.clock
 end)
 MockCore.run(200)
 local function analyzed(name) for _, e in ipairs(evs("analysis")) do if e.file == name and e.ok then return true end end return false end
-check(listedAt and S.lib.byKey["Test/Tuning/Z - Flaky.flac"] == nil and not analyzed(FLAKY.name) and analyzed("A - Song1.flac"),
-  "the failed file waits for the next scan; the rest of the list is analyzed")
+check(listedAt and S.lib.byKey["Test/Tuning/Z - Flaky.flac"] == nil and analyzed(FLAKY.name) and analyzed("A - Song1.flac"),
+  "the file its station dropped is measured all the same, and the rest of the list")
 S:scan()
-MockCore.run(120)
-check(analyzed(FLAKY.name), "analyzed once a rescan brings it back")
+check(S.lib.byKey["Test/Tuning/Z - Flaky.flac"] ~= nil, "a rescan brings it back to the station")
 
 print("-- figures kept only for the files listed now (2.0.0 dev kept one for every file it had ever played,")
 print("   through every folder change: growing with uptime)")
@@ -338,7 +341,7 @@ S:scan()
 check(outside("F3/") == 0, "and nothing outside F3/ after the next scan")
 
 print("-- a faulted station's state still says whether it can analyze (2.0.0 dev left it out: the Music page then")
-print("   sent the operator to a correct CFG mixer instead of naming the fault)")
+print("   sent the operator to a correct CFG mixer instead of naming the fault; 2.1: this Core has an analysis player)")
 local faultedState
 boot(songs(4, 40), BUMPERS, function()
   MockCore.serve{ sync = function(part) if part.state and part.state.fault then faultedState = faultedState or part.state end end }
@@ -347,8 +350,8 @@ CFG.SERVER_URL = "http://radio-server:5410"
 MockCore.run(5)
 S.tick = function() error("injected") end
 MockCore.run(15)
-check(faultedState and faultedState.analyze and faultedState.analyze.can == true and faultedState.analyze.left == 0,
-  "its state reports analyze.can: its CFG entry names a mixer")
+check(faultedState and faultedState.analyze and faultedState.analyze.can == true and faultedState.analyze.left == nil,
+  "its state reports analyze.can: this Core has an analysis player")
 
 print("-- a station whose sync part is answered { error } keeps its events on disk: a script restart replays them")
 print("   (2.0.0 dev kept them in memory only: the server answered, so outbox.json was never written)")
@@ -382,6 +385,75 @@ check(onDisk and missing == 0, string.format("after a script restart every one o
 local cleared = readOutbox()
 check(cleared and #cleared == 0, "and outbox.json is emptied once the server has them")
 
+print("-- a file the analysis player cannot play leaves the rotation at once and is reported unsupported (2.0.0 reported a")
+print("   failed analysis only: the station still tried it on air, and the server listed it again every run)")
+local NOPE = { name = "N - Nope.flac", duration = 40, unsupported = true, status = "Unsupported file format" }
+local nopeMusic = songs(3, 40)
+nopeMusic[4] = NOPE
+boot(nopeMusic, BUMPERS)
+S.settings.bumper_every_n_tracks = 0
+MockCore.at(0.5, function() analyze({ "Test/Tuning/N - Nope.flac" }) end)
+local realLoad, nopeOnAir = Deck.load, 0
+Deck.load = function(d, track, cb)
+  if d.st ~= Analyzer and track.name == NOPE.name then nopeOnAir = nopeOnAir + 1 end
+  return realLoad(d, track, cb)
+end
+MockCore.run(400)
+Deck.load = realLoad
+local nope, verdict = evs("file_unsupported")[1], evs("analysis")[1]
+check(count("file_unsupported") == 1 and nope.file == NOPE.name and verdict and nope.at == verdict.at and S.lib.byKey["Test/Tuning/N - Nope.flac"] == nil
+  and nopeOnAir == 0 and count("dead_air_guard") == 0, string.format("reported once, by the analysis; the station never loaded it (%d times)", nopeOnAir))
+
+print("-- an analysis that stalls while loading is given up 30 s after, whatever the player played before (2.0.0")
+print("   waited the previous file's length + 30 s: the deck's duration was the last file's)")
+local LONG = { { name = "L - Long.flac", duration = 1800, lead = 0.2, trail = 0.5, level = -10 } }
+boot(songs(3, 40), LONG)
+S.settings.bumper_every_n_tracks = 0
+MockCore.at(0.5, function() analyze({ "Test/Imaging/L - Long.flac", "Test/Tuning/A - Song1.flac" }) end)
+local realPoll, stallAt = Deck.pollLoad, nil
+when(function() return count("analysis") >= 1 end, function()
+  Deck.pollLoad = function(d, t)                  -- the next analysis load fails inside the 50 ms timer, once
+    if d.st == Analyzer and not stallAt then stallAt = MockCore.clock; error("injected") end
+    return realPoll(d, t)
+  end
+end)
+MockCore.run(150)
+Deck.pollLoad = realPoll
+local long, song = evs("analysis")[1], evs("analysis")[2]
+check(long and long.ok and long.duration == 1800 and song and song.ok == false and song.status == "timed out"
+  and stallAt and song.at - stallAt < 32, string.format("the long file measured, the stalled one given up %.1f s later",
+    song and stallAt and song.at - stallAt or -1))
+
+print("-- a file dropped from the list while it is measured is measured again when it is listed again (2.1.0 dev")
+print("   marked it done all the same: Stop, then Analyze again, left it 'queued' for good)")
+boot(songs(3, 60), BUMPERS)
+S.settings.bumper_every_n_tracks = 0
+local AGAIN = "Test/Tuning/A - Song1.flac"
+MockCore.at(0.5, function() analyze({ AGAIN }) end)
+when(function() return Analyzer.decks[1].job ~= nil end, function() Analyzer:list({}, "") end)   -- Stop: an empty list
+local relisted
+when(function() return count("analysis") >= 1 end, function() relisted = MockCore.clock; analyze({ AGAIN }) end)
+MockCore.run(150)
+local measured = 0
+for _, e in ipairs(evs("analysis")) do if e.dir .. e.file == AGAIN and e.ok then measured = measured + 1 end end
+check(relisted and measured == 2 and not Analyzer.decks[1].job, string.format("measured %d times (listed, dropped, listed again)", measured))
+
+print("-- two unsupported files listed back to back are both reported unsupported (2.1.0 dev: the second load leaves")
+print("   the same status string, which fires nothing: it timed out, stayed in rotation and was retried every day)")
+local W1 = { name = "W1.m4a", duration = 40, unsupported = true, status = "Unsupported file format" }
+local W2 = { name = "W2.m4a", duration = 40, unsupported = true, status = "Unsupported file format" }
+local wMusic = songs(3, 40)
+wMusic[4], wMusic[5] = W1, W2
+boot(wMusic, BUMPERS)
+S.settings.bumper_every_n_tracks = 0
+MockCore.at(0.5, function() analyze({ "Test/Tuning/W1.m4a", "Test/Tuning/W2.m4a" }) end)
+MockCore.run(10)
+local verdicts = {}
+for _, e in ipairs(evs("file_unsupported")) do verdicts[#verdicts + 1] = e.file .. ": " .. e.status end
+check(count("file_unsupported") == 2 and verdicts[2] == "W2.m4a: Unsupported file format"
+  and not S.lib.byKey["Test/Tuning/W1.m4a"] and not S.lib.byKey["Test/Tuning/W2.m4a"],
+  "both out of rotation (" .. table.concat(verdicts, "; ") .. ")")
+
 print("-- lightweight: fast timer only while fading/loading")
 boot(songs(6, 60), BUMPERS)
 S.settings.bumper_every_n_tracks = 0
@@ -394,14 +466,19 @@ check(count("track_start") >= 5, "still crossfading normally")
 
 print("-- Tick and Fast allocate nothing (1.6.0 built a deck list every tick while analyzing and every 50 ms,")
 print("   and a table per crossfade check of a file without figures)")
-boot(songs(4, 60), BUMPERS)
-S.settings.bumper_every_n_tracks = 0
-MockCore.run(70)                                  -- the second song, mid-way, first play: no figures yet
-local waiting                                     -- a file to analyze, but no deck free for it (the song on air
-for _, tr in ipairs(S.lib.music) do               -- ends in under K.scan_need_s): the list waits, checked every tick
-  if tr ~= S.live.track and tr ~= S.other.track then waiting = waiting or tr.key end
+local twoAnalyzers = function(cfg)                -- a second analysis player, idle while a listed file waits
+  MockCore.wire{ name = "Analysis_Player2", label = "X2", meter = "AnalysisMeter", channel = 2 }
+  cfg.ANALYZERS[2] = { player = "Analysis_Player2", meter = "AnalysisMeter", meter_idx = 2 }
 end
-S:analyze({ waiting }, "r1")
+boot(songs(4, 60), BUMPERS, nil, twoAnalyzers)
+S.settings.bumper_every_n_tracks = 0
+MockCore.run(55)
+local other                                       -- one analysis player measures a song; the other is idle, the list
+for _, tr in ipairs(S.lib.music) do               -- (that song, and one of a station not on this Core) checked every tick
+  if tr ~= S.live.track then other = other or tr.key end
+end
+Analyzer:list({ { station = "Main", key = other }, { station = "Elsewhere", key = "Test/Tuning/x.flac" } }, "r1")
+MockCore.run(15)                                  -- the second song, mid-way, first play: no figures yet
 local function allocated(fn, n)
   collectgarbage("collect")
   collectgarbage("stop")
@@ -414,11 +491,29 @@ local function allocated(fn, n)
 end
 local playing = S.state == "playing" and S.live and not S.learned[S.live.track.key]
 local tickKb = allocated(function() Radio.tick() end, 2000)
-local pending = S.an.pos <= #S.an.todo and not (S.decks[1].job or S.decks[2].job)
+local X1, X2 = Analyzer.decks[1], Analyzer.decks[2]
+local pending = X1.job and X1.job.key == other and X1.job.phase == "body" and not X2.job and Analyzer.pos == 1
 S.live:fadeOut(60, function() end)
 local fastKb = allocated(function() MockCore.clock = MockCore.clock + 0.001; Engine.fast() end, 2000)
 check(playing and pending and tickKb == 0 and fastKb == 0,
-  string.format("2,000 ticks (a file waiting to be analyzed): %.2f KB, 2,000 fade steps: %.2f KB allocated", tickKb, fastKb))
+  string.format("2,000 ticks (a file measured, another waiting): %.2f KB, 2,000 fade steps: %.2f KB allocated", tickKb, fastKb))
+
+print("-- a station whose build failed: its listed files wait until it is built (2.1.0 dev measured them under a guessed")
+print("   root Audio/, as its players' root is read by the scan: each reported failed, 'outside the analysis player's")
+print("   root', and then not owed for a day, on every Core whose stations list it)")
+boot(songs(2, 40), {}, function()
+  MockCore.dirs["Radio/Test/Tuning/"], MockCore.dirs["Test/Tuning/"] = MockCore.dirs["Test/Tuning/"], nil
+  for _, p in pairs(MockCore.players) do p.ctl.root.String = "Audio/Radio/" end   -- every player's Root the same
+end, function(cfg) cfg.STATIONS[1].players[2] = "Missing_Player" end)
+analyze({ "Test/Tuning/A - Song1.flac" })
+MockCore.run(25)
+local waited = S.fault and not S.built and count("analysis") == 0 and not Analyzer.decks[1].job and Analyzer.pos == 1
+S.cfg.players[2] = "Audio_Player24"               -- the design fixed: the rebuild after the back-off builds it
+MockCore.run(120)
+local rebuilt = Radio.stations[1]
+check(waited, "nothing measured while its station is not built: the file stays listed")
+check(rebuilt.built and not rebuilt.fault and rebuilt.lib.root == "Audio/Radio/" and analyzed("A - Song1.flac")
+  and count("analysis") == 1, "built again: measured under its real root, once")
 
 print("")
 print(fails == 0 and "ALL CHECKS PASSED" or (fails .. " CHECK(S) FAILED"))

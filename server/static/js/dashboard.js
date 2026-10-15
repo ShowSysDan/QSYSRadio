@@ -30,12 +30,6 @@
     '"><em class="g"></em><span>GAIN</span>' + (num(trim) ? '<span class="trim">(' + R.db(trim) + ')</span>' : '') + '</div></div>';
 
   function deckHtml(id, d) {
-    if (d && d.analyzing && d.file) {          // measuring a file, muted at the mixer
-      return '<div class="dk analyzing">' + meterHtml(id) + '<div class="dk-main"><div class="dk-head"><span class="dk-id">DECK ' + esc(id) + '</span>' +
-        '<span class="dk-state">analyzing · off air</span></div>' +
-        '<div class="dk-idle" title="Measuring its quiet start, end and average level; this deck is muted at the mixer and is taken back the moment the station needs it">' +
-        esc(R.whoLine(d)) + '</div></div></div>';
-    }
     if (!d || !d.file || !(playing(d) || d.state === 'loading')) {
       return '<div class="dk">' + meterHtml(id) + '<div class="dk-main"><div class="dk-head"><span class="dk-id">DECK ' + esc(id) + '</span>' +
         '<span class="dk-state">idle</span></div><div class="dk-idle">NO SIGNAL</div></div></div>';

@@ -169,7 +169,7 @@
   }
 
   // ── what is on air (the dashboard and the nav rail) ──────────────────────
-  R.playing = (d) => d && !d.analyzing && (d.state === 'playing' || d.state === 'fading');
+  R.playing = (d) => d && (d.state === 'playing' || d.state === 'fading');
   R.liveDeck = (st) => {
     if (!st || !st.decks) return null;
     const ds = ['A', 'B'].map((id) => st.decks[id]).filter(R.playing);

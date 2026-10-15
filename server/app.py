@@ -393,7 +393,8 @@ def post_forget():
 @app.post('/api/v1/analyze')
 @auth.operator_required
 def post_analyze():
-    """{station, scope: new|all|stop} or {station, key}: start / stop analyzing files on the off-air deck."""
+    """{station, scope: new|all|stop}: start / stop a run on the station's Core (its analysis players); or {station,
+    key}: that file again."""
     body = _json_body()
     station = _station(body.get('station'))
     if not station:

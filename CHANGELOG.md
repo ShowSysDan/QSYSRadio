@@ -5,6 +5,202 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [2.1.0] - 2026-10-15
+
+### Added
+- **Analysis players of the Core's own.** File analysis moves off the
+  on-air decks to Audio Players kept for it, each with a meter channel,
+  routed to no output and listed in the new `CFG.ANALYZERS`:
+  ```lua
+  ANALYZERS = {        -- {} (or absent) = no file analysis (figures are still learned from plays)
+    { player = "Analysis_Player", meter = "AnalysisMeter", meter_idx = 1 },
+  },
+  ```
+  They measure files for every station on the Core, at any hour, whatever
+  the stations do (playing, stopped or faulted). A station whose build
+  failed (a player or meter missing) has no library scan yet, so its
+  players' root is unknown: its listed files wait until it is built, rather
+  than fail under a guessed root. Nothing on air is touched
+  any more: no mixer mute, no deck taken over, no song shortened to make
+  room. The measurement is the same as before: unity gain, the first 6 s
+  (quiet start), 20 s from the middle (average level) and the last 15 s
+  (quiet end). That is about 37 s per song; a short file plays through.
+  The meter must be the same kind as the stations' (peak + rms) at the same
+  point (straight after the player), so the levels compare. Several
+  analysis players work through one list at once, each on a different
+  file: a second one halves a big backlog. A result counts at once on every
+  station of this Core that lists the same file (same media path), from
+  its next play. Other Cores' stations take it at their next library
+  upload, as before.
+- **Never stuck.** Each of these is reported as a failed `analysis` event,
+  and the player takes the next file:
+  - a load that fails: the player's own status;
+  - a load that never completes: `timeout (<status>)` after 1.5 s;
+  - a player that never reports the end: `timed out`, the file's length +
+    30 s after it started;
+  - a script error: `error on the Core`.
+
+  A listed file the analysis player cannot play (`Unsupported…`) also
+  leaves the rotation of every station of this Core that lists it, at once,
+  and is reported `file_unsupported`, several in a row too. Before, the
+  station found out on air.
+- **One root for every player.** Give the analysis player the same Root
+  as the stations' players (normally `Audio/`). When one root is a folder
+  of the other the Core translates the path. Otherwise that file fails with
+  `outside the analysis player's root …: give the analysis player the same
+  root, normally Audio/`, logged once per player and station.
+- **"Analyze new files"** (Settings → Silence detection; was "Analyze new
+  files daily at") has three kinds of value:
+  - **right away**, the new default: each new file within minutes, with
+    no run needed. A file that fails is tried again a day later, never in a
+    loop.
+  - **00:00 to 23:00**: a daily run at that hour (server time), as before.
+  - **off**: only what a library page starts.
+
+  It applies to the whole Core, so it is set for **All stations only**.
+  Saving it for a station answers 400, and a station's settings no longer
+  show it. Migration 0017 removes any value a station had of its own.
+  Saved `off` and `HH:00` values stay as they are. An install that never
+  saved one (the old default, 04:00) now analyzes right away.
+- **The library pages show the Core's analysis players**: each one idle
+  or `measuring <file> (<station>)` (`Core offline` while it does not
+  sync: no file is then shown queued, nor the header's Analyzing), plus
+  this station's files still to go, not analyzed and failed. The buttons
+  act on the station's Core:
+  - **Re-analyze all**: every file of every station on it.
+  - **Analyze new now**: the files not analyzed yet, failed ones too. In
+    right-away mode it is offered only when some failed, to try them at
+    once.
+  - **Stop**: ends the run and every file asked for on the Core's
+    stations. In right-away mode new files are still analyzed; set Off to
+    stop those too.
+
+  Analyze again on one file works as before. Without an analysis player
+  the page says to add one (`CFG.ANALYZERS`, radio.lua 2.1.0 or later), its
+  rows have no Analyze button and none shows "queued". A station with no
+  Core (a 1.x Core) answers 400 to the page's buttons. A station its Core
+  has not synced for 10 minutes (taken out of `CFG.STATIONS`) is no longer
+  on it: its page says **Not on its Core**, with nothing Analyzing or
+  queued, as its files are no longer listed.
+- **Heartbeat**: the Core's line ends with its analysis players, for
+  example `| analysis: Analysis_Player idle, Analysis_Player2 Main <file>, 12 listed`.
+- **MockCore 0.5.0**:
+  - analysis players by name (`MockCore.analyzers`), routed nowhere;
+  - files load from root + directory;
+  - file flags `hang` (the load never completes) and `noEnd` (the player
+    never reports the end);
+  - a fake per-Core analysis list (`MockCore.analysisQueue`, served with
+    `MockCore.serve{ core = … }`).
+
+  `scenario_analysis.lua` is rewritten for the analysis player. It keeps
+  the checks that still apply (figures, unity gain, head / middle / tail
+  jumps, failures). It adds: on-air decks never touched while three
+  stations play, two players sharing one list, figures shared at once, a
+  stuck load and a stuck player moving on, the root cases, no analysis
+  player at all, and a pasted 2.0.0 entry. `live_core.py --analyzers N`
+  runs N analysis players (default 1).
+
+### Changed
+- **The analysis job is the Core's** (migration 0017). The job moves to
+  `cores.analyze_from`, `analyze_run_at` and `analyze_auto_at`; a run in
+  progress on one of a 2.0.0 Core's stations carries over. A 1.x Core's
+  station keeps its run (such as the re-analysis of every file that 1.3.0
+  started, to measure each file's level) in its own columns until it first
+  syncs from a 2.x Core, which takes it over (journal: `ANALYSIS
+  station=Main core=… its run goes on as the Core's`); a later version
+  drops those columns. A Core owes the files present in the libraries of
+  its stations (those it synced in the last 10 minutes) that are not
+  unsupported. Each file is listed once, for one station that has it: the
+  files asked for first, then imaging and ads, then music, at most 20 per
+  reply.
+- **The Core's list is cached** on its row (`cores.owed`, `owed_rev`,
+  `owed_at`). It is made again when a result comes in, when something it
+  is made from changes (`analysis.stale`: a library upload, a run started
+  or stopped, a file asked for, the setting, Forget measured) or after a
+  minute. On 14 stations × 3,000 files the usual second costs about
+  0.7 ms; making the list again costs about 2 ms during a backlog and
+  75 ms at worst (every file analyzed).
+- **Protocol 2.1:**
+  - The sync body has `analyze_rev` at the top level, only from a Core
+    with an analysis player.
+  - It also has `analyzers: [{name, state: idle | measuring, station?,
+    key?}]`, sent when it changed or every 10 s. The server keeps it on
+    `cores.analyzers` for the library pages.
+  - Station parts no longer carry `analyze_rev`, and a station's
+    `state.analyze` is just `{can}`: this Core has an analysis player.
+  - The reply has, at the top level, `analyze: [{station, key}]` (at most
+    20, in the order to measure) with `analyze_rev`, when the Core's rev
+    differs.
+  - Results are `analysis` events of the station the job names, as before.
+- **Forget measured**: forgotten files count as never analyzed, so in
+  right-away mode they are measured again within minutes.
+- The Core keeps at most 100 files to analyze (was 5,000; the server sends
+  20).
+
+### Removed
+- **Analysis on the on-air decks**: the deck take-over, the mixer mute
+  (`mixer` / `mix` in `CFG.STATIONS`), the `analyzing` deck state and the
+  dashboard's "analyzing · off air" deck. The station's `RadioOut` mixer
+  stays in the design as its output; radio.lua no longer uses it.
+- A pasted 2.0.0 entry with `mixer` / `mix` is still accepted. At boot the
+  Core unmutes those mixer inputs once, because 2.0.0 left a deck's input
+  muted after an analysis until that deck's next on-air play. It logs
+  `CFG.STATIONS: mixer / mix no longer used (Main; their inputs unmuted
+  once): file analysis uses CFG.ANALYZERS`. Remove them after that first
+  boot.
+
+### Fixed
+- An analysis load that stalls is now given up 30 s after it started.
+  2.0.0 waited the previous file's length + 30 s, because the deck still
+  held the last file's duration.
+- A file taken off the Core's list while it was measured (Stop, or pushed
+  out of the first 20) and listed again later (Analyze again, Re-analyze
+  all) was never measured again: it stayed "queued" until the next Stop.
+- A second unsupported file loaded straight after another on the same
+  player (on air or for analysis) was reported `timeout (Unsupported file
+  format)`, a passing failure: it stayed in rotation and was tried again.
+  The player's status does not change between the two; the Core now goes
+  by the echo of the new file name, so it is reported unsupported.
+
+**Older Cores** keep syncing, playing and logging, but get no analysis
+work. This covers a 2.0.0 Core (`analyze_rev` in its station parts) and a
+1.x Core (the single-station body, still accepted). The server answers a
+non-empty per-station `analyze_rev` once with an empty list, which stops
+it. The library page then says the Core needs an analysis player. A run in
+progress waits on the server and goes on once the new radio.lua syncs. So
+paste the new radio.lua right after upgrading the server.
+
+Redeploy **both**, in this order:
+1. Back up (README, Installation step 11).
+2. **In Q-SYS Designer**, add an analysis player:
+   - an Audio Player with Code Name `Analysis_Player`, its output wired to
+     nothing;
+   - a True Peak/RMS meter channel straight after it, the same kind as the
+     stations' meters (for example a 1-channel meter `AnalysisMeter`);
+   - Script Access `Script` (or `All`) on both;
+   - the player's Root the same as the stations' players (normally
+     `Audio/`).
+
+   A second player and meter channel halves a big backlog. The `RadioOut`
+   mixer is no longer needed for analysis.
+3. **The server**: `git pull && sudo systemctl restart qsysradio`. This
+   runs migration 0017; reload open panel pages. From now on the 2.0.0 Core
+   gets no analysis work, so do step 4 right away.
+4. **Then the Core**: paste the new radio.lua into the **same** Text
+   Controller and keep your `CFG` values. Add `ANALYZERS`, as above.
+   **Keep `mixer` / `mix` in the station entries for this first boot**: the
+   new script unmutes those mixer inputs once, since 2.0.0 may have left
+   one muted mid-analysis (a deck that would then play silently). Remove
+   them after that boot (or, if you removed them already, check in Designer
+   that `RadioOut` inputs 1 and 2 are not muted). Save to Core & Run: one
+   restart, a short gap on air. The Debug Output says `analysis: 1
+   player(s)`.
+
+Going back from 2.1.0 to any older version (2.0.0, 1.6.0 or older) needs
+the backup from step 1: migration 0017 moves the analysis job from
+`stations` to `cores`, and "Analyze new files" can hold `right away`,
+which older servers cannot read.
+
 ## [2.0.0] - 2026-10-15
 
 ### Changed (breaking)

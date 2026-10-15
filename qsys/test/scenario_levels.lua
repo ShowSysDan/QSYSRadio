@@ -144,10 +144,14 @@ for _, fadeIn in ipairs({ 0, 2 }) do
   check(#evs("dead_air_guard") == 0 and not S.automation, string.format("fade-in %d s: no dead air, stopped cleanly", fadeIn))
 end
 
-print("-- analysis measures the average level in the middle of the file")
+print("-- analysis (the analysis player) measures the average level in the middle of the file")
 boot()
 S:setAutomation(false, "test")
-MockCore.at(1, function() S:analyze({ key("Test/Tuning/", MUSIC[1]), key("Test/Tuning/", MUSIC[2]), key("Test/Imaging/", IMAGING[1]) }, "r1") end)
+MockCore.at(1, function()
+  local list = {}
+  for i, k in ipairs({ key("Test/Tuning/", MUSIC[1]), key("Test/Tuning/", MUSIC[2]), key("Test/Imaging/", IMAGING[1]) }) do list[i] = { station = "Main", key = k } end
+  Analyzer:list(list, "r1")
+end)
 MockCore.run(120)
 local an = {}
 for _, e in ipairs(evs("analysis")) do if e.ok then an[e.dir .. e.file] = e end end
