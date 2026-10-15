@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **1.4.1** · see [CHANGELOG.md](CHANGELOG.md)
+Version **1.5.0** · see [CHANGELOG.md](CHANGELOG.md)
 
 A two-deck radio-station automation system built on a Q-SYS Core. Lua on the
 Core does the real-time work (deck control, crossfades, silence detection,
@@ -13,9 +13,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **1.4.1** — stable; standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **1.4.1** — offline Core stand-in + a live simulated Core for demos |
-| `server` — Flask + Postgres | **1.4.1** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **1.5.0** — stable; standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **1.5.0** — offline Core stand-in + a live simulated Core for demos |
+| `server` — Flask + Postgres | **1.5.0** — stable; own schema, migrate-on-start, play log, control panel, shared sign-in, settings by station, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -62,6 +62,11 @@ station settings, the library, syslog.
   and validated in `server/core_settings.py`, edited on the web page and
   pushed to the Core. `radio.lua` only carries fallback values (a test keeps
   the two in step).
+- **Settings by station.** Three layers, the most specific wins: radio.lua's
+  fallback, **All stations** (`app_settings`, `core.*`), **this station**
+  (`station_settings`). A station stores only what differs, the server's own
+  settings (IDs, ad timing, daily analysis) included; the folders are set
+  per station only, so a new station never inherits another's.
 - **Per-deck metering.** Player 1 → `meter.1`, Player 2 → `meter.2`.
 - **Two decks only.** A bumper or ad plays on the free deck; the next track
   starts under it on the other deck. Ads in one break play back to back,
@@ -206,7 +211,7 @@ server/
   app.py              routes (pages, web API, Core API)
   auth.py             shared sign-in (shared.users / shared.app_sessions)
   control.py          Core sync + library, commands, status, settings
-  core_settings.py    every station setting: label, range, default, help
+  core_settings.py    every station setting: label, range, default, help; the layers
   events.py           Core events -> core_events + play_log
   plays.py            play log queries
   db.py               pooled PostgreSQL access + small helpers
@@ -297,7 +302,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `1.4.1`.
+Expect the version, e.g. `1.5.0`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -429,13 +434,13 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `migrate: schema "qsysradio" at version 0012 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 1.4.1 starting on port
+- In the journal: `migrate: schema "qsysradio" at version 0014 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 1.5.0 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":13,"schema_version":13,"version":"1.4.1"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":14,"schema_version":14,"version":"1.5.0"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -580,10 +585,11 @@ In Q-SYS Designer, with the station's design open:
    Tools → Show Core Manager in Designer), then **Files** → **Audio**.
    Create the music and imaging folders and upload. The defaults are
    `Test/Tuning/` and `Test/Imaging/` under `Audio`. Change them later on the
-   Settings page (Music folder, Imaging folder). FLAC, MP3 and WAV are proven
-   on the Core; WMA does not load. Put a few bumpers in the imaging folder,
-   or set "Bumper every N songs" to 0. Ads are optional: put them in their
-   own folder and set the Advertisements folder on the Settings page.
+   Settings page, for the station (Music folder, Imaging folder). FLAC, MP3
+   and WAV are proven on the Core; WMA does not load. Put a few bumpers in
+   the imaging folder, or set "Bumper every N songs" to 0. Ads are optional:
+   put them in their own folder and set the station's Advertisements folder
+   on the Settings page.
 5. **Script.** Add a Text Controller (or Control Script). Open its Lua
    editor, paste all of `qsys/radio/radio.lua`, and change only `CFG`:
    ```lua
@@ -603,14 +609,14 @@ In Q-SYS Designer, with the station's design open:
    Start on the dashboard.
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 1.4.1 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 1.5.0 starting on Core 8 Flex (<design name>)
    16:00:01 library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    ```
    There should be no `! server: sync failed` lines. Every event prints one
    line, and a heartbeat prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main · radio.lua 1.4.1`, and under On air "No Core has
+   becomes `· Main · radio.lua 1.5.0`, and under On air "No Core has
    connected yet" becomes the playing track (artist – title). The journal
    shows `INFO BOOT station=Main ...` and then `PLAY` lines:
    ```
@@ -641,7 +647,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (8 in 1.4.1).
+The last line prints the number of tables (10 in 1.5.0).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -683,7 +689,7 @@ Every start (`start.sh`) does three things in order:
 
 - When CHANGELOG.md says radio.lua changed, paste the new radio.lua on the
   Core and re-enter your `CFG` values. So does a journal line like
-  `station=Main runs radio.lua 1.4.0, server is 1.4.1`.
+  `station=Main runs radio.lua 1.4.1, server is 1.5.0`.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -803,7 +809,7 @@ sudo journalctl -u qsysradio --since "1 hour ago" --no-pager | tail -n 50
 | `meter 'PlayerMeter' has no control peak.1` (or `peak.2`) | The meter's Script Access is `None`, or it has fewer than 2 channels (step 10) |
 | `! meter 'PlayerMeter' has no control rms.1: average levels are not measured` | The meter has no RMS reading: use a True Peak/RMS meter (step 10). The station plays on; files are not measured, so level matching only uses levels measured before |
 | `! mixer 'RadioOut' with input.1/2.mute.1 not found: file analysis is off` | The mixer's Code Name differs from `CFG.MIXER`, its Script Access is `None`, or the players are on other inputs (`MIX_A` / `MIX_B`). The station plays on; only file analysis is off |
-| `library: cannot list media/Audio/Test/Tuning/` | That folder is not on the Core: upload it, or change Music folder on the Settings page |
+| `library: cannot list media/Audio/Test/Tuning/` | That folder is not on the Core: upload it, or change the station's Music folder on the Settings page |
 | `! server: sync failed (403 ); N events queued`; journal: `/api/v1/core/sync: rejected request from <core-ip> (bad or missing X-Radio-Token)` | `CFG.SERVER_TOKEN` differs from `RADIO_API_TOKEN` (`grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`): paste it and run again |
 | Journal: `/api/v1/core/sync: refused, RADIO_API_TOKEN is not set in .env` | Re-run `sudo ./install.sh` (it generates one), then put it in `CFG.SERVER_TOKEN` |
 | `! server: sync failed (…)` with no 403 and nothing in the journal | The Core cannot reach the server: check `SERVER_URL`, the Core's routing and the firewall (steps 6, 10). It keeps playing and queues up to 5000 events until it can |
@@ -1004,13 +1010,23 @@ MockCore scenarios and `live_core.py`.
   Ad break now still play. Station IDs are not paused.
 - **Play log:** a day (search, type), what was on air at a moment, CSV.
   Today's list adds each play as it starts and ends.
-- **Settings** (admins): every station setting in a box per group (Library,
+- **Settings** (admins): a switch at the top of Station settings: **All
+  stations** or the station chosen in the header (the default, once a
+  station has connected). All stations: the values every station uses
+  unless it sets its own; a reset goes back to the default. A station: its
+  own values on top; each setting says where its value comes from (this
+  station, all stations, the default) and **use all stations (value)** takes
+  its own value away again. The folders (Library) are set per station only;
+  a station without a music folder of its own plays radio.lua's fallback,
+  and the page says so. The Core banner (running these settings / waiting)
+  shows for a station. Every station setting is in a box per group (Library,
   Bumpers & ads, Fades, Levels, Silence detection, Rotation, Safety), the
   boxes in columns (three on a wide screen, one on a phone). Each setting
-  shows its unit, what it does, where its value comes from (a green dot and
-  "set here", or the default) and what the Core is running. Changes are
-  marked amber, and the save bar counts them and stays in view until you
-  save or discard. Saved settings reach the Core within a second.
+  shows its unit, what it does, where its value comes from (a green dot when
+  set in the scope shown) and, for a station, what its Core is running.
+  Changes are marked amber, and the save bar counts them and stays in view
+  until you save or discard; switching scope or station asks first. Saved
+  settings reach the Core within a second. Syslog and clock (Server settings) are server-wide.
 
 Commands go to the server, the Core picks them up on its next sync (≤ 1 s)
 and reports the result, which shows in Activity. Pages poll short requests,
@@ -1273,6 +1289,7 @@ complete record.
 | 1.2.0 | Analyze one file from its row; failed analyses retried by the next run |
 | 1.3.0 | Level matching: each file's average level measured, every item played at the same average; deck gain and meters on the dashboard |
 | 1.4.0 | Panel refresh: nav rail with what is on air on every page, smoothed deck meters, pressed / sent / done transport keys, Settings in boxes, pages that reload themselves |
+| 1.5.0 | Settings by station: All stations, each station's own on top; folders per station |
 | Next | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
 | Later | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
 

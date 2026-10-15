@@ -822,22 +822,198 @@ def test_database_down_gives_503_not_500(app, monkeypatch):
 def test_settings_validation_and_push(app):
     admin = signed_in(app, 'admin')
     save = lambda **s: admin.post('/api/v1/settings', json={'settings': s}, headers=WEB)
+    here = lambda **s: admin.post('/api/v1/settings', json={'settings': s, 'scope': 'station', 'station': 'S7'}, headers=WEB)
+    sync(app, station='S7')
     assert save(crossfade_s=99).status_code == 400
     assert save(crossfade_s=True).status_code == 400
-    assert save(music_dir='').status_code == 400
-    assert save(music_dir={'x': 1}).status_code == 400
-    assert save(music_dir='../etc').status_code == 400
+    assert here(music_dir='').status_code == 400
+    assert here(music_dir={'x': 1}).status_code == 400
+    assert here(music_dir='../etc').status_code == 400
     assert save(bumper_every_n_tracks='4.5').status_code == 400
     assert save(nope=1).status_code == 400
-    assert save(bumper_every_n_tracks='3.0', bumper_fade_s=2.5, imaging_gain_db=-3, stop_fade_s=4,
-                music_dir='My Music').json['changed'] == ['bumper_every_n_tracks', 'bumper_fade_s', 'imaging_gain_db',
-                                                          'music_dir', 'stop_fade_s']
+    assert save(bumper_every_n_tracks='3.0', bumper_fade_s=2.5, imaging_gain_db=-3, stop_fade_s=4).json['changed'] == [
+        'bumper_every_n_tracks', 'bumper_fade_s', 'imaging_gain_db', 'stop_fade_s']
+    assert here(music_dir='My Music').json['changed'] == ['music_dir']                   # folders: per station
     first = sync(app, station='S7', settings_rev='').json
     assert first['settings'] == {'bumper_every_n_tracks': 3, 'bumper_fade_s': 2.5, 'imaging_gain_db': -3, 'stop_fade_s': 4,
                                  'music_dir': 'My Music/'}
     assert 'settings' not in sync(app, station='S7', settings_rev=first['settings_rev']).json
-    assert save(music_dir=None).json['changed'] == ['music_dir']                          # back to the default
+    assert here(music_dir=None).json['changed'] == ['music_dir']                          # back to the default
     assert 'music_dir' not in sync(app, station='S7', settings_rev=first['settings_rev']).json['settings']
+
+
+def settings_for(app, station):
+    """The settings and rev a Core with nothing yet gets on its next sync."""
+    r = sync(app, station=station, settings_rev='').json
+    return r['settings'], r['settings_rev']
+
+
+def test_settings_by_station_layers(app):
+    """radio.lua's fallback <- All stations <- this station: each station gets its own merged values and rev."""
+    sync(app, station='SL1')
+    sync(app, station='SL2')
+    admin = signed_in(app, 'admin')
+    save = lambda station=None, **s: admin.post('/api/v1/settings', headers=WEB, json=dict(
+        {'settings': s}, **({'scope': 'station', 'station': station} if station else {'scope': 'all'})))
+    try:
+        assert save(crossfade_s=5).json == {'ok': True, 'changed': ['crossfade_s'], 'scope': 'all', 'station': None}
+        (s1, rev1), (s2, rev2) = settings_for(app, 'SL1'), settings_for(app, 'SL2')
+        assert s1['crossfade_s'] == s2['crossfade_s'] == 5 and s1 == s2 and rev1 == rev2   # nothing of their own: All stations
+        assert save('SL1', crossfade_s=8).json == {'ok': True, 'changed': ['crossfade_s'], 'scope': 'station', 'station': 'SL1'}
+        (s1, rev1), (s2, rev2) = settings_for(app, 'SL1'), settings_for(app, 'SL2')
+        assert s1['crossfade_s'] == 8 and s2['crossfade_s'] == 5 and rev1 != rev2
+        # an All-stations change reaches a station without its own value, not one with
+        assert save(crossfade_s=6, fade_in_s=1).status_code == 200
+        (s1, _), (s2, _) = settings_for(app, 'SL1'), settings_for(app, 'SL2')
+        assert (s1['crossfade_s'], s1['fade_in_s']) == (8, 1) and (s2['crossfade_s'], s2['fade_in_s']) == (6, 1)
+        # a station value equal to the All-stations one still counts as its own; reset = back to All stations
+        assert save('SL2', fade_in_s=1).json['changed'] == ['fade_in_s']
+        assert save(fade_in_s=2).status_code == 200
+        assert settings_for(app, 'SL2')[0]['fade_in_s'] == 1 and settings_for(app, 'SL1')[0]['fade_in_s'] == 2
+        assert save('SL1', crossfade_s=None).json['changed'] == ['crossfade_s']
+        assert settings_for(app, 'SL1')[0]['crossfade_s'] == 6
+        assert save('SL2', fade_in_s=None).status_code == 200
+        assert settings_for(app, 'SL1') == settings_for(app, 'SL2')                       # the same again: the same rev
+        # the log line names the scope; a station reset reads as back to All stations
+        conn = db.connect()
+        try:
+            user = {'username': 'admin'}
+            assert control.save_settings(conn, {'skip_fade_s': 3}, user, 'SL1')[1] == (
+                20, 'SETTINGS station=SL1 changed by=admin skip_fade_s=3.0')
+            assert control.save_settings(conn, {'skip_fade_s': None, 'music_dir': 'M'}, user, 'SL1')[1] == (
+                20, 'SETTINGS station=SL1 changed by=admin music_dir=M/ skip_fade_s=all-stations')
+            assert control.save_settings(conn, {'music_dir': None}, user, 'SL1')[1][1].endswith(' music_dir=default')
+            assert control.save_settings(conn, {'skip_fade_s': 2}, user)[1] == (
+                20, 'SETTINGS station=all changed by=admin skip_fade_s=2.0')
+            assert control.save_settings(conn, {'skip_fade_s': None}, user)[1][1].endswith(' skip_fade_s=default')
+        finally:
+            conn.close()
+        assert save('NOPE', crossfade_s=3).status_code == 400                              # no such station
+        assert signed_in(app, 'operator').post('/api/v1/settings', json={'settings': {'crossfade_s': 3}, 'scope': 'station',
+                                                                          'station': 'SL1'}, headers=WEB).status_code == 403
+    finally:
+        save(crossfade_s=None, fade_in_s=None)
+
+
+def test_folders_are_set_per_station_only(app):
+    sync(app, station='FD1')
+    sync(app, station='FD2')
+    admin = signed_in(app, 'admin')
+    post = lambda body: admin.post('/api/v1/settings', json=body, headers=WEB)
+    for name in ('music_dir', 'imaging_dir', 'ads_dir'):
+        r = post({'settings': {name: 'X'}})
+        assert r.status_code == 400 and 'set per station' in r.json['error'], name
+        assert post({'settings': {name: 'X'}, 'scope': 'all'}).status_code == 400
+    assert post({'settings': {'music_dir': 'Zone 1', 'ads_dir': 'Spots'}, 'scope': 'station', 'station': 'FD1'}).json['changed'] == [
+        'ads_dir', 'music_dir']
+    s1, s2 = settings_for(app, 'FD1')[0], settings_for(app, 'FD2')[0]
+    assert (s1['music_dir'], s1['ads_dir']) == ('Zone 1/', 'Spots/') and 'music_dir' not in s2 and 'ads_dir' not in s2
+    # a folder left in the All-stations rows (never written by the server) is never read
+    sql("""INSERT INTO qsr_test.app_settings (key, value) VALUES ('core.music_dir', '"Old/"')""")
+    try:
+        assert 'music_dir' not in settings_for(app, 'FD2')[0] and settings_for(app, 'FD1')[0]['music_dir'] == 'Zone 1/'
+        assert 'music_dir' not in {x['name'] for x in admin.get('/api/v1/settings?scope=all').json['settings']}
+    finally:
+        sql("DELETE FROM qsr_test.app_settings WHERE key = 'core.music_dir'")
+
+
+def test_settings_views_all_stations_and_one_station(app):
+    sync(app, station='SV1', state=dict(STATE, settings={'crossfade_s': 4, 'fade_in_s': 0}))
+    admin, viewer = signed_in(app, 'admin'), signed_in(app, 'viewer')
+    save = lambda body: admin.post('/api/v1/settings', json=body, headers=WEB)
+    try:
+        assert save({'settings': {'crossfade_s': 5, 'ad_fit_tolerance_s': 60}}).status_code == 200
+        assert save({'settings': {'fade_in_s': 2, 'music_dir': 'Zone/', 'ad_fit_tolerance_s': 30},
+                     'scope': 'station', 'station': 'SV1'}).status_code == 200
+        every = viewer.get('/api/v1/settings?station=SV1&scope=all').json
+        assert (every['scope'], every['station']) == ('all', None) and 'rev' not in every
+        rows = {x['name']: x for x in every['settings']}
+        assert not set(rows) & core_settings.STATION_ONLY and not any(x['station_only'] for x in rows.values())
+        assert set(rows) == set(core_settings.BY_NAME) - core_settings.STATION_ONLY
+        assert {k: rows['crossfade_s'][k] for k in ('override', 'all', 'source', 'default')} == {
+            'override': 5, 'all': 5, 'source': 'all', 'default': 4}
+        assert (rows['fade_in_s']['override'], rows['fade_in_s']['source']) == (None, 'default') and 'own' not in rows['fade_in_s']
+        one = viewer.get('/api/v1/settings?station=SV1').json
+        assert (one['scope'], one['station']) == ('station', 'SV1') and one['rev'] and 'in_sync' in one
+        rows = {x['name']: x for x in one['settings']}
+        assert set(rows) == set(core_settings.BY_NAME) and rows['music_dir']['station_only'] is True
+        pick = lambda n: {k: rows[n][k] for k in ('override', 'own', 'all', 'source', 'running')}
+        assert pick('crossfade_s') == {'override': None, 'own': None, 'all': 5, 'source': 'all', 'running': 4}
+        assert pick('fade_in_s') == {'override': 2, 'own': 2, 'all': None, 'source': 'station', 'running': 0}
+        assert pick('music_dir') == {'override': 'Zone/', 'own': 'Zone/', 'all': None, 'source': 'station', 'running': None}
+        assert pick('dead_air_s')['source'] == 'default'
+        assert pick('ad_fit_tolerance_s') == {'override': 30, 'own': 30, 'all': 60, 'source': 'station', 'running': 30}
+        assert rows['ident_schedule']['running'] == 'off'                     # the server's own: what it uses for SV1
+        assert one['in_sync'] is False                                         # the Core has not taken them yet
+        sync(app, station='SV1', settings_rev=one['rev'])
+        assert viewer.get('/api/v1/settings?station=SV1').json['in_sync'] is True
+        assert viewer.get('/api/v1/settings?station=nope').json['scope'] == 'all'          # no such station: All stations
+        assert viewer.get('/api/v1/settings').json['scope'] == 'station'                   # the most recent station
+        conn = db.connect()
+        try:
+            assert control.settings_view(conn, None)['scope'] == 'all'                     # no station has connected
+        finally:
+            conn.close()
+    finally:
+        save({'settings': {'crossfade_s': None, 'ad_fit_tolerance_s': None}})
+
+
+def test_server_only_settings_per_station(app):
+    """ident_schedule, ad_fit_tolerance_s, ident_window_min, analyze_at: per station, like the rest."""
+    items = [{'key': 'I/id.wav', 'dir': 'I/', 'file': 'id.wav', 'kind': 'imaging'},
+             {'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music', 'size': 1}]
+    op, admin = signed_in(app, 'operator'), signed_in(app, 'admin')
+    for st in ('SO1', 'SO2'):
+        library_post(app, st, items)
+        assert op.post('/api/v1/library/ident', json={'station': st, 'key': 'I/id.wav', 'ident': True}, headers=WEB).status_code == 200
+    save = lambda station=None, **s: admin.post('/api/v1/settings', headers=WEB, json=dict(
+        {'settings': s}, **({'scope': 'station', 'station': station} if station else {})))
+    plan = lambda st: sync(app, station=st, ads_rev='').json['ads']
+    try:
+        assert save(ident_schedule='off', analyze_at='off').status_code == 200
+        assert 'ident' not in plan('SO1') and 'ident' not in plan('SO2')
+        assert save('SO1', ident_schedule='quarter-hourly', ident_window_min=15).status_code == 200
+        assert plan('SO1')['ident'] == 'I/id.wav' and 'ident' not in plan('SO2')
+        assert op.get('/api/v1/now?station=SO1').json['station']['ident']['next_at']
+        assert op.get('/api/v1/now?station=SO2').json['station']['ident']['next_at'] is None
+        assert 'ident_schedule' not in settings_for(app, 'SO1')[0]                     # still not sent to the Core
+        # analyze_at: SO1's daily run starts (its time has passed today); SO2 stays off
+        assert save('SO1', analyze_at='00:00').status_code == 200
+        assert sync(app, station='SO1', analyze_rev='').json['analyze'] == ['I/id.wav', 'M/a.mp3']
+        assert 'analyze' not in sync(app, station='SO2', analyze_rev='').json
+        assert op.get('/api/v1/now?station=SO1').json['station']['analysis']['at'] == '00:00'
+        assert op.get('/api/v1/now?station=SO2').json['station']['analysis']['at'] == 'off'
+        assert 'analyze_at' not in settings_for(app, 'SO1')[0]
+    finally:
+        save(ident_schedule=None, analyze_at=None)
+
+
+def test_migration_0014_moves_the_folders_to_every_station():
+    """The folders set for everyone become each existing station's own; nothing else moves."""
+    path = next(p for v, _, p, _ in migrate.discover() if v == 14)
+    sql('DROP SCHEMA IF EXISTS qsr_test_m14 CASCADE; CREATE SCHEMA qsr_test_m14; '
+        'CREATE TABLE qsr_test_m14.stations (station TEXT PRIMARY KEY); '
+        'CREATE TABLE qsr_test_m14.app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, '
+        'updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())')
+    try:
+        sql("INSERT INTO qsr_test_m14.stations VALUES ('Main'), ('Zone')")
+        sql("""INSERT INTO qsr_test_m14.app_settings (key, value) VALUES ('core.music_dir', '"Music/"'),
+               ('core.imaging_dir', '"Imaging/"'), ('core.crossfade_s', '5'), ('syslog.host', '"h"')""")
+        conn = db.connect(search_path=False)
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SET LOCAL search_path TO qsr_test_m14')
+                cur.execute(path.read_text(encoding='utf-8'))
+            conn.commit()
+        finally:
+            conn.close()
+        moved = sql('SELECT station, name, value FROM qsr_test_m14.station_settings ORDER BY 1, 2', fetch=True)
+        assert [tuple(r) for r in moved] == [('Main', 'imaging_dir', '"Imaging/"'), ('Main', 'music_dir', '"Music/"'),
+                                             ('Zone', 'imaging_dir', '"Imaging/"'), ('Zone', 'music_dir', '"Music/"')]
+        left = sql('SELECT key FROM qsr_test_m14.app_settings ORDER BY 1', fetch=True)
+        assert [r[0] for r in left] == ['core.crossfade_s', 'syslog.host']
+    finally:
+        sql('DROP SCHEMA IF EXISTS qsr_test_m14 CASCADE')
 
 
 def test_syslog_set_on_the_settings_page(app):

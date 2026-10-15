@@ -52,7 +52,7 @@ def sync(cur, station, core_rev):
         return {}, []
     lines, job = [], _job(cur, station)
     since, run_at = job['analyze_from'], job['analyze_run_at']
-    at = core_settings.load(cur).get('analyze_at', core_settings.BY_NAME['analyze_at'][7])
+    at = core_settings.effective(cur, station)['analyze_at']
     if at != 'off':
         cur.execute("""SELECT date_trunc('day', NOW()) + %s::interval <= NOW()
                               AND (%s::timestamptz IS NULL OR %s < date_trunc('day', NOW()) + %s::interval) AS due""",
@@ -114,4 +114,4 @@ def view(cur, station, state):
     can = (state.get('analyze') or {}).get('can') is True
     return {'active': since is not None or left > 0, 'left': left, 'never': counts['never'], 'failed': counts['failed'], 'can': can,
             'auto_at': iso(job and job['analyze_auto_at']), 'last': iso(counts['last']),
-            'at': core_settings.load(cur).get('analyze_at', core_settings.BY_NAME['analyze_at'][7])}
+            'at': core_settings.effective(cur, station)['analyze_at']}

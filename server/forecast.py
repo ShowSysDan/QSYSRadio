@@ -13,9 +13,8 @@ SONG_GUESS_S = 210         # length assumed for a file never played
 SPOT_GUESS_S = 30
 
 
-def _settings(cur, state):
-    s = {n: spec[7] for n, spec in core_settings.BY_NAME.items()}
-    s.update(core_settings.load(cur))
+def _settings(cur, station, state):
+    s = core_settings.effective(cur, station)
     s.update({k: v for k, v in (state.get('settings') or {}).items() if k in s and isinstance(v, (int, float, str))})
     return s
 
@@ -30,7 +29,7 @@ def forecast(cur, station, state, age_s, n=10):
     Holds and the station ID schedule are followed."""
     if not state.get('automation'):
         return []
-    s = _settings(cur, state)
+    s = _settings(cur, station, state)
     cur.execute("""SELECT key, kind, file, artist, title, duration_s, COALESCE(trail_set_s, trail_s) AS trail_s,
                           COALESCE(lead_set_s, lead_in_s) AS lead_in_s, last_played FROM library
                    WHERE station = %s AND present AND NOT unsupported""", (station,))

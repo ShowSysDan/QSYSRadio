@@ -393,15 +393,24 @@ def post_ad_rule():
 @app.get('/api/v1/settings')
 @auth.login_required
 def get_settings():
-    return jsonify(ok=True, **control.settings_view(dbconn(), _station()))
+    """?station=X (default the most recent) -> that station's view; ?scope=all (or no station yet) -> All stations."""
+    station = None if _arg('scope') == 'all' else _station()
+    return jsonify(ok=True, **control.settings_view(dbconn(), station))
 
 
 @app.post('/api/v1/settings')
 @auth.admin_required
 def post_settings():
-    changed, line = control.save_settings(dbconn(), _json_body().get('settings'), auth.current_user())
+    """{settings, scope: 'station' (with station; default the most recent) | 'all' (the default)}."""
+    body = _json_body()
+    station = None
+    if body.get('scope') == 'station':
+        station = _station(body.get('station'))
+        if not station:
+            raise BadRequest('no such station: choose one that has connected, or All stations')
+    changed, line = control.save_settings(dbconn(), body.get('settings'), auth.current_user(), station)
     write_logs([line])
-    return jsonify(ok=True, changed=changed)
+    return jsonify(ok=True, changed=changed, scope='station' if station else 'all', station=station)
 
 
 @app.get('/api/v1/server-settings')

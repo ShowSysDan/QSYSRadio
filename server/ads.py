@@ -103,10 +103,6 @@ def schedule(cur, station):
     return {r['key']: r for r in rows}, rows[0]['hour_start']
 
 
-def _setting(cur, name):
-    return core_settings.load(cur).get(name, core_settings.BY_NAME[name][7])
-
-
 def next_song(cur, station, slot=None):
     """The song the Core should play after the one on air: (key, why) or (None, None).
 
@@ -128,6 +124,7 @@ def next_song(cur, station, slot=None):
     state = (on_air and on_air['state']) or {}
     if not on_air or state.get('queue') or state.get('automation') is not True:
         return None, None
+    s = core_settings.effective(cur, station)
     cur.execute("""SELECT key, duration_s, COALESCE(trail_set_s, trail_s) AS trail_s,
                           COALESCE(lead_set_s, lead_in_s) AS lead_in_s, count(*) OVER () AS n FROM library
                    WHERE station = %s AND present AND NOT unsupported AND kind = 'music' AND key IS DISTINCT FROM %s
@@ -135,7 +132,7 @@ def next_song(cur, station, slot=None):
                          SELECT lower(artist) FROM (SELECT artist FROM play_log WHERE station = %s AND kind = 'music'
                                                     ORDER BY started_at DESC LIMIT %s) a WHERE artist IS NOT NULL)
                    ORDER BY last_played NULLS FIRST, key LIMIT %s""",
-                (station, on_air['key'], station, int(_setting(cur, 'artist_separation')), POOL))
+                (station, on_air['key'], station, int(s['artist_separation']), POOL))
     oldest = cur.fetchall()
     if not oldest:
         return None, None
@@ -147,10 +144,10 @@ def next_song(cur, station, slot=None):
     quarter, half = shuffled(0.25), shuffled(0.5)
     if not (slot and on_air['duration_s']):
         return quarter[0]['key'], 'rotation'
-    air = airtime({n: float(_setting(cur, n)) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})
+    air = airtime({n: float(s[n]) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})
     gap = (slot[0] - on_air['started_at']).total_seconds() - air(on_air)     # from the next song's start to the slot
     timed = lambda pool: [(r['key'], air(r)) for r in pool if r['duration_s']]
-    return choose(quarter[0]['key'], timed(quarter), timed(half), gap, float(_setting(cur, 'ad_fit_tolerance_s')), slot[1])
+    return choose(quarter[0]['key'], timed(quarter), timed(half), gap, float(s['ad_fit_tolerance_s']), slot[1])
 
 
 def airtime(settings):

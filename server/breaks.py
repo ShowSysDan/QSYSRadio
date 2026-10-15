@@ -22,10 +22,6 @@ WHAT = ('ads', 'bumpers')
 EVERY_MIN = {'off': 0, 'hourly': 60, 'half-hourly': 30, 'quarter-hourly': 15}
 
 
-def _setting(cur, name):
-    return core_settings.load(cur).get(name, core_settings.BY_NAME[name][7])
-
-
 def holds(cur, station):
     """{'ads': {'until': datetime | None}, ...} for the holds in force (until None = until resumed)."""
     cur.execute("""SELECT what, until, set_by FROM station_holds
@@ -79,8 +75,9 @@ def set_ident(conn, station, key, ident):
 def idents(cur, station, now=None):
     """The ID schedule: {'due': key | None, 'next_at': datetime | None, 'window_s', 'keys': [...]}.
     due = the ID to play at the next song change (its slot is open and no ID played since it opened)."""
-    every = EVERY_MIN.get(_setting(cur, 'ident_schedule'), 0)
-    window = int(_setting(cur, 'ident_window_min')) * 60
+    s = core_settings.effective(cur, station)
+    every = EVERY_MIN.get(s['ident_schedule'], 0)
+    window = int(s['ident_window_min']) * 60
     cur.execute("""SELECT key FROM library WHERE station = %s AND kind = 'imaging' AND ident AND present AND NOT unsupported
                    ORDER BY key""", (station,))
     keys = [r['key'] for r in cur.fetchall()]

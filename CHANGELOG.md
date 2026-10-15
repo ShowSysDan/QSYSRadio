@@ -5,6 +5,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [1.5.0] - 2026-10-15
+
+### Added
+- **Settings by station.** Three layers, the most specific wins: radio.lua's
+  fallback, then **All stations**, then **this station**. A station stores
+  only what differs (new table `station_settings`, migration 0014); the
+  All-stations values stay where they were (`app_settings`, `core.*`). Each
+  station's Core gets its own merged settings and its own rev; a station
+  with nothing of its own gets exactly the All-stations values, as before.
+  The server's own settings (Station ID schedule, Station ID may be late by,
+  Ad timing tolerance, Analyze new files daily at) are per station the same
+  way: ad plans, IDs, the next-song pick, file analysis and Coming up use the
+  station's values.
+- **Settings page: All stations or one station.** A switch at the top of
+  Station settings: **All stations** or the station chosen in the header
+  (the default, once a station has connected). For a station, each setting
+  says where its value comes from (this station, all stations or the
+  default) and **use all stations (value)** takes a station's own value away
+  again. Switching scope or the header's station asks first when there are
+  unsaved changes. `GET /api/v1/settings?station=X[&scope=all]` says which
+  view it is and adds `all`, `own`, `source` and `station_only` to each row;
+  `POST /api/v1/settings` takes `scope: 'station'` (with `station`) or
+  `'all'` (the default, as before). The SETTINGS log line names the scope
+  (`station=Main` or `station=all`); a station reset reads
+  `name=all-stations`.
+
+### Changed
+- **The folders are per station only.** Music, Imaging and Advertisements
+  folder are set for a station, never for all stations (the server answers
+  400), so a new station never inherits another's folders. A station without
+  a music folder of its own plays radio.lua's fallback folder, and its
+  Settings page says so.
+
+Redeploy the server: `git pull && sudo systemctl restart qsysradio` (runs
+migration 0014; reload open panel pages). Nothing else to do: the migration
+moves the folders set today to every station already known, so the existing
+station keeps its folders, and every other setting becomes its All-stations
+value. The Core gets the same settings with the same rev (no rescan). The
+Core only changed its version number: paste radio.lua when convenient
+(until then the server logs a version mismatch).
+
 ## [1.4.1] - 2026-10-14
 
 ### Changed

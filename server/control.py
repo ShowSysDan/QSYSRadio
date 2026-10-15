@@ -144,10 +144,10 @@ def core_sync(conn, payload, now):
         newest = cur.fetchone()[0]
         if ack > newest:            # server DB was reset: tell the Core to start over
             reply['ack_reset'] = newest
-        overrides = core_settings.for_core(core_settings.load(cur))
-        rev = core_settings.rev(overrides)
+        values = core_settings.for_core(core_settings.merged(cur, station))
+        rev = core_settings.rev(values)
         if (text(payload.get('settings_rev'), 50) or '') != rev:
-            reply['settings'], reply['settings_rev'] = overrides, rev
+            reply['settings'], reply['settings_rev'] = values, rev
         plan, rev = ads.plan(cur, station)
         if (text(payload.get('ads_rev'), 50) or '') != rev:
             reply['ads'], reply['ads_rev'] = plan, rev
@@ -458,32 +458,43 @@ def library(conn, station, q=None, kind=None, sort='artist', limit=200, offset=0
     return total, items, totals
 
 
-def _setting_rows(spec, overrides, running):
-    return [{'name': n, 'label': lb, 'group': g, 'type': t, 'min': None if t == 'choice' else lo,
-             'max': hi, 'step': st, 'choices': list(lo) if t == 'choice' else None, 'default': d, 'help': h,
-             'override': overrides.get(n), 'running': running.get(n), 'server_only': n in core_settings.SERVER_ONLY}
+def _setting_rows(spec, overrides, running, extra=lambda n: {}):
+    return [dict({'name': n, 'label': lb, 'group': g, 'type': t, 'min': None if t == 'choice' else lo,
+                  'max': hi, 'step': st, 'choices': list(lo) if t == 'choice' else None, 'default': d, 'help': h,
+                  'override': overrides.get(n), 'running': running.get(n), 'server_only': n in core_settings.SERVER_ONLY},
+                 **extra(n))
             for n, lb, g, t, lo, hi, st, d, h in spec]
 
 
 def settings_view(conn, station):
+    """The Settings page. station None = All stations (no folders: those are per station); else that station's
+    view: per row its own value, the All-stations one, where the value in force comes from (station | all |
+    default) and what the Core runs (the server's own settings: what the server uses for it).
+    'override' = the value set in the scope shown."""
     with conn.cursor() as cur:
-        overrides = core_settings.load(cur)
-        running, rev_core = {}, None
+        every, own = core_settings.layers(cur, station)
+        r = None
         if station:
             cur.execute('SELECT state, settings_rev FROM stations WHERE station = %s', (station,))
             r = cur.fetchone()
-            if r:
-                running = (_clean_state(r['state']) or {}).get('settings') or {}
-                rev_core = r['settings_rev']
-    rev = core_settings.rev(core_settings.for_core(overrides))
+    if not station:
+        spec = [x for x in core_settings.SPEC if x[0] not in core_settings.STATION_ONLY]
+        return {'scope': 'all', 'station': None, 'settings': _setting_rows(spec, every, {}, lambda n: {
+            'all': every.get(n), 'source': 'all' if n in every else 'default', 'station_only': False})}
+    values = {**every, **own}
+    running = ((_clean_state(r['state']) if r else None) or {}).get('settings') or {}
     for name in core_settings.SERVER_ONLY:          # the server's own: "running" is what it uses
-        running[name] = overrides.get(name, core_settings.BY_NAME[name][7])
-    return {'rev': rev, 'core_rev': rev_core, 'in_sync': rev_core == rev,
-            'settings': _setting_rows(core_settings.SPEC, overrides, running)}
+        running[name] = values.get(name, core_settings.DEFAULTS[name])
+    rev, rev_core = core_settings.rev(core_settings.for_core(values)), r and r['settings_rev']
+    return {'scope': 'station', 'station': station, 'rev': rev, 'core_rev': rev_core, 'in_sync': rev_core == rev,
+            'settings': _setting_rows(core_settings.SPEC, own, running, lambda n: {
+                'all': every.get(n), 'own': own.get(n), 'station_only': n in core_settings.STATION_ONLY,
+                'source': 'station' if n in own else 'all' if n in every else 'default'})}
 
 
-def _save(conn, form, user, spec, prefix, what):
-    """form: {name: value, or None to go back to the default}.
+def _save(conn, form, user, spec, what, prefix=core_settings.PREFIX, station=None):
+    """form: {name: value, or None to go back to the layer below: the default, or for a station its
+    All-stations value (its folders: the default)}. station: into that station's own layer.
     Returns (changed names, log_line or None)."""
     if not isinstance(form, dict):
         raise BadRequest('expected an object of settings')
@@ -497,19 +508,25 @@ def _save(conn, form, user, spec, prefix, what):
         except ValueError as exc:
             raise BadRequest(str(exc))
     with conn.cursor() as cur:
-        before = core_settings.load(cur, prefix, by_name)
+        before = core_settings.layer(cur, station) if station else core_settings.load(cur, prefix, by_name)
         changed = {k: v for k, v in changes.items() if before.get(k) != v}
-        core_settings.save(cur, changed, prefix)
+        core_settings.save(cur, changed, prefix, station)
     conn.commit()
+    below = lambda k: 'all-stations' if station and k not in core_settings.STATION_ONLY else 'default'
     line = None
     if changed:
         line = (20, f'{what} changed by={user.get("username")} ' +
-                ' '.join(f'{k}={"default" if v is None else v}' for k, v in sorted(changed.items())))
+                ' '.join(f'{k}={below(k) if v is None else v}' for k, v in sorted(changed.items())))
     return sorted(changed), line
 
 
-def save_settings(conn, form, user):
-    return _save(conn, form, user, core_settings.SPEC, core_settings.PREFIX, 'SETTINGS')
+def save_settings(conn, form, user, station=None):
+    """Into one layer: All stations (station None; never the folders) or that station's own values."""
+    if not station and isinstance(form, dict):
+        folder = next((x[1] for x in core_settings.SPEC if x[0] in form and x[0] in core_settings.STATION_ONLY), None)
+        if folder:
+            raise BadRequest(f'{folder} is set per station: choose the station, not All stations')
+    return _save(conn, form, user, core_settings.SPEC, f'SETTINGS station={station or "all"}', station=station)
 
 
 # ── Server settings (syslog, clock) ──────────────────────────────────────────
@@ -548,7 +565,7 @@ def save_server_settings(conn, form, user):
     for m, what in SERVER_GROUPS:
         part = {k: v for k, v in form.items() if k in {x[0] for x in m.spec()}}
         if part:
-            c, line = _save(conn, part, user, m.spec(), m.PREFIX, what)
+            c, line = _save(conn, part, user, m.spec(), what, m.PREFIX)
             changed += c
             lines.append(line)
     apply_server_settings(conn)

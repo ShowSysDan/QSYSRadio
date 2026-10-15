@@ -1,10 +1,12 @@
 """Station settings: defined, documented and validated here, edited on the web
 page, pushed to the Core on its next sync.
 
-Only overrides are stored (app_settings key 'core.<name>'); a setting with no
-override uses the fallback in radio.lua's SETTINGS table (the `default`
-column below must match it). The Core reports the values it is running,
-which the settings page shows next to each field.
+Three layers, the most specific wins: radio.lua's fallback (its SETTINGS
+table; the `default` column below must match it) <- All stations (app_settings
+key 'core.<name>') <- this station (station_settings). Each layer stores only
+what differs. The folders (STATION_ONLY) are never set for all stations. The
+Core reports the values it is running, which the settings page shows next to
+each field.
 """
 import hashlib
 import json
@@ -100,8 +102,10 @@ SPEC = [
      'If nothing is playing for this long, start something (seconds).'),
 ]
 BY_NAME = {s[0]: s for s in SPEC}
+DEFAULTS = {s[0]: s[7] for s in SPEC}
 REQUIRED = {'music_dir'}
 SERVER_ONLY = {'ad_fit_tolerance_s', 'ident_schedule', 'ident_window_min', 'analyze_at'}   # the server's own; not sent to the Core
+STATION_ONLY = {'music_dir', 'imaging_dir', 'ads_dir'}      # each station its own folders; never set for all stations
 PREFIX = 'core.'
 
 
@@ -147,32 +151,69 @@ def coerce(name, raw, by_name=None):
     return f
 
 
-def load(cur, prefix=PREFIX, by_name=None):
-    """{name: value} overrides stored on the server."""
-    cur.execute('SELECT key, value FROM app_settings WHERE key LIKE %s', (prefix + '%',))
+def _decode(rows, by_name=None):
+    """{name: value} from (name, JSON text) pairs, known names only."""
     out = {}
-    for r in cur.fetchall():
-        name = r['key'][len(prefix):]
+    for name, raw in rows:
         if name in (by_name or BY_NAME):
             try:
-                out[name] = json.loads(r['value'])
+                out[name] = json.loads(raw)
             except ValueError:
                 pass
     return out
 
 
-def for_core(overrides):
-    return {k: v for k, v in overrides.items() if k not in SERVER_ONLY}
+def load(cur, prefix=PREFIX, by_name=None):
+    """{name: value} stored in app_settings under prefix (the server settings use their own)."""
+    cur.execute('SELECT key, value FROM app_settings WHERE key LIKE %s', (prefix + '%',))
+    return _decode(((r['key'][len(prefix):], r['value']) for r in cur.fetchall()), by_name)
 
 
-def rev(overrides):
-    return hashlib.sha1(json.dumps(overrides, sort_keys=True).encode()).hexdigest()[:12]
+def layers(cur, station=None):
+    """(All stations, the station's own) values, in one query; the folders only ever from the station's own."""
+    cur.execute("""SELECT FALSE AS own, substr(key, %s) AS name, value FROM app_settings WHERE key LIKE %s
+                   UNION ALL SELECT TRUE, name, value FROM station_settings WHERE station = %s""",
+                (len(PREFIX) + 1, PREFIX + '%', station))
+    rows = cur.fetchall()
+    return (_decode((r['name'], r['value']) for r in rows if not r['own'] and r['name'] not in STATION_ONLY),
+            _decode((r['name'], r['value']) for r in rows if r['own']))
 
 
-def save(cur, changes, prefix=PREFIX):
-    """changes: {name: value or None (= back to the default)}."""
+def layer(cur, station=None):
+    """One layer: All stations (station None) or that station's own values."""
+    return layers(cur, station)[1 if station else 0]
+
+
+def merged(cur, station):
+    """The station's values that differ from radio.lua's fallbacks: All stations, its own on top."""
+    every, own = layers(cur, station)
+    return {**every, **own}
+
+
+def effective(cur, station):
+    """Every station setting in force for this station (the server's reads: ads, IDs, analysis, forecast)."""
+    return {**DEFAULTS, **merged(cur, station)}
+
+
+def for_core(values):
+    return {k: v for k, v in values.items() if k not in SERVER_ONLY}
+
+
+def rev(values):
+    return hashlib.sha1(json.dumps(values, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def save(cur, changes, prefix=PREFIX, station=None):
+    """changes: {name: value or None (= delete: back to the layer below)} into one layer: app_settings
+    under prefix (station settings: All stations) or, with station, that station's own."""
     for name, value in changes.items():
-        if value is None:
+        if station is not None and value is None:
+            cur.execute('DELETE FROM station_settings WHERE station = %s AND name = %s', (station, name))
+        elif station is not None:
+            cur.execute("""INSERT INTO station_settings (station, name, value, updated_at) VALUES (%s, %s, %s, NOW())
+                           ON CONFLICT (station, name) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+                        (station, name, json.dumps(value)))
+        elif value is None:
             cur.execute('DELETE FROM app_settings WHERE key = %s', (prefix + name,))
         else:
             cur.execute("""INSERT INTO app_settings (key, value, updated_at) VALUES (%s, %s, NOW())

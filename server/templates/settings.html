@@ -3,9 +3,11 @@
 {% block main %}
 <div class="section-header">
   <div class="section-title">Station settings</div>
-  <span class="dim small">Sent to the Core within a second of saving. It keeps them if the server goes away.</span>
+  <div class="chip-group" id="scope" role="group" aria-label="Settings for"></div>
+  <span class="dim small">For all stations, or one station's own on top. Sent to the Core within a second of saving; it keeps them if the server goes away.</span>
 </div>
-<div id="sync" class="banner"></div>
+<div id="sync" class="banner" hidden></div>
+<div id="scope-note" class="banner" hidden></div>
 <form id="set-form"><div id="groups" class="set-grid"></div>
   <div class="form-actions"><span class="unsaved"></span>
     <button type="button" data-revert>Discard changes</button><button type="submit" class="primary">Save settings</button></div>
