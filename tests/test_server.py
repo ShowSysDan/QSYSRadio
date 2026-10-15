@@ -22,7 +22,7 @@ os.environ.update(PG_APP_SCHEMA='qsr_test', PG_SHARED_SCHEMA='qsr_test_shared', 
                   WEB_THREADS='8', SYSLOG_HOST='')
 os.environ.pop('RADIO_ALLOW_NO_TOKEN', None)
 
-from server import ads, config, control, core_settings, db, logs, migrate  # noqa: E402
+from server import ads, config, control, core_settings, db, fingerprints, logs, migrate  # noqa: E402
 
 if not db.is_configured():
     pytest.skip('no test database configured (QSYSRADIO_ENV_FILE)', allow_module_level=True)
@@ -463,6 +463,32 @@ def test_next_song_least_recently_played_and_ad_fit(app):
         conn.close()
 
 
+def mock_core(lupa):
+    """A Lua runtime with MockCore loaded. Its Crypto.Digest stand-in hashes with Python's hashlib (the same SHA-1 as
+    its pure-Lua one, much faster for the thousands of files the Core fingerprints here; the files' names are ASCII)."""
+    import hashlib
+    L = lupa.LuaRuntime(unpack_returned_tuples=True)
+    L.execute('dofile("qsys/test/mock_core.lua")')
+    mock = L.globals().MockCore
+    if mock.sha1 is not None:
+        mock.sha1 = lambda data: hashlib.sha1(data.encode() if isinstance(data, str) else data).digest()
+    return L
+
+
+def mock_fingerprint(name, size=1000000, n=65536):
+    """The fingerprint of a MockCore file (its bytes: its name and '|', repeated), by the spec, independently of
+    radio.lua: sha1 of the size as decimal text, a newline, the first, middle (from size // 2 - n // 2) and last n
+    bytes (the whole file when no longer than 3 n)."""
+    import hashlib
+    unit = (name + '|').encode()
+
+    def part(pos, length):
+        off = pos % len(unit)
+        return (unit * ((off + length) // len(unit) + 1))[off:off + length]
+    data = part(0, size) if size <= 3 * n else part(0, n) + part(size // 2 - n // 2, n) + part(size - n, n)
+    return hashlib.sha1(b'%d\n' % size + data).hexdigest()
+
+
 def radio_lua_for(station):
     """radio.lua's source with its CFG pointed at this server (http://radio-server, token tok) and its
     (first) station named `station`: the Core's own setup, nothing of its internals."""
@@ -487,8 +513,7 @@ def test_every_song_gets_played_end_to_end(app, tmp_path, monkeypatch):
     os.symlink(os.path.join(repo, 'qsys'), tmp_path / 'qsys')
     monkeypatch.chdir(tmp_path)
     client = app.test_client()
-    L = lupa.LuaRuntime(unpack_returned_tuples=True)
-    L.execute('dofile("qsys/test/mock_core.lua")')
+    L = mock_core(lupa)
     L.execute("""local songs = {}
                  for i = 1, 24 do songs[i] = { name = string.format("Artist%d - Song%02d.mp3", i % 8, i),
                                               duration = 20 + (i * 7) % 15, level = -10 } end
@@ -526,6 +551,14 @@ def test_every_song_gets_played_end_to_end(app, tmp_path, monkeypatch):
         assert analyzed[0] >= 5, f'{analyzed[0]} of {analyzed[1]} files analyzed'
         players = sql('SELECT analyzers FROM qsr_test.cores WHERE core = %s', (core,), fetch=True)[0][0]
         assert [p['name'] for p in players] == ['Analysis_Player'], players
+    if 'fingerprint_rev' in src:     # 2.4: every file fingerprinted, and each the fingerprint of its file's row
+        got = sql("""SELECT count(*) FILTER (WHERE l.fingerprint ~ '^[0-9a-f]{40}$' AND m.fingerprint = l.fingerprint), count(*)
+                     FROM qsr_test.library l JOIN qsr_test.media_files m ON m.id = l.file_id
+                     WHERE l.station = 'E2E' AND l.present""", fetch=True)[0]
+        assert tuple(got) == (24, 24), got
+        name = 'Artist1 - Song01.mp3'      # the formula, worked out here from the simulated file's bytes
+        assert sql("SELECT fingerprint FROM qsr_test.library WHERE station = 'E2E' AND file = %s", (name,),
+                   fetch=True)[0][0] == mock_fingerprint(name)
 
 
 def test_three_stations_on_one_core_end_to_end(app, tmp_path, monkeypatch):
@@ -537,8 +570,7 @@ def test_three_stations_on_one_core_end_to_end(app, tmp_path, monkeypatch):
     os.symlink(os.path.join(repo, 'qsys'), tmp_path / 'qsys')
     monkeypatch.chdir(tmp_path)
     client = app.test_client()
-    L = lupa.LuaRuntime(unpack_returned_tuples=True)
-    L.execute('dofile("qsys/test/mock_core.lua")')
+    L = mock_core(lupa)
     if L.eval('MockCore.stations') is None:
         pytest.skip('this MockCore has no multi-station wiring')
     L.execute("""local wiring, cfg = MockCore.stations(3, { prefix = "ME" })
@@ -591,8 +623,7 @@ def test_one_player_zone_end_to_end(app, tmp_path, monkeypatch):
     os.symlink(os.path.join(repo, 'qsys'), tmp_path / 'qsys')
     monkeypatch.chdir(tmp_path)
     client = app.test_client()
-    L = lupa.LuaRuntime(unpack_returned_tuples=True)
-    L.execute('dofile("qsys/test/mock_core.lua")')
+    L = mock_core(lupa)
     if L.eval('MockCore.zones') is None:
         pytest.skip('this MockCore has no one-player zones')
     L.execute("""local wiring, cfg = MockCore.stations(1, { ids = { "OPR" } })
@@ -1227,6 +1258,311 @@ def test_stations_uploading_the_same_new_files_at_once(app):
         1500 * rounds,) * 2
     assert sql("""SELECT count(*) FROM qsr_test.library a JOIN qsr_test.library b ON b.station = 'CC2' AND b.key = a.key
                   WHERE a.station = 'CC1' AND a.file_id = b.file_id""", fetch=True)[0][0] == 1500 * rounds
+
+
+# ── File fingerprints ────────────────────────────────────────────────────────
+
+def fp(name):
+    """A fingerprint as radio.lua 2.4 reports them (40 lowercase hex digits)."""
+    import hashlib
+    return hashlib.sha1(name.encode()).hexdigest()
+
+
+def fingerprinting(app, core):
+    """A 2.4 Core that can fingerprint files, as radio.lua does: each sync sends the rev of the list it holds, which a
+    reply with a list replaces. Returns sync(*parts) -> the reply, plus held (the list it holds now: [(station, key)])
+    and sent (whether this reply brought a list)."""
+    held = {'list': [], 'rev': ''}
+
+    def sync(*parts):
+        r = batch(app, *parts, core=core, fingerprint_rev=held['rev']).json
+        if 'fingerprint_rev' in r:
+            held.update(list=r['fingerprint'], rev=r['fingerprint_rev'])
+        return dict(r, held=[(e['station'], e['key']) for e in held['list']], sent='fingerprint' in r)
+    return sync
+
+
+def fingerprint_of(station, key):
+    """(the library row's fingerprint, size, error; its file's row id and fingerprint)."""
+    return tuple(sql("""SELECT l.fingerprint, l.fingerprint_size, l.fingerprint_error, l.file_id, m.fingerprint
+                        FROM qsr_test.library l JOIN qsr_test.media_files m ON m.id = l.file_id
+                        WHERE l.station = %s AND l.key = %s""", (station, key), fetch=True)[0])
+
+
+def test_a_renamed_file_keeps_its_figures(app):
+    """End to end through the library upload and the fingerprint events: a renamed file (here also moved to another
+    station) keeps its figures once its Core has fingerprinted it; what plays and the operator gave the new name
+    meanwhile fills in only what the file lacked (the levels count together); the row it leaves goes."""
+    a = [{'key': 'M/a.mp3', 'dir': 'M/', 'file': 'a.mp3', 'kind': 'music', 'size': 8001},
+         {'key': 'M/b.mp3', 'dir': 'M/', 'file': 'b.mp3', 'kind': 'music', 'size': 8002}]
+    fpc = fingerprinting(app, 'FPC')
+    core = lambda *evs: fpc({'station': 'FP1', 'events': list(evs)})
+    op = signed_in(app, 'operator')
+    trim = lambda st, key, lead, trail: op.post('/api/v1/library/trim', json=dict(station=st, key=key, lead=lead, trail=trail),
+                                                headers=WEB).status_code
+    core()                                                                   # FP1 is on Core FPC
+    library_post(app, 'FP1', a)
+    assert core()['held'] == [('FP1', 'M/a.mp3'), ('FP1', 'M/b.mp3')]
+    assert 'fingerprint' not in batch(app, {'station': 'FP1'}, core='FPC').json        # a Core that cannot fingerprint: no list
+    r = core(ev(1, 'analysis', file='a.mp3', dir='M/', ok=True, lead_in=0.5, trail=2.0, duration=181.0, level=-8.0, level_s=20.0,
+                peak=-1.0))
+    assert not r['sent']                                                     # not a fingerprint: the same list, not sent again
+    assert trim('FP1', 'M/a.mp3', 0.2, None) == 200
+    r = core(ev(2, 'fingerprint', file='a.mp3', dir='M/', size=8001, fp=fp('a')),
+             ev(3, 'fingerprint', file='b.mp3', dir='M/', size=8002, fp=fp('b').upper()))
+    assert r['stations']['FP1']['accepted'] == 2 and r['sent'] and r['held'] == []        # all done
+    file_a = figures('FP1', 'M/a.mp3')['file_id']
+    assert fingerprint_of('FP1', 'M/a.mp3') == (fp('a'), 8001, None, file_a, fp('a'))
+    assert fingerprint_of('FP1', 'M/b.mp3')[0] == fp('b')                    # read as lower case
+    before = figures('FP1', 'M/a.mp3')
+    # renamed: a new name of the same size is a new file until its fingerprint comes in (owed at once: the upload)
+    renamed = [dict(a[0], key='M/new name.mp3', file='new name.mp3'), a[1]]
+    assert 'M/new name.mp3' not in library_post(app, 'FP1', renamed).json['learned']
+    assert core()['held'] == [('FP1', 'M/new name.mp3')]
+    core(ev(4, 'track_start', deck='A', file='new name.mp3', dir='M/', duration=180.0),
+         ev(5, 'track_end', deck='A', file='new name.mp3', dir='M/', reason='end', lead_in=0.9, trail=4.0, level=-4.0, level_s=60.0,
+            peak=2.0))
+    assert trim('FP1', 'M/new name.mp3', 0.5, 0.8) == 200
+    fresh = figures('FP1', 'M/new name.mp3')['file_id']
+    assert fresh != file_a
+    with logged() as lines:
+        r = core(ev(6, 'fingerprint', file='new name.mp3', dir='M/', size=8001, fp=fp('a')))
+    assert r['stations']['FP1']['accepted'] == 1 and r['held'] == []
+    assert any('FINGERPRINT station=FP1 key="M/new name.mp3"' in m and 'its figures follow it' in m for _, m in lines), lines
+    now = figures('FP1', 'M/new name.mp3')
+    level = round(10 * math.log10((10 ** -0.8 * 20 + 10 ** -0.4 * 60) / 80), 1)
+    assert now['file_id'] == file_a and now['analyzed_at'] == before['analyzed_at']
+    assert (now['lead_in_s'], now['trail_s'], now['duration_s']) == (0.5, 2.0, 181.0)          # the analysis is final
+    assert (now['lead_set_s'], now['trail_set_s']) == (0.2, 0.8)                              # its trim, then the one it lacked
+    assert (now['level_s'], now['peak_dbfs']) == (80.0, 2.0) and now['level_db'] == pytest.approx(level, abs=0.05)
+    assert sql('SELECT count(*) FROM qsr_test.media_files WHERE id = %s', (fresh,), fetch=True)[0][0] == 0   # the row it left
+    assert library_post(app, 'FP1', renamed).json['learned']['M/new name.mp3'] == {
+        'trail': 0.8, 'lead': 0.2, 'fixed': True, 'analyzed': True, 'level': level, 'peak': 2.0}
+    # the same file on another station of the Core, under the new name: a file of its own, then the file's figures
+    both = lambda *evs: fpc({'station': 'FP1'}, {'station': 'FP2', 'events': list(evs)})
+    both()
+    library_post(app, 'FP2', [dict(renamed[0], key='Zone/new name.mp3', dir='Zone/')])
+    assert both()['held'] == [('FP2', 'Zone/new name.mp3')]
+    assert both(ev(1, 'fingerprint', file='new name.mp3', dir='Zone/', size=8001, fp=fp('a')))['held'] == []
+    assert figures('FP2', 'Zone/new name.mp3') == figures('FP1', 'M/new name.mp3')
+
+
+def test_same_name_and_size_other_content_is_another_file(app):
+    """Two stations' files of the same name and size share figures until fingerprinted: different content parts them
+    (the first keeps the figures, the other starts afresh); each stays on its own row through library uploads while
+    its size is unchanged; a copy of the first moves onto it; an edited file is owed again; a size other than the
+    library's, an unreadable file and a malformed fingerprint are recorded as errors and wait for the next scan."""
+    x = lambda d, size=8100: [{'key': f'{d}/x.mp3', 'dir': f'{d}/', 'file': 'x.mp3', 'kind': 'music', 'size': size}]
+    core = fingerprinting(app, 'FSC')
+    core({'station': 'FS1'}, {'station': 'FS2'})
+    library_post(app, 'FS1', x('A'))
+    library_post(app, 'FS2', x('B'))
+    shared = figures('FS1', 'A/x.mp3')['file_id']
+    assert figures('FS2', 'B/x.mp3')['file_id'] == shared
+    assert core({'station': 'FS1'}, {'station': 'FS2'})['held'] == [('FS1', 'A/x.mp3'), ('FS2', 'B/x.mp3')]
+    core({'station': 'FS1', 'events': [ev(1, 'track_start', deck='A', file='x.mp3', dir='A/', duration=150.0),
+                                       ev(2, 'track_end', deck='A', file='x.mp3', dir='A/', reason='end', lead_in=0.4, trail=1.5,
+                                          level=-7.0, level_s=90.0, peak=-2.0)]})
+    with logged() as lines:
+        r = core({'station': 'FS1', 'events': [ev(3, 'fingerprint', file='x.mp3', dir='A/', size=8100, fp=fp('x1'))]},
+                 {'station': 'FS2', 'events': [ev(1, 'fingerprint', file='x.mp3', dir='B/', size=8100, fp=fp('x2'))]})
+    assert r['held'] == [] and any('another file of the same name and size' in m for _, m in lines), lines
+    one, two = figures('FS1', 'A/x.mp3'), figures('FS2', 'B/x.mp3')
+    assert one['file_id'] == shared and (one['lead_in_s'], one['level_s']) == (0.4, 90.0)
+    assert two['file_id'] != shared and (two['lead_in_s'], two['trail_s'], two['level_db'], two['duration_s']) == (None,) * 4
+    assert sorted(r[0] for r in sql("SELECT fingerprint FROM qsr_test.media_files WHERE file = 'x.mp3' AND size = 8100",
+                                    fetch=True)) == sorted([fp('x1'), fp('x2')])
+    # library uploads (size unchanged) keep each on its own row; a station whose file has no fingerprint yet: by name + size
+    assert library_post(app, 'FS2', x('B')).json['learned'] == {} and figures('FS2', 'B/x.mp3')['file_id'] == two['file_id']
+    assert library_post(app, 'FS1', x('A')).json['learned']['A/x.mp3']['lead'] == 0.4
+    assert library_post(app, 'FS3', x('C')).status_code == 200
+    assert figures('FS3', 'C/x.mp3')['file_id'] in (shared, two['file_id'])
+    # FS2's file replaced by a copy of FS1's: it moves onto FS1's file; its own row (another file's) is neither merged nor dropped
+    two_says = lambda seq, **e: core({'station': 'FS1'}, {'station': 'FS2', 'events': [ev(seq, 'fingerprint', file='x.mp3', dir='B/', **e)]})
+    two_says(2, size=8100, fp=fp('x1'))
+    assert figures('FS2', 'B/x.mp3') == figures('FS1', 'A/x.mp3')
+    assert tuple(sql('SELECT fingerprint, lead_in_s FROM qsr_test.media_files WHERE id = %s', (two['file_id'],), fetch=True)[0]) == (
+        fp('x2'), None)
+    # edited (a new size): back to name + size, owed again
+    library_post(app, 'FS2', x('B', 8101))
+    assert figures('FS2', 'B/x.mp3')['file_id'] not in (shared, two['file_id'])
+    assert core({'station': 'FS1'}, {'station': 'FS2'})['held'] == [('FS2', 'B/x.mp3')]
+    # the Core found another size (changed again since the scan): an error, not owed until the next scan
+    r = two_says(3, size=8102, fp=fp('x3'))
+    assert r['stations']['FS2']['accepted'] == 1 and r['held'] == []
+    got = fingerprint_of('FS2', 'B/x.mp3')
+    assert got[:2] == (fp('x1'), 8100) and 'changed since the scan' in got[2]
+    library_post(app, 'FS2', x('B', 8102))
+    assert core({'station': 'FS1'}, {'station': 'FS2'})['held'] == [('FS2', 'B/x.mp3')]
+    # unreadable on the Core: its error kept, not owed; a malformed fingerprint is an error too
+    r = two_says(4, error='cannot open: Permission denied')
+    assert r['held'] == [] and fingerprint_of('FS2', 'B/x.mp3')[2] == 'cannot open: Permission denied'
+    r = two_says(5, size=8102, fp='not a sha1')
+    assert r['stations']['FS2']['rejected'] == 0 and fingerprint_of('FS2', 'B/x.mp3')[2] == 'not a fingerprint'
+    # an event about a file the station does not have changes nothing
+    r = core({'station': 'FS1', 'events': [ev(4, 'fingerprint', file='nope.mp3', dir='A/', size=1, fp=fp('n'))]})
+    assert r['stations']['FS1']['accepted'] == 1 and figures('FS1', 'A/x.mp3') == one
+
+
+def test_fingerprint_list_per_core(app):
+    """Each Core is sent the files of its own stations owed a fingerprint (present, of known size, not fingerprinted
+    at their size), at most 20, only when it sends fingerprint_rev, and again only when its list changes: a result
+    in, a library upload, the cache's minute."""
+    files = lambda d, n, base: [{'key': f'{d}/{d}-{i:02d}.mp3', 'dir': f'{d}/', 'file': f'{d}-{i:02d}.mp3', 'kind': 'music',
+                                 'size': base + i} for i in range(n)]
+    a, b = fingerprinting(app, 'FLA'), fingerprinting(app, 'FLB')
+    a({'station': 'FL1'}, {'station': 'FL2'})
+    b({'station': 'FL3'})
+    library_post(app, 'FL1', files('L1', 25, 8200) + [{'key': 'L1/u.mp3', 'dir': 'L1/', 'file': 'u.mp3', 'kind': 'music'}])
+    library_post(app, 'FL2', files('L2', 3, 8300))
+    library_post(app, 'FL3', files('L3', 2, 8400))
+    r = a({'station': 'FL1'}, {'station': 'FL2'})
+    assert r['sent'] and r['held'] == [('FL1', f'L1/L1-{i:02d}.mp3') for i in range(20)]           # unknown size: never listed
+    assert not a({'station': 'FL1'}, {'station': 'FL2'})['sent']                                 # the same list: not again
+    assert 'fingerprint' not in batch(app, {'station': 'FL1'}, core='FLA').json                  # a Core that cannot
+    assert b({'station': 'FL3'})['held'] == [('FL3', 'L3/L3-00.mp3'), ('FL3', 'L3/L3-01.mp3')]
+    done = [ev(i + 1, 'fingerprint', file=f'L1-{i:02d}.mp3', dir='L1/', size=8200 + i, fp=fp(f'L1-{i}')) for i in range(20)]
+    r = a({'station': 'FL1', 'events': done}, {'station': 'FL2'})
+    assert r['held'] == [('FL1', f'L1/L1-{i:02d}.mp3') for i in range(20, 25)] + [('FL2', f'L2/L2-{i:02d}.mp3') for i in range(3)]
+    # a library upload (a file gone, a file new): the list is made again at the next sync
+    library_post(app, 'FL2', files('L2', 2, 8300) + [{'key': 'L2/L2-new.mp3', 'dir': 'L2/', 'file': 'L2-new.mp3', 'kind': 'music',
+                                                     'size': 8399}])
+    r = a({'station': 'FL1'}, {'station': 'FL2'})
+    assert r['held'][-3:] == [('FL2', 'L2/L2-00.mp3'), ('FL2', 'L2/L2-01.mp3'), ('FL2', 'L2/L2-new.mp3')]
+    # cached on the Core's row: a sync costs one read of it, not the list's query
+    with queries() as seen:
+        assert not a({'station': 'FL1'}, {'station': 'FL2'})['sent']
+    assert not any('fingerprint_at <' in q for q in seen)
+    # the owed files are found through their index: a library (its indexes copied) of 5,000 files, 20 owed
+    conn = db.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('CREATE TEMP TABLE library (LIKE qsr_test.library INCLUDING DEFAULTS INCLUDING INDEXES)')
+            cur.execute("""INSERT INTO library (station, key, kind, directory, file, size, file_id, fingerprint, fingerprint_size)
+                           SELECT 'S' || (i % 5), 'k' || i, 'music', '', 'f' || i, i, 1, CASE WHEN i % 250 <> 0 THEN 'x' END, i
+                           FROM generate_series(1, 5000) i""")
+            cur.execute('ANALYZE library')
+            cur.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'library' AND schemaname LIKE 'pg_temp%%' "
+                        "AND indexdef LIKE '%%fingerprint%%'")
+            index = cur.fetchone()[0]
+            cur.execute(f"EXPLAIN SELECT l.key FROM library l WHERE l.station = 'S0' AND {fingerprints.OWED} ORDER BY l.key LIMIT 20")
+            plan = ' '.join(r[0] for r in cur.fetchall())
+        assert index in plan, plan
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def test_a_fingerprinted_file_back_at_its_size_is_back_on_its_row(app):
+    """A file fingerprinted at one size, scanned at another (owed again), then at the first size again before a new
+    fingerprint came in, is back on its fingerprint's row with its figures (it kept the other size's row, its
+    fingerprint saying it was done: the figures were lost for good)."""
+    k = lambda size: [{'key': 'K/k.mp3', 'dir': 'K/', 'file': 'k.mp3', 'kind': 'music', 'size': size}]
+    core = fingerprinting(app, 'KRC')
+    core({'station': 'KR1'})
+    library_post(app, 'KR1', k(8700))
+    core({'station': 'KR1', 'events': [ev(1, 'track_start', deck='A', file='k.mp3', dir='K/', duration=120.0),
+                                       ev(2, 'track_end', deck='A', file='k.mp3', dir='K/', reason='end', lead_in=0.7, trail=2.5)]})
+    core({'station': 'KR1', 'events': [ev(3, 'fingerprint', file='k.mp3', dir='K/', size=8700, fp=fp('k'))]})
+    row = figures('KR1', 'K/k.mp3')
+    library_post(app, 'KR1', k(8701))                                       # edited: name + size, owed again
+    assert figures('KR1', 'K/k.mp3')['file_id'] != row['file_id']
+    assert core({'station': 'KR1'})['held'] == [('KR1', 'K/k.mp3')]
+    assert library_post(app, 'KR1', k(8700)).json['learned']['K/k.mp3'] == {'lead': 0.7, 'trail': 2.5}   # back as it was
+    assert figures('KR1', 'K/k.mp3') == row and core({'station': 'KR1'})['held'] == []
+
+
+def test_a_faulted_stations_files_do_not_hold_up_the_list(app):
+    """A station whose state carries a fault (its build failed: no players' root, nothing can be read) is left out
+    of its Core's list, so the other stations' files are listed (it came first by name and filled the list)."""
+    core = fingerprinting(app, 'FFC')
+    core({'station': 'FF1'}, {'station': 'FF2'})
+    library_post(app, 'FF1', [{'key': f'A/{i:02d}.mp3', 'dir': 'A/', 'file': f'{i:02d}.mp3', 'kind': 'music', 'size': 8800 + i}
+                              for i in range(25)])
+    library_post(app, 'FF2', [{'key': 'B/z.mp3', 'dir': 'B/', 'file': 'z.mp3', 'kind': 'music', 'size': 8899}])
+    assert ('FF2', 'B/z.mp3') not in core({'station': 'FF1'}, {'station': 'FF2'})['held']
+    r = core({'station': 'FF1', 'state': {'fault': "player 'X' not found", 'retry_s': 30}}, {'station': 'FF2'})
+    library_post(app, 'FF2', [{'key': 'B/z.mp3', 'dir': 'B/', 'file': 'z.mp3', 'kind': 'music', 'size': 8899}])  # stale
+    assert core({'station': 'FF1'}, {'station': 'FF2'})['held'] == [('FF2', 'B/z.mp3')]
+    # the Core's report of a file of a station that is not built: an error, not owed until its next library upload
+    r = core({'station': 'FF1', 'state': STATE, 'events': [ev(1, 'fingerprint', file='00.mp3', dir='A/',
+                                                                 error="station not built: player 'X' not found")]},
+             {'station': 'FF2'})
+    assert r['stations']['FF1']['accepted'] == 1 and fingerprint_of('FF1', 'A/00.mp3')[2].startswith('station not built')
+    assert core({'station': 'FF1'}, {'station': 'FF2'})['held'][:2] == [('FF1', 'A/01.mp3'), ('FF1', 'A/02.mp3')]
+
+
+def test_the_same_fingerprint_taken_by_two_cores_at_once(app):
+    """Two Cores fingerprint the same content under two names at the same moment: the second station's event waits
+    for the first's transaction, then follows the row that took the fingerprint (it was rejected, and never
+    asked for again)."""
+    x = lambda st, name, size: library_post(app, st, [{'key': f'X/{name}', 'dir': 'X/', 'file': name, 'kind': 'music', 'size': size}])
+    first, second = fingerprinting(app, 'TAC'), fingerprinting(app, 'TBC')
+    first({'station': 'TA1'})
+    second({'station': 'TB1'})
+    x('TA1', 'p.mp3', 8500)
+    x('TB1', 'q.mp3', 8501)
+    took, theirs = figures('TA1', 'X/p.mp3')['file_id'], figures('TB1', 'X/q.mp3')['file_id']
+    conn = db.connect()
+    got = {}
+    try:
+        with conn.cursor() as cur:            # TA1's part, not committed yet: its row has the fingerprint
+            cur.execute('UPDATE media_files SET fingerprint = %s WHERE id = %s', (fp('pq'), took))
+        t = threading.Thread(target=lambda: got.update(r=second({'station': 'TB1', 'events': [
+            ev(1, 'fingerprint', file='q.mp3', dir='X/', size=8501, fp=fp('pq'))]})))
+        t.start()
+        assert lock_waits(t), 'the second event did not wait for the first transaction'
+        conn.commit()
+        t.join(10)
+    finally:
+        conn.close()
+    r = got['r']
+    assert r['stations']['TB1']['accepted'] == 1 and r['stations']['TB1']['rejected'] == 0 and r['held'] == []
+    assert figures('TB1', 'X/q.mp3')['file_id'] == took and fingerprint_of('TB1', 'X/q.mp3')[0] == fp('pq')
+    assert sql('SELECT count(*) FROM qsr_test.media_files WHERE id = %s', (theirs,), fetch=True)[0][0] == 0
+
+
+def test_a_row_left_by_two_stations_gives_its_levels_once(app):
+    """A name + size row two stations use follows a fingerprinted file twice (each station's event): its levels are
+    added to the file's once."""
+    core = fingerprinting(app, 'DMC')
+    core({'station': 'DM1'}, {'station': 'DM2'}, {'station': 'DM3'})
+    m = lambda d: [{'key': f'{d}/m.mp3', 'dir': f'{d}/', 'file': 'm.mp3', 'kind': 'music', 'size': 8600}]
+    library_post(app, 'DM1', m('A'))
+    library_post(app, 'DM2', m('B'))
+    library_post(app, 'DM3', [{'key': 'C/t.mp3', 'dir': 'C/', 'file': 't.mp3', 'kind': 'music', 'size': 8600}])
+    play = lambda st, d, f, level, secs: core({'station': st, 'events': [
+        ev(1, 'track_start', deck='A', file=f, dir=d, duration=100.0),
+        ev(2, 'track_end', deck='A', file=f, dir=d, reason='end', level=level, level_s=secs)]})
+    play('DM1', 'A/', 'm.mp3', -10.0, 50.0)
+    play('DM3', 'C/', 't.mp3', -10.0, 10.0)
+    say = lambda st, d, f, seq: core({'station': st, 'events': [ev(seq, 'fingerprint', file=f, dir=d, size=8600, fp=fp('m'))]})
+    say('DM3', 'C/', 't.mp3', 3)
+    row_m = figures('DM1', 'A/m.mp3')['file_id']
+    say('DM1', 'A/', 'm.mp3', 3)
+    assert figures('DM1', 'A/m.mp3')['level_s'] == 60.0                    # 10 s + the 50 s m.mp3's row had
+    say('DM2', 'B/', 'm.mp3', 3)
+    assert figures('DM2', 'B/m.mp3')['level_s'] == 60.0 and figures('DM3', 'C/t.mp3')['level_s'] == 60.0
+    assert sql('SELECT count(*) FROM qsr_test.media_files WHERE id = %s', (row_m,), fetch=True)[0][0] == 0
+
+
+def test_forget_measured_has_files_fingerprinted_again(app):
+    """A file replaced by another of the same length keeps its fingerprint and figures (it is never owed again);
+    Forget measured on it has it fingerprinted again, and other content then parts from the old figures."""
+    core = fingerprinting(app, 'FGC')
+    core({'station': 'FG1'})
+    library_post(app, 'FG1', [{'key': 'G/g.mp3', 'dir': 'G/', 'file': 'g.mp3', 'kind': 'music', 'size': 8900}])
+    core({'station': 'FG1', 'events': [ev(1, 'track_start', deck='A', file='g.mp3', dir='G/', duration=90.0),
+                                       ev(2, 'track_end', deck='A', file='g.mp3', dir='G/', reason='end', lead_in=0.3, trail=1.0),
+                                       ev(3, 'fingerprint', file='g.mp3', dir='G/', size=8900, fp=fp('g1'))]})
+    old = figures('FG1', 'G/g.mp3')['file_id']
+    assert core({'station': 'FG1'})['held'] == []
+    op = signed_in(app, 'operator')
+    assert op.post('/api/v1/library/forget', json={'station': 'FG1', 'key': 'G/g.mp3'}, headers=WEB).json['files'] == 1
+    assert fingerprint_of('FG1', 'G/g.mp3')[:3] == (None, None, None)
+    assert core({'station': 'FG1'})['held'] == [('FG1', 'G/g.mp3')]
+    core({'station': 'FG1', 'events': [ev(4, 'fingerprint', file='g.mp3', dir='G/', size=8900, fp=fp('g2'))]})
+    assert figures('FG1', 'G/g.mp3')['file_id'] != old and fingerprint_of('FG1', 'G/g.mp3')[4] == fp('g2')
 
 
 def test_holds_and_station_ids(app):
@@ -2326,6 +2662,53 @@ def test_migration_0018_counts_each_stations_players():
         sql("UPDATE qsr_test_m18.stations SET players = 1 WHERE station = 'A'")
     finally:
         sql('DROP SCHEMA IF EXISTS qsr_test_m18 CASCADE')
+
+
+def test_migration_0019_fingerprints_on_a_populated_schema():
+    """0019 keeps every file's figures and library row as they were (no fingerprint yet: one row per name + size, as
+    before), lets two rows of the same name and size coexist once fingerprinted (one per fingerprint), and remakes
+    library_figures with the new library columns."""
+    sql('DROP SCHEMA IF EXISTS qsr_test_m19 CASCADE; CREATE SCHEMA qsr_test_m19')
+    conn = db.connect(search_path=False)
+    try:
+        for version, _, path, _ in migrate.discover():
+            if version > 19:
+                break
+            if version == 19:
+                with conn.cursor() as cur:
+                    cur.execute("""SET LOCAL search_path TO qsr_test_m19;
+                        INSERT INTO media_files (id, file, size, lead_in_s, level_db, level_s) VALUES
+                            (1, 'a.mp3', 10, 0.5, -8, 20), (2, 'b.mp3', 20, NULL, NULL, NULL), (3, 'c.mp3', NULL, 0.1, NULL, NULL);
+                        SELECT setval(pg_get_serial_sequence('media_files', 'id'), 3);
+                        INSERT INTO library (station, key, kind, directory, file, size, file_id) VALUES
+                            ('A', 'M/a.mp3', 'music', 'M/', 'a.mp3', 10, 1), ('B', 'X/a.mp3', 'music', 'X/', 'a.mp3', 10, 1),
+                            ('A', 'M/b.mp3', 'music', 'M/', 'b.mp3', 20, 2), ('A', 'M/c.mp3', 'music', 'M/', 'c.mp3', NULL, 3);
+                        INSERT INTO cores (core) VALUES ('C1')""")
+            with conn.cursor() as cur:
+                cur.execute('SET LOCAL search_path TO qsr_test_m19')
+                cur.execute(path.read_text(encoding='utf-8'))
+            conn.commit()
+    finally:
+        conn.close()
+    try:
+        rows = sql("""SELECT station, key, file_id, lead_in_s, level_db, fingerprint, fingerprint_size, fingerprint_at
+                      FROM qsr_test_m19.library_figures ORDER BY station, key""", fetch=True)
+        assert [tuple(r) for r in rows] == [('A', 'M/a.mp3', 1, 0.5, -8.0, None, None, None), ('A', 'M/b.mp3', 2, None, None, None, None, None),
+                                            ('A', 'M/c.mp3', 3, 0.1, None, None, None, None), ('B', 'X/a.mp3', 1, 0.5, -8.0, None, None, None)]
+        assert sql('SELECT count(*) FROM qsr_test_m19.media_files WHERE fingerprint IS NOT NULL', fetch=True)[0][0] == 0
+        assert tuple(sql("SELECT fp_owed, fp_rev, fp_at FROM qsr_test_m19.cores WHERE core = 'C1'", fetch=True)[0]) == (None,) * 3
+        with pytest.raises(Exception, match='media_files_name_size_unknown'):         # not fingerprinted: one per name + size
+            sql("INSERT INTO qsr_test_m19.media_files (file, size) VALUES ('a.mp3', 10)")
+        sql(f"UPDATE qsr_test_m19.media_files SET fingerprint = '{fp('a1')}' WHERE id = 1")
+        sql(f"""INSERT INTO qsr_test_m19.media_files (file, size, fingerprint) VALUES ('a.mp3', 10, '{fp('a2')}'),
+                ('a.mp3', 10, NULL)""")                                               # another file of that name and size
+        with pytest.raises(Exception, match='media_files_fingerprint'):               # one row per fingerprint
+            sql(f"INSERT INTO qsr_test_m19.media_files (file, size, fingerprint) VALUES ('z.mp3', 1, '{fp('a1')}')")
+        owed = {r[0] for r in sql("""SELECT indexname FROM pg_indexes WHERE schemaname = 'qsr_test_m19'
+                                     AND indexname IN ('library_fingerprint_owed', 'media_files_name_size')""", fetch=True)}
+        assert owed == {'library_fingerprint_owed', 'media_files_name_size'}
+    finally:
+        sql('DROP SCHEMA IF EXISTS qsr_test_m19 CASCADE')
 
 
 def test_syslog_set_on_the_settings_page(app):

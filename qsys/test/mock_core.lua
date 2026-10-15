@@ -1,7 +1,7 @@
 --[[---------------------------------------------------------------------------
   MockCore :: an offline stand-in for the Q-SYS Lua runtime
   File:    qsys/test/mock_core.lua
-  Version: 0.6.0
+  Version: 0.7.0
 
   Enough of Component / Timer / dir / Design / Network / Controls / json / io
   to run radio.lua (and probe.lua) under plain Lua 5.3 with a simulated
@@ -21,6 +21,15 @@
   the per-Core analysis list: MockCore.analysisQueue).
   A file entry may say hang = true (its load never completes) or noEnd = true
   (the player never reports its end: it plays on, silent).
+  io.open(path, "rb") of a simulated file (media/Audio/ + a MockCore.dirs folder +
+  its name) reads its content (deterministic: its name, or content = "<seed>"
+  shared by files that are the same file, repeated to its size; middle =
+  "<seed>" for its middle third; seek works;
+  unreadable = true: it cannot be opened); every other path is the real file.
+  Crypto.Digest("sha1", data) is a real SHA-1 (pure Lua): raw 20 bytes (spec.crypto
+  = "raw", the default), 40 hex digits ("hex"), or no Crypto at all (false);
+  spec.ioSeek = false: files open without seek. MockCore.io counts opens, digests
+  and the most bytes read from one open file.
 
   Usage (see run_mock.py / scenario_basic.lua):
     dofile("qsys/test/mock_core.lua")
@@ -135,6 +144,104 @@ function json.decode(s)
   return value()
 end
 package.loaded["json"] = json
+
+-------------------------------------------------------------------------------
+-- SHA-1 (Crypto.Digest's stand-in) and the simulated files' content (io.open)
+-------------------------------------------------------------------------------
+function MockCore.sha1(msg)
+  local h0, h1, h2, h3, h4 = 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
+  local len = #msg
+  msg = msg .. "\128" .. string.rep("\0", (55 - len) % 64) .. string.pack(">I8", len * 8)
+  local w = {}
+  for chunk = 1, #msg, 64 do
+    for i = 0, 15 do w[i] = string.unpack(">I4", msg, chunk + i * 4) end
+    for i = 16, 79 do
+      local x = w[i - 3] ~ w[i - 8] ~ w[i - 14] ~ w[i - 16]
+      w[i] = ((x << 1) | (x >> 31)) & 0xffffffff
+    end
+    local a, b, c, d, e = h0, h1, h2, h3, h4
+    for i = 0, 79 do
+      local f, k
+      if i < 20 then f, k = (b & c) | (~b & d), 0x5A827999
+      elseif i < 40 then f, k = b ~ c ~ d, 0x6ED9EBA1
+      elseif i < 60 then f, k = (b & c) | (b & d) | (c & d), 0x8F1BBCDC
+      else f, k = b ~ c ~ d, 0xCA62C1D6 end
+      local t = (((a << 5) | (a >> 27)) + f + e + k + w[i]) & 0xffffffff
+      e, d, c, b, a = d, c, ((b << 30) | (b >> 2)) & 0xffffffff, a, t
+    end
+    h0, h1, h2, h3, h4 = (h0 + a) & 0xffffffff, (h1 + b) & 0xffffffff, (h2 + c) & 0xffffffff, (h3 + d) & 0xffffffff,
+                         (h4 + e) & 0xffffffff
+  end
+  return string.pack(">I4I4I4I4I4", h0, h1, h2, h3, h4)
+end
+function MockCore.hex(raw) return (raw:gsub(".", function(c) return string.format("%02x", c:byte()) end)) end
+
+function MockCore.fileSize(e) return e.size or 1000000 end    -- what dir.get lists
+
+local function repeated(unit, pos, n)
+  local off = pos % #unit
+  return string.rep(unit, (off + n) // #unit + 1):sub(off + 1, off + n)
+end
+-- a simulated file's bytes [pos, pos + n): its seed repeated; e.middle = another seed for its middle third (two files
+-- alike at both ends, such as spots with digital silence at each end)
+function MockCore.content(e, pos, n)
+  local unit = (e.content or e.name) .. "|"
+  if not e.middle then return repeated(unit, pos, n) end
+  local size, out, p, stop = MockCore.fileSize(e), {}, pos, pos + n
+  local a, b = size // 3, 2 * size // 3
+  while p < stop do
+    local mid = p >= a and p < b
+    local to = math.min(stop, mid and b or (p < a and a or stop))
+    out[#out + 1] = repeated(mid and (e.middle .. "|") or unit, p, to - p)
+    p = to
+  end
+  return table.concat(out)
+end
+
+-- the fingerprint radio.lua makes of a simulated file (sha1 of its size, its first, middle and last 64 KiB; the whole
+-- file when no longer than the three), for checks
+function MockCore.fingerprint(e)
+  local size, n = MockCore.fileSize(e), 65536
+  local data = size <= 3 * n and MockCore.content(e, 0, size)
+    or (MockCore.content(e, 0, n) .. MockCore.content(e, size // 2 - n // 2, n) .. MockCore.content(e, size - n, n))
+  return MockCore.hex(MockCore.sha1(string.format("%d\n", size) .. data))
+end
+
+local MockFile = {}
+MockFile.__index = MockFile
+local MockFileNoSeek = { read = true, close = true }
+function MockFile:read(n)
+  if type(n) ~= "number" then error("MockCore: a simulated file reads by count only") end
+  if self.pos >= self.size and n > 0 then return nil end
+  n = math.max(0, math.min(n, self.size - self.pos))
+  local s = MockCore.content(self.e, self.pos, n)
+  self.pos, self.read_n = self.pos + n, self.read_n + n
+  if self.read_n > MockCore.io.maxRead then MockCore.io.maxRead = self.read_n end
+  return s
+end
+function MockFile:seek(whence, offset)
+  local base = ({ set = 0, cur = self.pos, ["end"] = self.size })[whence or "cur"]
+  local pos = base and base + (offset or 0)
+  if not pos or pos < 0 then return nil, "Invalid argument" end
+  self.pos = pos
+  return pos
+end
+function MockFile:close() return true end
+for k in pairs(MockFileNoSeek) do MockFileNoSeek[k] = MockFile[k] end
+MockFileNoSeek.__index = MockFileNoSeek
+
+MockCore.io = { opens = 0, digests = 0, maxRead = 0 }
+MOCK_REAL_OPEN = MOCK_REAL_OPEN or io.open
+io.open = function(path, mode)
+  local rel = type(path) == "string" and (mode == nil or mode:sub(1, 1) == "r") and path:match("^media/Audio/(.+)$")
+  if not rel then return MOCK_REAL_OPEN(path, mode) end
+  local folder = rel:match("^(.*/)") or ""
+  local e = MockCore.lookup(folder, rel:sub(#folder + 1))
+  if not e then return nil, path .. ": No such file or directory" end
+  MockCore.io.opens = MockCore.io.opens + 1
+  if e.unreadable then return nil, path .. ": Permission denied" end
+  return setmetatable({ e = e, pos = 0, size = MockCore.fileSize(e), read_n = 0 }, MockCore.ioSeek == false and MockFileNoSeek or MockFile)
+end
 
 -------------------------------------------------------------------------------
 -- controls
@@ -444,12 +551,21 @@ function MockCore.setup(spec)
       end }
     end,
   }
+  -- Crypto.Digest("sha1", data): raw bytes (the default) or hex; spec.crypto = false: no Crypto
+  local crypto = spec.crypto == nil and "raw" or spec.crypto
+  MockCore.ioSeek, MockCore.io = spec.ioSeek ~= false, { opens = 0, digests = 0, maxRead = 0 }
+  Crypto = crypto and { Digest = function(alg, data)
+    if alg ~= "sha1" then error("MockCore: Crypto.Digest " .. tostring(alg) .. " not simulated") end
+    MockCore.io.digests = MockCore.io.digests + 1
+    local raw = MockCore.sha1(data)
+    return crypto == "hex" and MockCore.hex(raw):upper() or raw
+  end } or nil
   Design = { GetStatus = function() return { Platform = "MockCore", DesignName = "mock", IsRedundant = false } end }
   System = { BuildVersion = "mock", IsEmulating = true }
   Network = { Interfaces = function() return { { Interface = "LAN A", Address = "127.0.0.1" } } end }
   dir = {
     get = function(path)
-      local rel = path:match("^media/Audio/(.*)$")
+      local rel = path:gsub("/+", "/"):match("^media/Audio/?(.*)$")   -- media/Audio (the probe's walk) too
       if rel == nil then return nil end
       if rel == "" then
         local out = {}
@@ -459,7 +575,7 @@ function MockCore.setup(spec)
       local entries = MockCore.dirs[rel] or MockCore.dirs[rel .. "/"]
       if not entries then return nil end
       local out = {}
-      for _, e in ipairs(entries) do out[#out + 1] = { name = e.name, size = e.size or 1000000, type = "file" } end
+      for _, e in ipairs(entries) do out[#out + 1] = { name = e.name, size = MockCore.fileSize(e), type = "file" } end
       return out
     end,
     create = function(path) os.execute("mkdir -p '" .. path .. "'") end,

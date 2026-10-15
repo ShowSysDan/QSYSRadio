@@ -37,6 +37,7 @@ SCOPES = ('new', 'all', 'stop')
 RETRY_H = 24                # 'right away': a file whose analysis failed is tried again this long after
 LIST_MAX_AGE_S = 60         # the Core's cached list is made again at least this often
 GONE_MIN = 10               # a station its Core has not synced for this long is no longer on it (left out)
+RESULTS = ('analysis', 'file_unsupported')     # event kinds after which the Core's list is made again
 
 
 def run_sql(lib='library_figures', since='%s', run_at='%s'):

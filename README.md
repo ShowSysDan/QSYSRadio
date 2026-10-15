@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **2.3.0** · see [CHANGELOG.md](CHANGELOG.md)
+Version **2.4.0** · see [CHANGELOG.md](CHANGELOG.md)
 
 Radio-station automation built on a Q-SYS Core: one script runs every
 station on the Core, each station with two decks, or one for a
@@ -14,10 +14,10 @@ station settings, the library, syslog.
 
 | Component | State |
 |---|---|
-| `qsys/probe` — discovery script | **0.1.1** — done |
-| `qsys/radio` — deck controller | **2.3.0** — stable; every station on the Core from one script (two players, or one for a background-music zone), each faulted and rebuilt on its own; file analysis on analysis players of its own (nothing on air touched); standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **2.3.0** — offline Core stand-in (any number of players, analysis players, one-player zones) + a live simulated Core with several stations and zones for demos |
-| `server` — Flask + Postgres | **2.3.0** — stable; own schema, migrate-on-start, play log, control panel (with every station at a glance), shared sign-in, settings by station, per-file figures shared by every station, one sync a second per Core (each station its own transaction), file analysis per Core, syslog; pytest suite against real PostgreSQL |
+| `qsys/probe` — discovery script | **0.2.0** — done; section F checks file fingerprints (Crypto.Digest, io seek) on the real Core |
+| `qsys/radio` — deck controller | **2.4.0** — stable; every station on the Core from one script (two players, or one for a background-music zone), each faulted and rebuilt on its own; file analysis on analysis players of its own (nothing on air touched); file fingerprints (off by itself on a Core that cannot make them); standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **2.4.0** — offline Core stand-in (any number of players, analysis players, one-player zones, simulated file contents and Crypto.Digest) + a live simulated Core with several stations and zones for demos |
+| `server` — Flask + Postgres | **2.3.0** — stable; own schema, migrate-on-start, play log, control panel (with every station at a glance), shared sign-in, settings by station, per-file figures shared by every station (a file known by its fingerprint once its Core has made one), one sync a second per Core (each station its own transaction), file analysis per Core, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -110,12 +110,15 @@ station settings, the library, syslog.
   with each play; the server keeps them per file and gives the Core back what
   it needs (quiet start / end, average level and peak, unsupported files)
   after each library upload.
-- **A file's figures are the file's.** One set per file name (no folder) and
-  size, shared by every station that has the file, on any Core
-  (`media_files`): a file moved to another folder or zone keeps them, an
-  edited file (new size) starts afresh (trims too), a file of unknown size
-  is never shared. A trim, Forget measured or an analysis on one station
-  counts on all.
+- **A file's figures are the file's.** One set per file, shared by every
+  station that has the file, on any Core (`media_files`). A file is known
+  by its content fingerprint once its Core has made one (radio.lua 2.4.0,
+  see [File fingerprints](#file-fingerprints)), else by its name (no
+  folder) and size: a file moved to another folder or zone keeps them, a
+  renamed one too once fingerprinted, two different files of the same name
+  and size part once fingerprinted, an edited file (new size) starts afresh
+  (trims too), a file of unknown size is never shared. A trim, Forget
+  measured or an analysis on one station counts on all.
 - **Level matching.** Every item plays at the same average level: the Core
   turns each file up or down by its measured average, within limits (see
   [Level matching](#level-matching)). Fades start and end at that level.
@@ -147,6 +150,7 @@ Facts from the first real run that the deck controller and server will build on.
 | Meter | `meter2`, 2 channels, −120 … +20 dBFS, floor reads −120.0000076; `response.time` 300 ms default (10 ms – 1 s); `peak.N` and `rms.N` both live regardless of `select` |
 | Control metadata | `Component.GetControls()` exposes `MinValue`, `MaxValue`, `MinString`, `MaxString`, `Choices` |
 | Dump file | `io.open` to `media/_probe/...` works; `dir.create` works |
+| Fingerprints | Not probed yet: probe 0.2.0's section F checks `Crypto.Digest("sha1", …)` (raw bytes or hex), `io.open(path, "rb")` + `seek` on media files and the time per file. radio.lua 2.4.0 checks the same at boot and turns fingerprints off by itself if they fail |
 
 ## Deck controller
 
@@ -305,6 +309,10 @@ ANALYZERS = {   -- {} = no file analysis
   30 s only while the server is unreachable or answers a station's part
   with `{error}`, at most every 2 min above 2,000 events). A 1.x file is read as the first station's. An unreadable
   file is kept as `<name>.bad`, never overwritten.
+- **Fingerprints** ([File fingerprints](#file-fingerprints)): only for the
+  files the server lists, one every 0.5 s on a timer of its own that runs
+  only while files are listed; each reads at most 192 KiB and writes
+  nothing.
 - **Never dead.** If neither deck is busy for `dead_air_s`, something starts;
   with an empty music folder it backs off and logs once, and looks again
   every 30 s: files that arrive start playing by themselves (one song).
@@ -322,10 +330,11 @@ The Core always asks; nothing connects to the Core. Both requests carry
 
 - **`POST /api/v1/core/sync`, once a second for every station:**
   `{version, boot, core, mem_kb, analyze_rev, analyzers: [{name, state,
-  station, key}], stations: [{station, ack, settings_rev, ads_rev, meters:
+  station, key}], fingerprint_rev, stations: [{station, ack, settings_rev, ads_rev, meters:
   {A: {peak, rms, gain}, B: …}, state, events, dropped}]}`. `analyze_rev`
   (the Core's list of files to analyze) comes only from a Core with an
-  analysis player; `analyzers` (each analysis player: `idle`, or
+  analysis player; `fingerprint_rev` (the Core's list of files to
+  fingerprint) only from a Core that can make fingerprints; `analyzers` (each analysis player: `idle`, or
   `measuring` with the station and key of its file; `{}` when there is
   none) only when it changed or every 10 s; `ack` is the last command id
   the station ran; `state` only when it
@@ -339,11 +348,15 @@ The Core always asks; nothing connects to the Core. Both requests carry
   is `{stations: {<id>: {commands (id > ack), settings + settings_rev (when
   the station's rev differs), ads + ads_rev (the ad plan, when it changed),
   ack_reset (the server's database is older than the ack), accepted,
-  duplicates, rejected} | {error}}, analyze + analyze_rev}`: `analyze` is
+  duplicates, rejected} | {error}}, analyze + analyze_rev, fingerprint +
+  fingerprint_rev}`: `analyze` is
   the Core's next files to analyze, `[{station, key}]` (at most 20, in the
   order to measure), sent when its rev differs from the Core's. Each
   result comes back as an `analysis` event of the station the file was
-  listed for. The server handles each station in its own transaction under
+  listed for. `fingerprint` is the same for fingerprints (at most 20; each
+  comes back as a `fingerprint` event, `{dir, file, size, fp}` or `{dir,
+  file, error}`, of the listed station and of every other station on the
+  Core that lists the same file). The server handles each station in its own transaction under
   that station's lock (every web change to the station, from a command to
   an ID mark, takes the same lock before it touches any row, so none can
   deadlock with that station's sync; a file's figures are shared by every
@@ -353,9 +366,10 @@ The Core always asks; nothing connects to the Core. Both requests carry
   `{error}` and the web change answers 409, nothing changed, try again); a
   station whose part fails gets `{error}` and the Core sends its events
   again next time (and keeps them in `outbox.json` meanwhile). The Core's
-  file analysis comes after the stations, in a transaction of its own
-  (`analysis.sync`; the list is cached on the Core's row, see
-  [File analysis](#file-analysis)). The database
+  file analysis and fingerprint lists come after the stations, each in a
+  transaction of its own (`analysis.sync`, `fingerprints.sync`; each list
+  is cached on the Core's row, see [File analysis](#file-analysis) and
+  [File fingerprints](#file-fingerprints)). The database
   gone answers 503 for the whole request and the Core backs off (2 s,
   doubling to 30 s).
 - **`POST /api/v1/core/library`, after each scan:** the station's files in
@@ -402,6 +416,7 @@ python3 qsys/test/run_mock.py qsys/test/scenario_levels.lua       # average leve
 python3 qsys/test/run_mock.py qsys/test/scenario_regressions.lua  # one case per bug found in review
 python3 qsys/test/run_mock.py qsys/test/scenario_multi.lua        # several stations: faults, rebuilds, outage, library in parts, memory
 python3 qsys/test/run_mock.py qsys/test/scenario_single.lua       # one-player zones beside a radio station: hand-over, commands, memory
+python3 qsys/test/run_mock.py qsys/test/scenario_fingerprint.lua  # file fingerprints, the off switch, the probe's section F
 ```
 
 `qsys/test/live_core.py --server http://127.0.0.1:5410 --token T` runs
@@ -426,8 +441,9 @@ server/
   cores.py            each Core: boot, version, Lua memory and the leak warning, its analysis players
   core_settings.py    every station setting: label, range, default, help; the layers
   events.py           Core events -> core_events + play_log
-  media.py            each file's figures, shared by every station (media_files, library_figures)
+  media.py            each file's figures, shared by every station (media_files, library_figures); which file a fingerprint is
   analysis.py         file analysis: each Core's job, runs and its cached list of files to measure
+  fingerprints.py     file fingerprints: each Core's cached list of files owed one
   plays.py            play log queries
   db.py               pooled PostgreSQL access + small helpers
   logs.py             journald + remote syslog (background thread)
@@ -879,7 +895,12 @@ route between its LAN ports. Keep the Core's clock right (NTP), because the
 play log uses it.
 
 **Probe (once per site or design, optional).** `qsys/probe/probe.lua` needs
-the same Script Access. It dumps the design and walks `media/Audio`. It
+the same Script Access. It dumps the design and walks `media/Audio`. Its
+section F (silent) checks what file fingerprints need: `Crypto.Digest("sha1",
+…)` (does it give the right digest, as raw bytes or hex?) and reading media
+files with `io.open` + `seek`, and times fingerprinting 20 of the files it
+found (ms each); its last line is the verdict (`radio.lua 2.4.0 will
+fingerprint files`, or will not). It
 loads every file in the player's folder silently, then plays one at −20 dB
 for about 20 s. Set `RUN_PLAYBACK_PROBE = false` for a silent run. Copy the
 Debug Output from `===== PROBE START` to `===== PROBE END`.
@@ -895,7 +916,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (12 in 2.3.0).
+The last line prints the number of tables (12 in 2.4.0).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -979,6 +1000,17 @@ Every start (`start.sh`) does three things in order:
   convenient (keep your `CFG` values). Until then the journal says
   `runs radio.lua 2.2.0, server is 2.3.0` once per station and the Stations
   page marks each card `radio.lua 2.2.0`; nothing else differs.
+- **From 2.3.0 to 2.4.0** (file fingerprints): first run the probe's
+  section F on the Core (step 10, Probe; `RUN_PLAYBACK_PROBE = false` is
+  enough) to see whether this Core can make them. Then update the server,
+  as above (migration 0019; the 2.3.0 Core plays on, its files known by
+  name + size). Then paste the new radio.lua into the same Text Controller
+  and keep your `CFG` values (nothing new to set). Its Debug Output says
+  `fingerprint: on (a test read of …)` or `! fingerprint: off (…)`; off,
+  everything works as before. On, the Core fingerprints every file of
+  every station once, 20 at a time, one every 0.5 s (2 to 3 hours for
+  14,000 files; a file that several stations list on the same Core is read
+  once), and again only when its size changes.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -1004,7 +1036,9 @@ code does not know (code rolled back?)…`, and health shows `"ok":false` with
 `schema_version` above `schema_expected`.
 
 If the old code does not work with the newer schema, restore the backup
-taken before the update. 1.5.0 and older never run on the schema of 1.6.0 or
+taken before the update. Nothing older than 2.4.0 runs on the 2.4.0 schema:
+migration 0019 replaced the one-row-per-name-and-size constraint the older
+library upload relies on, so going back from 2.4.0 needs the backup. 1.5.0 and older never run on the schema of 1.6.0 or
 later (migration 0015 moved each file's figures from `library` to
 `media_files`): going back to 1.5.0 or older always needs that backup.
 2.2.0 runs on the 2.3.0 schema (2.3.0 has no migration). 2.1.0 runs on the 2.2.0 schema (migration 0018 only adds a column; it
@@ -1278,7 +1312,9 @@ cached ads plan, the memory warning (garbage sawing up and down never
 warns), every web write taking the station's lock first, a 14-station sync
 timed), commands,
 sign-in and permissions, settings, the play log, per-file figures shared
-between stations (including two stations uploading at once), the data
+between stations (including two stations uploading at once), file
+fingerprints (a renamed file keeps its figures, the same name and size with
+other content parts, each Core's list), the data
 migrations (each in a scratch schema), failure handling, and radio.lua
 itself (MockCore) against the server: one station, three on one Core, and
 a one-player zone beside a radio station (plus the one-player rules: a
@@ -1354,7 +1390,7 @@ MockCore scenarios and `live_core.py`.
   the Core never measures over a figure set here), go back to the measured
   ones, or forget them and the level (measured again on the next play). **Forget
   measured** in the toolbar does that for the whole page. The figures are the
-  file's (its name and size), shared by every station that has the file: a
+  file's (its fingerprint, else its name and size), shared by every station that has the file: a
   figure set here or Forget measured reaches each such station's Core at
   once (the server queues a rescan on every one of them); an analysis
   result (Analyze again) reaches every station on the same Core at once
@@ -1572,7 +1608,7 @@ plays:
   the setting, Forget measured) or after a minute.
 - **For every station.** A result is the file's (`media_files`): a file
   analyzed, or failed, for one station counts on every station that has it
-  (same name and size). Every station on the same Core that lists the file
+  (the same file: same fingerprint, else same name and size). Every station on the same Core that lists the file
   (the same media path) uses the new figures from its next play; another
   Core's stations take them at their next library scan (boot, folder
   change, Rescan), until then they play the file with the figures they had.
@@ -1622,6 +1658,77 @@ plays:
   operator still win; **Forget measured** clears the analysis too. The
   average level is not final: plays keep adding to it.
 
+## File fingerprints
+
+A file is known by its content once its Core has fingerprinted it, so its
+figures (quiet start / end, level, trims, analysis) follow it when it is
+renamed or moved between zones, and two different files that happen to
+share a name and size are told apart. Until then, and on a Core that
+cannot make fingerprints, a file is known by its name and size, as before.
+
+- **The fingerprint.** The SHA-1 (lowercase hex) of the file's size in
+  bytes as decimal text, a newline, its first 64 KiB, the 64 KiB from the
+  middle (starting at half its size less 32 KiB) and its last 64 KiB (the
+  whole file when it is no longer than 192 KiB). The Core makes it with
+  `Crypto.Digest("sha1", …)` over `io.open(path, "rb")` reads with `seek`
+  (raw or hex digests both work). Three 64 KiB pieces keep it cheap on any
+  file length; the middle one tells apart files alike at both ends (spots of
+  the same length with digital silence at each end).
+- **A file is fingerprinted once per size.** A file fingerprinted at its
+  current size is not looked at again: a file replaced by another of exactly
+  the same length keeps the old one's fingerprint and figures. Use
+  **Forget measured** on it (its row's editor, or the toolbar for the
+  page): that also clears the fingerprint of every station's copy, so the
+  Core fingerprints it again and different content parts from the old
+  figures. A new size is always noticed (the next scan).
+- **On by itself, or off.** At boot the script checks `Crypto.Digest`
+  (the digest of `abc`) and reads the first file a station lists (no file
+  yet: it looks again every 30 s). If either fails it logs `! fingerprint:
+  off (…)` once and never asks for work (no `fingerprint_rev`); nothing
+  else changes. Run the probe's section F first to see which it will be
+  (step 10, Probe).
+- **Which files.** The server lists, per Core, the present files of known
+  size of its stations that have no fingerprint at their current size
+  (`library.fingerprint`, `fingerprint_size`; index
+  `library_fingerprint_owed`), 20 at a time (`fingerprint`,
+  `fingerprint_rev` in the sync reply; cached on the Core's row,
+  `cores.fp_owed`, made again when a result comes in, after a library
+  upload, or after a minute). The Core works through the list on a timer
+  of its own (one file every 0.5 s, only while the list has files; never
+  inside the deck timers), reads at most 192 KiB per file and writes
+  nothing. Each result is a `fingerprint` event of the listed station and
+  of every other station on the Core that lists the same file (one read).
+  A file that cannot be read is reported with its error
+  (`library.fingerprint_error`) and, like a size other than the library's
+  (changed since the scan), tried again after the next scan or a day. A
+  faulted station's files are not listed (its state says so); a listed file
+  of a station that is not built on the Core is reported as such (`station
+  not built`), so the list moves on to the other stations' files, and is
+  listed again after the station's next library upload.
+- **What the server does with one** (in that event's savepoint, under the
+  station's lock): another file row with that fingerprint is this file
+  (renamed or moved): the station's file points at it and keeps its
+  figures; the row it leaves, when it was only a name-and-size guess, gives
+  it what it lacks (the levels count together, as plays do, once: the row
+  left gives its levels up; an analysis, trims, the length when it has
+  none) and is dropped once no station uses it. A row that has another
+  fingerprint is another file of the same name and size: the station's
+  file gets a row of its own, measured afresh. A row not fingerprinted yet
+  takes the fingerprint. Two Cores fingerprinting the same content under
+  two names at the same moment: the second follows the row the first gave
+  it. A library upload keeps a file fingerprinted at its size on its
+  fingerprint's row (back on it when a scan finds that size again); a new
+  size goes back to name and size until fingerprinted again.
+- **Locks.** The event touches the station's own library row and at most
+  two file rows, by primary key, locked together in id order. Another
+  station's sync writes a file row by key too (a play's or an analysis's
+  figures), so two stations' parts meet only on a file both have; if they
+  ever deadlock, PostgreSQL cancels one part, which is answered `{error}`
+  and sent again by its Core (nothing lost).
+- **The Core** takes a moved file's figures from its next library upload
+  reply (boot, folder change, Rescan); until then it plays the file as a
+  new one (and measures it).
+
 ## Level matching
 
 Every song, bumper and ad plays at the same average level, set on Settings →
@@ -1656,7 +1763,8 @@ Levels:
   / Quietest). Start events carry `trim` (syslog, `core_events`).
 - **Starting over.** Forget measured forgets the level too, and a replaced
   file (new size) is measured afresh (its operator quiet start / end are
-  gone too). Updating to 1.3.0 starts a
+  gone too); a file replaced by one of the same length needs Forget
+  measured ([File fingerprints](#file-fingerprints)). Updating to 1.3.0 starts a
   re-analysis of every file once (migration 0013, as Re-analyze all does) so
   each gets an analyzed level; plays measure as they go anyway.
 
@@ -1730,6 +1838,7 @@ complete record.
 | 2.1.0 | File analysis on the Core's own analysis players for every station, right away by default; nothing on air touched |
 | 2.2.0 | One-player stations: background-music zones (one Audio Player, songs only) beside the radio stations, from the same radio.lua |
 | 2.3.0 | The Stations page: every station at a glance (what plays, its meter, Start / Stop / Skip), one poll for all of them |
+| 2.4.0 | File fingerprints: a file is known by its content, so a renamed or moved file keeps its figures; checked by the probe, off by itself on a Core that cannot |
 | Next | Ad campaigns (start / end dates, dayparts, daily caps) and proof-of-play reports |
 | Later | Alerts (dead air, Core offline, clock off) and scheduled events (a file at a set time) |
 

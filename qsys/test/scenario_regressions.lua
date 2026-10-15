@@ -551,5 +551,40 @@ check(starts[1] and starts[1].at < 72 and (not starts[2] or starts[2].at > start
   string.format("one song starts at the guard's rescan (t=%s); both players on air for %.2f s (a crossfade's worth at most)",
     starts[1] and starts[1].at or "-", both * 0.25))
 
+print("-- fingerprints: a listed file of a station that is not built is reported, so the list moves on (2.4.0 dev passed")
+print("   it silently: the server listed the same files again and again, and no later station's file was ever done)")
+local fpEvents = {}
+boot(songs(3, 40), {}, function()
+  MockCore.dirs["Zone/"] = songs(2, 40)
+  MockCore.serve{ core = function(body)
+    for _, part in ipairs(body.stations or {}) do
+      for _, e in ipairs(part.events or {}) do if e.kind == "fingerprint" then fpEvents[#fpEvents + 1] = e end end
+    end
+    if body.fingerprint_rev == "" then
+      return { fingerprint = { { station = "Zone", key = "Zone/A - Song1.flac" }, { station = "Main", key = "Test/Tuning/A - Song1.flac" } },
+               fingerprint_rev = "f1" }
+    end
+  end }
+end, function(cfg)
+  cfg.SERVER_URL = "http://radio-server:5410"
+  cfg.STATIONS[2] = { id = "Zone", players = { "Missing_Player" }, meter = "PlayerMeter", meters = { 1 } }
+end)
+MockCore.run(5)
+local zoneErr, mainFp
+for _, e in ipairs(fpEvents) do
+  if e.station == "Zone" then zoneErr = e.error elseif e.station == "Main" then mainFp = e.fp end
+end
+check(Radio.byId.Zone.fault and zoneErr and zoneErr:find("station not built", 1, true) and mainFp,
+  "the faulted station's file reported (" .. tostring(zoneErr) .. "); the next station's file done")
+
+print("-- fingerprints: two spots of the same length with digital silence at both ends are two files (2.4.0 dev hashed")
+print("   only the first and last 64 KiB: they had one fingerprint, and the server gave one the other's figures)")
+local spot = function(name, middle) return { name = name, duration = 30, size = 2000000, content = "silence", middle = middle } end
+boot({ spot("A - Spot1.wav", "spot one"), spot("B - Spot2.wav", "spot two") }, {})
+local one = Fingerprint.of(S:mediaPath("Test/Tuning/") .. "A - Spot1.wav")
+local two = Fingerprint.of(S:mediaPath("Test/Tuning/") .. "B - Spot2.wav")
+check(one and two and one ~= two and one == MockCore.fingerprint(MockCore.lookup("Test/Tuning/", "A - Spot1.wav")),
+  "different middles: different fingerprints")
+
 print("")
 print(fails == 0 and "ALL CHECKS PASSED" or (fails .. " CHECK(S) FAILED"))

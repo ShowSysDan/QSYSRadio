@@ -1,8 +1,8 @@
 -- QSYSRadio deck controller (Q-SYS Lua 5.3): every station on this Core (two Audio Players each, or one for a
--- background-music zone) and its file analysis players. Docs: README.md.
+-- background-music zone), its file analysis players and file fingerprints. Docs: README.md.
 -- Station settings are edited on the server's web page and pushed here; SETTINGS below are only the
 -- fallback until the server has been reached once.
-RADIO_VERSION = "2.3.0"
+RADIO_VERSION = "2.4.0"
 
 CFG = {
   SERVER_URL = "",     -- e.g. "http://10.0.0.20:5410"; "" = run standalone
@@ -36,6 +36,7 @@ local K = {
   sync_s = 1, sync_batch = 100, state_every_s = 10, http_timeout_s = 5, library_chunk = 1000,
   outbox_max = 10000, outbox_big = 2000, outbox_big_s = 120, events_max = 500, history_max = 50, queue_max = 100, analyze_max = 100,
   fault_after = 5, retry_s = 30, retry_max_s = 300, healthy_s = 600,
+  fingerprint_s = 0.5, fingerprint_chunk = 65536, fingerprint_max = 50,
 }
 -- only what must survive a reboot while the server is unreachable; everything else lives on the server
 FILES = { outbox = "media/_radio/outbox.json", settings = "media/_radio/settings.json" }
@@ -492,6 +493,20 @@ end
 
 function Station:mediaPath(dirRel)
   return (("media/" .. self.lib.root .. "/" .. dirRel):gsub("/+", "/"))
+end
+
+-- the key a media path has in its library (nil: outside its players' root)
+function Station:keyOf(path)
+  local root = self:mediaPath("")
+  return startsWith(path, root) and path:sub(#root + 1) or nil
+end
+
+-- its record of a file, and whether it lists it now (a key it does not list: a record made from the key)
+function Station:track(key)
+  local tr = self.lib.byKey[key]
+  if tr then return tr, true end
+  local folder = key:match("^(.*/)") or ""
+  return { key = key, dir = folder, name = key:sub(#folder + 1) }, false
 end
 
 -- its files of one kind in dirRel; the records are shared with every station that lists the same folder.
@@ -1023,12 +1038,8 @@ end
 -- a file its station does not list now (a load failed on air, or the list is a moment old) is tried all the same:
 -- the list never sticks
 function Analyzer:begin(d, e, st, t)
-  local tr = st.lib.byKey[e.key]
-  local job = { id = e.id, station = st.id, key = e.key, listed = tr ~= nil, S = st.settings, started = t }
-  if not tr then
-    local folder = e.key:match("^(.*/)") or ""
-    tr = { key = e.key, dir = folder, name = e.key:sub(#folder + 1) }
-  end
+  local tr, listed = st:track(e.key)
+  local job = { id = e.id, station = st.id, key = e.key, listed = listed, S = st.settings, started = t }
   job.track, job.path = tr, st:mediaPath(tr.dir) .. tr.name
   d.job, self.changed = job, self.changed + 1
   local dir, err = self:dirFor(d, st, tr.dir)
@@ -1079,8 +1090,7 @@ end
 function Analyzer:share(path, ev, unsupported)
   if not (ev.ok or unsupported) then return end
   for _, st in ipairs(Radio.stations) do
-    local root = st:mediaPath("")
-    local key = startsWith(path, root) and path:sub(#root + 1)
+    local key = st:keyOf(path)
     local tr = key and st.lib.byKey[key]
     if tr and unsupported then
       st:figures(key).unsupported = true
@@ -1158,6 +1168,156 @@ function Analyzer:statusLine()
   for i, d in ipairs(self.decks) do parts[i] = d.id .. " " .. (d.job and (d.job.station .. " " .. d.job.track.name) or "idle") end
   for _, e in ipairs(self.todo) do if not self.done[e.id] then left = left + 1 end end
   return "analysis: " .. table.concat(parts, ", ") .. ", " .. left .. " listed"
+end
+
+-- ── FINGERPRINT: which file a file is, so the server's figures follow it (renamed, moved) and two files of the same
+-- name and size are told apart: the sha1 of its size, a newline, its first, middle and last K.fingerprint_chunk bytes
+-- (the whole file when no longer than the three). For the files the server lists, one every K.fingerprint_s on its own timer
+-- (Hashing), which runs only while the list has files. Off when Crypto.Digest or io seek is missing or fails (files
+-- are then known by name + size). It only reads files.
+-- todo: the server's list ({ id, station, key, done }), worked through from pos; byId: the same entries by id
+Fingerprint = { id = "fingerprint", todo = {}, byId = {}, pos = 1, rev = "", can = nil, on = false }
+
+local function hexByte(c) return string.format("%02x", c:byte()) end
+
+-- Crypto.Digest's sha1 as 40 lowercase hex digits (it may give the 20 raw bytes or hex), or nil
+local function sha1Hex(data)
+  local d = Crypto.Digest("sha1", data)
+  if type(d) ~= "string" then return nil end
+  if #d == 20 then d = d:gsub(".", hexByte) end
+  d = d:lower()
+  if #d == 40 and not d:find("[^0-9a-f]") then return d end
+end
+
+-- n bytes at pos (from the end when pos < 0)
+local function readAt(f, pos, n)
+  if not f:seek(pos < 0 and "end" or "set", pos) then error("io seek failed", 0) end
+  local s = f:read(n) or ""
+  if #s ~= n then error("short read", 0) end
+  return s
+end
+
+-- the middle chunk starts at floor(size / 2) - n / 2: two files alike at both ends (silence) still differ
+local function readPrint(f)
+  local size, n = f:seek("end"), K.fingerprint_chunk
+  if type(size) ~= "number" or size < 0 then error("io seek failed", 0) end
+  local data
+  if size <= 3 * n then
+    data = readAt(f, 0, size)
+  else
+    data = readAt(f, 0, n) .. readAt(f, size // 2 - n // 2, n) .. readAt(f, -n, n)
+  end
+  local fp = sha1Hex(string.format("%d\n", size) .. data)
+  if not fp then error("Crypto.Digest gave no sha1", 0) end
+  return fp, size
+end
+
+-- a file's fingerprint and size, or nil, nil and why not
+function Fingerprint.of(path)
+  local f, err = io.open(path, "rb")
+  if not f then return nil, nil, "cannot open: " .. tostring(err) end
+  local ok, fp, size = pcall(readPrint, f)
+  pcall(f.close, f)
+  if not ok then return nil, nil, tostring(fp) end
+  return fp, size
+end
+
+function Fingerprint.off(why)
+  Fingerprint.can = false
+  log("! fingerprint: off (%s): files are known by name + size", why)
+end
+
+-- can this Core make fingerprints? Crypto.Digest's sha1 of "abc", then a test read of a listed file: one that opens but
+-- cannot be read (seek, digest) says no; one that does not open, the next (up to 5); no file listed yet: Chores asks again
+function Fingerprint.check()
+  local ok, abc = pcall(sha1Hex, "abc")
+  if not ok or abc ~= "a9993e364706816aba3e25717850c26c9cd0d89d" then
+    return Fingerprint.off("Crypto.Digest(\"sha1\") " .. (ok and ("gave " .. tostring(abc)) or ("failed: " .. tostring(abc))))
+  end
+  local tried, why = 0, nil
+  for _, st in ipairs(Radio.stations) do
+    for _, kind in ipairs(KIND_ORDER) do
+      local tr = st.built and tried < 5 and st.lib[kind][1]
+      if tr then
+        local path = st:mediaPath(tr.dir) .. tr.name
+        local fp, _, err = Fingerprint.of(path)
+        if fp then
+          Fingerprint.can = true
+          return log("fingerprint: on (a test read of %s: %s)", path, fp)
+        end
+        tried, why = tried + 1, "a test read of " .. path .. ": " .. tostring(err)
+        if not startsWith(err, "cannot open") then return Fingerprint.off(why) end
+      end
+    end
+  end
+  if why then Fingerprint.off(why) end
+end
+
+function Fingerprint.start()
+  local ok, err = pcall(Fingerprint.check)
+  if not ok then Fingerprint.off(tostring(err)) end
+end
+
+-- the server's list for this Core: { station, key }; a file done from the last list is not done again
+function Fingerprint.list(list, rev)
+  local F, todo, byId = Fingerprint, {}, {}
+  for _, e in ipairs(list) do
+    if type(e) == "table" and type(e.station) == "string" and type(e.key) == "string" and #todo < K.fingerprint_max then
+      local id = e.station .. "|" .. e.key
+      if not byId[id] then
+        local was = F.byId[id]
+        byId[id] = { id = id, station = e.station, key = e.key, done = was ~= nil and was.done }
+        todo[#todo + 1] = byId[id]
+      end
+    end
+  end
+  F.todo, F.byId, F.pos, F.rev = todo, byId, 1, tostring(rev or "")
+  if #todo > 0 and not F.on then
+    F.on = true
+    Hashing:Start(K.fingerprint_s)
+  end
+end
+
+-- one file: its fingerprint is an event of every station of this Core that lists it (one read); a file that cannot
+-- be read is reported as such, as the listed station's
+function Fingerprint.run(st, e)
+  local tr = st:track(e.key)
+  local path = st:mediaPath(tr.dir) .. tr.name
+  local fp, size, err = Fingerprint.of(path)
+  e.done = true
+  if not fp then return emit(st, "fingerprint", { dir = tr.dir, file = tr.name, error = err }) end
+  emit(st, "fingerprint", { dir = tr.dir, file = tr.name, size = size, fp = fp })
+  for _, other in ipairs(Radio.stations) do
+    local key = other ~= st and other:keyOf(path)
+    local o = key and other.lib.byKey[key]
+    if o then
+      local x = Fingerprint.byId[other.id .. "|" .. key]
+      if x then x.done = true end
+      emit(other, "fingerprint", { dir = o.dir, file = o.name, size = size, fp = fp })
+    end
+  end
+end
+
+-- the timer: the next listed file not done yet; stops when the list is worked through. A file of a station that is
+-- not built (its players' root unknown) is reported as such, so the server lists others meanwhile (it lists it again
+-- after the station's next library upload); one of a station not on this Core is passed
+function Fingerprint.step()
+  local F, todo = Fingerprint, Fingerprint.todo
+  while todo[F.pos] and todo[F.pos].done do F.pos = F.pos + 1 end
+  local e = todo[F.pos]
+  if not e then
+    F.on = false
+    return Hashing:Stop()
+  end
+  F.pos = F.pos + 1
+  local st = Radio.byId[e.station]
+  if st and st.built then
+    guard(st, "fingerprint", F.run, st, e)
+  elseif st then
+    local tr = st:track(e.key)
+    e.done = true
+    emit(st, "fingerprint", { dir = tr.dir, file = tr.name, error = "station not built: " .. tostring(st.fault) })
+  end
 end
 
 -- ── COMMANDS (from the web panel, via the server) ─────────────────────────────
@@ -1576,11 +1736,12 @@ function Server.sync()
   local A, shown = Analyzer, nil                  -- the analysis players: their list's rev, and how they are (when that changed)
   if A:can() then body.analyze_rev = A.rev end
   if A.changed ~= A.sentChanged or t - A.stateAt >= K.state_every_s then body.analyzers, shown = A:state(), A.changed end
+  if Fingerprint.can then body.fingerprint_rev = Fingerprint.rev end
   post("sync", "/api/v1/core/sync", body, function(code, data, httpErr) Server.synced(sent, shown, t, code, data, httpErr) end)
 end
 
 -- the reply: each station's entry applied on its own; a station answered with { error } (or nothing) keeps its events;
--- the analysis list (top level) when it changed
+-- the lists of files to analyze and to fingerprint (top level) when they changed
 function Server.synced(sent, shown, t, code, data, httpErr)
   local resp = decoded(code, data)
   local replies = resp and resp.stations
@@ -1625,6 +1786,9 @@ function Server.synced(sent, shown, t, code, data, httpErr)
   if changed then Server.saveSettings() end
   if shown then Analyzer.sentChanged, Analyzer.stateAt = shown, t end
   if type(resp.analyze) == "table" and Analyzer:can() then guard(Analyzer, "analysis list", Analyzer.list, Analyzer, resp.analyze, resp.analyze_rev) end
+  if type(resp.fingerprint) == "table" and Fingerprint.can then
+    guard(Fingerprint, "fingerprint list", Fingerprint.list, resp.fingerprint, resp.fingerprint_rev)
+  end
 end
 
 -- settings.json: { stations = { [id] = { rev, settings } } } (a 1.x { rev, settings } is the first station's);
@@ -1703,6 +1867,7 @@ function Radio.chores()
   log("heartbeat: Lua %s KB, outbox %d | %s", tostring(memKb()), #Server.outbox, table.concat(parts, " | "))
   Server.saveOutbox()
   pruneShared()
+  if Fingerprint.can == nil then Fingerprint.start() end
 end
 
 -- ── STARTUP ───────────────────────────────────────────────────────────────────
@@ -1755,9 +1920,11 @@ local function boot()
   Tick = timer("tick", Radio.tick, K.tick_s)
   Sync = timer("sync", Server.sync, K.sync_s)
   Chores = timer("chores", Radio.chores, K.chores_s)
+  Hashing = timer("fingerprint", function() Fingerprint.step() end)   -- started by Fingerprint.list while files are listed
   for i, c in ipairs(cfgs) do Radio.stations[i] = Station.new(c, nil, saved[c.id]) end
   Analyzer:build(CFG.ANALYZERS, cfgs)
   Radio.refresh()
+  Fingerprint.start()
   for _, st in ipairs(Radio.stations) do
     emit(st, "boot", { version = RADIO_VERSION, platform = tostring(info.Platform), design = DESIGN_NAME, core = coreName(),
       server = Server.enabled() and CFG.SERVER_URL or "-" })

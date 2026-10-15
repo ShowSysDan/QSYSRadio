@@ -22,7 +22,7 @@ from datetime import timedelta
 import psycopg2
 import psycopg2.extensions
 
-from . import ads, analysis, breaks, clock, core_settings, cores, db, events, logs, media
+from . import ads, analysis, breaks, clock, core_settings, cores, db, events, fingerprints, logs, media
 from .db import clean_json, iso, like, number, text
 from .events import BadRequest
 
@@ -212,22 +212,27 @@ def _part_failed(conn, name, exc):
     return {'error': error}, lines
 
 
-def _results(part):
-    """Does this station's part carry an analysis result (or a file found unsupported)? The Core's list of files
-    to analyze is then made again."""
+def _results(part, kinds):
+    """Does this station's part carry a result for one of the Core's lists (an event of one of these kinds: an
+    analysis result or a file found unsupported, a fingerprint)? That list is then made again."""
     evs = part.get('events') if isinstance(part, dict) else None
-    return isinstance(evs, list) and any(isinstance(e, dict) and e.get('kind') in ('analysis', 'file_unsupported') for e in evs)
+    return isinstance(evs, list) and any(isinstance(e, dict) and e.get('kind') in kinds for e in evs)
+
+
+# the Core's own lists, each when it sends its rev: (name, module with sync(), the rev field)
+CORE_JOBS = (('analysis', analysis, 'analyze_rev'), ('fingerprint', fingerprints, 'fingerprint_rev'))
 
 
 def core_sync(conn, payload, now, log):
     """The Core's once-a-second request. Returns the reply; log(lines) is called after each commit.
-    2.x: {version, boot, core, mem_kb, analyze_rev?, analyzers?, stations: [{station, ack, settings_rev, ads_rev,
-    meters, state?, events?, dropped?}]} -> {stations: {id: reply | {error}}, analyze?, analyze_rev?}; each
-    station is its own transaction (its lock held for its work only, committed before the next): one
-    station's failure rolls back that station alone, which gets {error} and sends its events again. Then the
-    Core's file analysis (analyze_rev: it has an analysis player), in its own transaction: its next files
-    when its list differs (analysis.sync). 1.x: one station's part at the top level ({station, version, boot,
-    ack, ...}) -> that station's reply, as before 2.0."""
+    2.x: {version, boot, core, mem_kb, analyze_rev?, analyzers?, fingerprint_rev?, stations: [{station, ack,
+    settings_rev, ads_rev, meters, state?, events?, dropped?}]} -> {stations: {id: reply | {error}}, analyze?,
+    analyze_rev?, fingerprint?, fingerprint_rev?}; each station is its own transaction (its lock held for its
+    work only, committed before the next): one station's failure rolls back that station alone, which gets
+    {error} and sends its events again. Then the Core's own lists, each in its own transaction: its next files
+    to analyze (analyze_rev: it has an analysis player; analysis.sync) and to fingerprint (fingerprint_rev: it
+    can make fingerprints; fingerprints.sync), each when it differs from the Core's. 1.x: one station's part at
+    the top level ({station, version, boot, ack, ...}) -> that station's reply, as before 2.0."""
     if not isinstance(payload, dict):
         raise BadRequest('expected a JSON object')
     version, boot = text(payload.get('version'), 50), text(payload.get('boot'), 100)
@@ -266,15 +271,17 @@ def core_sync(conn, payload, now, log):
         replies[station] = reply
         log(lines)
     out = {'stations': replies}
-    if core and 'analyze_rev' in payload:
+    for name, job, field in CORE_JOBS:
+        if not core or field not in payload:
+            continue
         try:
             with conn.cursor() as cur:
-                more, lines = analysis.sync(cur, core, text(payload.get('analyze_rev'), 50) or '',
-                                            any(_results(p) for p in parts[:SYNC_STATIONS_MAX]))
+                more, lines = job.sync(cur, core, text(payload.get(field), 50) or '',
+                                       any(_results(p, job.RESULTS) for p in parts[:SYNC_STATIONS_MAX]))
             conn.commit()
             out.update(more)
         except Exception as exc:          # noqa: BLE001 (the stations' replies stand; the Core asks again)
-            lines = _part_failed(conn, f'core:{core} analysis', exc)[1]
+            lines = _part_failed(conn, f'core:{core} {name}', exc)[1]
         log(lines)
     return out
 
@@ -323,6 +330,7 @@ def core_library(conn, payload):
                                  f'of {parts} not received; send the whole scan again')
         media.link(cur, station, rows, scan)
         analysis.stale(cur, station)
+        fingerprints.stale(cur, station)
         if part < parts:
             cur.execute("""INSERT INTO stations (station, scan, scan_parts) VALUES (%s, %s, %s)
                            ON CONFLICT (station) DO UPDATE SET scan = EXCLUDED.scan, scan_parts = EXCLUDED.scan_parts""",
@@ -582,9 +590,9 @@ def set_trim(conn, station, key, lead, trail, user):
 
 def forget_measured(conn, station, key, kind, user):
     """Forget the measured quiet start / end and level of one file (key) or of every file of a kind the
-    station has, for every station that has them; they are measured again on the next play. Operator
-    figures stay. Returns (files, log line, the stations to rescan: this one and every other that has
-    one of the files forgotten)."""
+    station has, for every station that has them; they are measured again on the next play, and fingerprinted
+    again (a file replaced by another of the same length is then told apart). Operator figures stay. Returns
+    (files, log line, the stations to rescan: this one and every other that has one of the files forgotten)."""
     if not key and kind not in KINDS:
         raise BadRequest('give a file (key) or a kind')
     with conn.cursor() as cur:
@@ -600,6 +608,10 @@ def forget_measured(conn, station, key, kind, user):
         stations = media.stations_of(cur, station, ids)
         if ids:
             analysis.stale(cur)                  # files not analyzed any more: owed again on every Core
+            # and fingerprinted again (a replacement of the same length is another file: it parts from these figures)
+            cur.execute("""UPDATE library SET fingerprint = NULL, fingerprint_size = NULL, fingerprint_at = NULL,
+                                  fingerprint_error = NULL WHERE file_id = ANY(%s) AND fingerprint IS NOT NULL""", (ids,))
+            fingerprints.stale(cur)
     conn.commit()
     return len(ids), (20, f'FORGET station={station} {"key=" + repr(key) if key else "kind=" + kind} files={len(ids)} '
                           f'by={user.get("username")}'), stations

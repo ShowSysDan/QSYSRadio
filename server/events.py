@@ -6,9 +6,9 @@ its own savepoint, so one malformed event is rejected on its own instead of
 failing the batch (which would make the Core resend it forever). Only newly
 stored events touch play_log, the per-file figures (lead-in, trailing silence,
 average level, peak, unsupported; the file's, shared by every station that
-has it: media.py) and the log; log lines are returned to the caller to write
-after the transaction commits. An event about a file the station does not
-have changes no figures.
+has it, and which file it is: its fingerprint; media.py) and the log; log
+lines are returned to the caller to write after the transaction commits. An
+event about a file the station does not have changes no figures.
 """
 import json
 import logging
@@ -149,6 +149,12 @@ def _apply(cur, station, ev):
             cur.execute(f'UPDATE media_files SET analyze_failed_at = NOW(), analyze_error = %(error)s WHERE {media.file_of()}',
                         dict(error=text(ev.get('status'), 200) or 'failed', **args))
         cur.execute(f'UPDATE library SET analyze_wanted = FALSE WHERE {media.file_of("file_id")} AND analyze_wanted', args)
+    elif kind == 'fingerprint':
+        # the file's content (radio.lua 2.4.0): its figures follow it (media.fingerprinted)
+        fp, size = (text(ev.get('fp'), 100) or '').lower(), ev.get('size')
+        size = size if isinstance(size, int) and not isinstance(size, bool) and 0 < size < 2 ** 62 else None
+        return media.fingerprinted(cur, station, (text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or ''),
+                                   fp if media.FINGERPRINT.fullmatch(fp) and size else None, size, text(ev.get('error'), 200))
     elif kind == 'file_unsupported':
         cur.execute(f'UPDATE media_files SET unsupported = TRUE WHERE {media.file_of()} AND NOT unsupported',
                     dict(station=station, key=(text(ev.get('dir'), 500) or '') + (text(ev.get('file'), 500) or '')))

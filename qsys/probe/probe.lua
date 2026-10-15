@@ -1,7 +1,7 @@
 --[[---------------------------------------------------------------------------
   Q-SYS Radio Automation :: Discovery Probe
   File:     qsys/probe/probe.lua
-  Version:  0.1.1
+  Version:  0.2.0
   Requires: Q-SYS Designer 9.x/10.x, a Text Controller, and Script Access
             enabled on the two Audio Players and the level meter.
 
@@ -26,6 +26,12 @@
                      all controls on the players + meter (type, range, value).
     B. Media dump    raw player strings, dir.get() path probes, and a recursive
                      walk of MEDIA_ROOT with file sizes.
+    F. Fingerprint   (RUN_FINGERPRINT, silent) what radio.lua 2.4.0 needs to know
+                     a file by its content: Crypto.Digest("sha1", ...) (correct?
+                     raw bytes or hex?), io.open "rb" + seek on media files, and
+                     the time to fingerprint FINGERPRINT_FILES files (ms each).
+                     Runs right after the walk; its verdict says whether
+                     radio.lua will fingerprint files on this Core.
     C. Directory     if the probe player has no directory selected, sets
                      PROBE_DIRECTORY and waits for it to settle.
     D. Load sweep    (RUN_LOAD_SWEEP, silent) sets filename to each file in the
@@ -38,6 +44,9 @@
                      !! plays audio through it. Set RUN_PLAYBACK_PROBE = false
                      !! for a silent run (the load sweep makes no sound).
 
+  CHANGES IN 0.2.0
+    - Section F: fingerprint check and timing (radio.lua 2.4.0).
+
   CHANGES IN 0.1.1 (from the first run on a Core 8 Flex, build 1-2603002)
     - Control metadata fields are MinValue/MaxValue/MinString/MaxString/
       Choices; the controls table now shows them properly.
@@ -48,7 +57,7 @@
     - UTC timestamps. Restores directory as well as gain/loop/filename.
 -----------------------------------------------------------------------------]]
 
-PROBE_VERSION = "0.1.1"
+PROBE_VERSION = "0.2.0"
 
 -------------------------------------------------------------------------------
 -- CONFIG
@@ -79,6 +88,10 @@ CFG = {
   FADE_STEP_SECONDS   = 0.05,            -- gain update interval during the fade
   SAMPLE_INTERVAL     = 0.25,            -- seconds between samples
   SILENCE_DBFS        = -50,             -- only used for "meter rose above / fell below" timings
+
+  RUN_FINGERPRINT     = true,            -- section F (reads files, no sound)
+  FINGERPRINT_FILES   = 20,              -- audio files from the walk to fingerprint and time
+  FINGERPRINT_CHUNK   = 65536,           -- radio.lua's K.fingerprint_chunk: the first, middle and last this many bytes
 
   RESTORE_PLAYER      = true,            -- put directory/filename/gain/loop back afterwards
   WRITE_DUMP_FILE     = true,
@@ -552,6 +565,7 @@ local function writeDump()
     dirs = DIRS,
     sweep = plain(S.results),
     playback = plain(P),
+    fingerprint = plain(FP),
   }))
   f:write("\n")
   f:close()
@@ -940,6 +954,95 @@ local function beginDirectoryStep()
 end
 
 -------------------------------------------------------------------------------
+-- F. FINGERPRINT (radio.lua 2.4.0 knows a file by the sha1 of its size in bytes as decimal text, a newline, its
+--    first, middle (from floor(size / 2) - chunk / 2) and last FINGERPRINT_CHUNK bytes; the whole file when no longer
+--    than the three)
+-------------------------------------------------------------------------------
+FP = { files = {} }
+
+local SHA1_ABC = "a9993e364706816aba3e25717850c26c9cd0d89d"
+
+local function hexOf(raw) return (raw:gsub(".", function(c) return string.format("%02x", c:byte()) end)) end
+
+-- Crypto.Digest's sha1 as lowercase hex (raw 20 bytes or 40 hex characters), or nil
+local function sha1Hex(data)
+  local d = Crypto.Digest("sha1", data)
+  if type(d) ~= "string" then return nil end
+  return (#d == 20 and hexOf(d) or d:lower())
+end
+
+-- what radio.lua does for one file: returns fingerprint (nil without Crypto), size
+local function fingerprintFile(path)
+  local f = assert(io.open(path, "rb"))
+  local ok, fp, size = pcall(function()
+    local n = CFG.FINGERPRINT_CHUNK
+    local size = f:seek("end")
+    if type(size) ~= "number" then error("seek(\"end\") gave " .. tostring(size)) end
+    local function at(pos, len)
+      assert(f:seek(pos < 0 and "end" or "set", pos), "seek to " .. pos .. " failed")
+      return f:read(len) or ""
+    end
+    local data
+    if size <= 3 * n then
+      data = at(0, size)
+    else
+      data = at(0, n) .. at(size // 2 - n // 2, n) .. at(-n, n)
+    end
+    if #data ~= math.min(size, 3 * n) then error("short read: " .. #data .. " bytes") end
+    return FP.crypto and sha1Hex(string.format("%d\n", size) .. data) or nil, size
+  end)
+  f:close()
+  if not ok then error(fp, 0) end
+  return fp, size
+end
+
+local function sectionFingerprint()
+  if not CFG.RUN_FINGERPRINT then return end
+  hr("FINGERPRINT (Crypto.Digest sha1 + io seek, for radio.lua 2.4.0)")
+  FP.crypto = type(Crypto) == "table" and type(Crypto.Digest) == "function"
+  outf("  Crypto.Digest          = %s", FP.crypto and "present" or "MISSING")
+  if FP.crypto then
+    local ok, d = pcall(Crypto.Digest, "sha1", "abc")
+    if not ok then FP.form = "error: " .. esc(d)
+    elseif type(d) ~= "string" then FP.form = "a " .. type(d)
+    elseif #d == 20 then FP.form = "raw (20 bytes)"
+    elseif #d == 40 then FP.form = "hex (40 characters)"
+    else FP.form = "unknown (" .. #d .. " bytes)" end
+    local hex = ok and type(d) == "string" and (#d == 20 and hexOf(d) or d:lower()) or nil
+    FP.correct = hex == SHA1_ABC
+    outf("  sha1(\"abc\") form      = %s", FP.form)
+    outf("  sha1(\"abc\")           = %s (%s)", esc(hex), FP.correct and "correct" or ("WRONG, expected " .. SHA1_ABC))
+    FP.crypto = FP.correct
+  end
+  local clock = HAVE_TIMER_NOW and Timer.Now or os.clock
+  local total, cpuTotal, n, failed = 0, 0, 0, 0
+  for _, e in ipairs(TREE) do
+    if n >= CFG.FINGERPRINT_FILES then break end
+    if e.type ~= "directory" and isAudio(e.rel) then
+      n = n + 1
+      local path = CFG.MEDIA_ROOT .. "/" .. e.rel
+      local t0, c0 = clock(), os.clock()
+      local ok, fp, size = pcall(fingerprintFile, path)
+      local ms, cpu = (clock() - t0) * 1000, (os.clock() - c0) * 1000
+      if ok then total, cpuTotal = total + ms, cpuTotal + cpu else failed = failed + 1 end
+      FP.files[#FP.files + 1] = { rel = e.rel, ms = ms, cpu_ms = cpu, size = ok and size or nil, fp = ok and fp or nil,
+                                  error = not ok and tostring(fp) or nil }
+      outf("  %8.1f ms (CPU %6.1f)  %-40s %s", ms, cpu, ok and (fp or ("size " .. tostring(size) .. ", read; no sha1"))
+        or ("FAIL " .. esc(fp)), esc(e.rel))
+    end
+  end
+  if n == 0 then out("  no audio file found by the walk: io seek not tested") end
+  FP.tested, FP.failed, FP.avg_ms = n, failed, n > failed and total / (n - failed) or nil
+  if FP.avg_ms then
+    outf("  average %.1f ms per file (CPU %.1f ms; %d read, %d failed); radio.lua does one file every 0.5 s", FP.avg_ms,
+      cpuTotal / (n - failed), n - failed, failed)
+  end
+  FP.on = FP.crypto and n > 0 and failed < n
+  outf("  VERDICT: radio.lua 2.4.0 will %s", FP.on and "fingerprint files (files keep their figures when renamed)"
+    or "NOT fingerprint files on this Core (files stay known by name + size)")
+end
+
+-------------------------------------------------------------------------------
 -- MAIN
 -------------------------------------------------------------------------------
 out("===== PROBE START (v" .. PROBE_VERSION .. ") =====")
@@ -953,4 +1056,5 @@ sectionMedia(Player1, CFG.PLAYER_1)
 sectionMedia(Player2, CFG.PLAYER_2)
 sectionDirGet(Player1 or Player2, Player1 and CFG.PLAYER_1 or CFG.PLAYER_2)
 sectionTree()
+sectionFingerprint()
 beginDirectoryStep()

@@ -18,14 +18,16 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   (`git pull && sudo systemctl restart qsysradio`), both, or neither.
 - No duplicated code: reuse the helpers (Lua: `push`, `shuffled`, `set`/`trigger`,
   `readJson`/`writeJson`, `timer`, `post`, `emit(st, kind, data)`, `guard`,
-  `Station:figures(key)`;
+  `Station:figures(key)`, `Station:track(key)` (its record of a file, listed or not),
+  `Station:keyOf(path)` (a media path's key in its library);
   Python: `db.text`, `db.number`, `db.clean_json`, `db.like`, `db.iso`,
   `db.lock_station`, `dbconn()`, `write_logs`, `core_settings.effective`, `media.file_of` /
   `media.supported` (per-file figures live in `media_files`; read them
   through the view `library_figures`), `ads.stale` (call it in the
   transaction of any change a station's ads plan is made from, which took
   `db.lock_station` first), `analysis.stale` (the same for a Core's list
-  of files to analyze), `cores.seen`; JS:
+  of files to analyze), `fingerprints.stale` (and to fingerprint),
+  `media.fingerprinted` (which file a fingerprint is), `cores.seen`; JS:
   `Radio.api/post/command/setHTML/esc/num/status/meter/pick`).
 
 ## radio.lua: keep it slim and light
@@ -40,7 +42,9 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   loops over the prebuilt `Radio.stations`, then `Analyzer:tick` over the
   analysis players); the 50 ms `Fast` timer only while a deck fades or
   loads (`Engine.wake()`, loops over `Radio.decks`: every station's decks
-  and the analysis players);
+  and the analysis players); the 0.5 s `Hashing` timer only while the server
+  lists files to fingerprint (one file per run, at most 192 KiB read, never
+  inside `Tick` / `Fast`);
   one sync request per second for all stations (plus one library part at a
   time after a scan); control objects cached in `Deck.new`; panel writes
   only on change; files written only from `Chores` (every 30 s) or once per
@@ -57,19 +61,20 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   itself, the next song loads once the fade-out ends); never a copy of the
   transition logic, and loops over `st.decks`, never `decks[2]` blindly.
 - Every list has a cap (`K.outbox_max`, `events_max`, `history_max`,
-  `queue_max`, `analyze_max`); nothing may grow with uptime. The Core
+  `queue_max`, `analyze_max`, `fingerprint_max`); nothing may grow with uptime. The Core
   reports `mem_kb` every sync; `scenario_multi.lua` checks memory is flat.
 - Use the documented Q-SYS APIs (HttpClient.Upload, Timer, Component, dir,
-  io on media/, rapidjson). Keep `Tick`, `Fast`, `Sync`, `Chores` timers
-  global (a local timer can be garbage-collected).
+  io on media/, rapidjson, Crypto). Keep `Tick`, `Fast`, `Sync`, `Chores`,
+  `Hashing` timers global (a local timer can be garbage-collected).
 - After any change run every MockCore scenario (`for s in
   qsys/test/scenario_*.lua; do python3 qsys/test/run_mock.py $s; done`); add a
   case to `scenario_regressions.lua` for every bug fixed.
 - The Core's only files are `settings.json` (`{stations: {id: {rev,
   settings}}}`) and `outbox.json` (every station's events), both for when
   the server is unreachable (the outbox also while a station's part is
-  answered `{error}`). Per-file data (learned figures, unsupported)
-  and command state live on the server; don't add Core files.
+  answered `{error}`). Per-file data (learned figures, unsupported,
+  fingerprints) and command state live on the server; don't add Core files
+  (fingerprinting only reads files).
 
 ## PostgreSQL: its own schema, PostgreSQL only
 - Every QSYSRadio table lives in `PG_APP_SCHEMA` (default `qsysradio`).
@@ -96,10 +101,10 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
 ## Core <-> server protocol
 - `POST /api/v1/core/sync` (≈1/s, X-Radio-Token), ONE request for all the
   Core's stations: `{version, boot, core, mem_kb, analyze_rev?, analyzers?,
-  stations: [{station, ack, settings_rev, ads_rev, meters, state?, events?,
-  dropped?}]}`; reply `{stations: {id: {commands, settings, settings_rev,
-  ads, ads_rev, ack_reset, accepted, duplicates, rejected} | {error}},
-  analyze?, analyze_rev?}`. Events (station, boot, seq unique; stored once, each in a
+  fingerprint_rev?, stations: [{station, ack, settings_rev, ads_rev, meters,
+  state?, events?, dropped?}]}`; reply `{stations: {id: {commands, settings,
+  settings_rev, ads, ads_rev, ack_reset, accepted, duplicates, rejected} |
+  {error}}, analyze?, analyze_rev?, fingerprint?, fingerprint_rev?}`. Events (station, boot, seq unique; stored once, each in a
   savepoint; at most `K.sync_batch` per request, shared round-robin);
   optional state (with `fault` when faulted); command ack; `meters` (each
   deck's gain, peak, rms; kept on `stations` for the panel). Server: one
@@ -147,6 +152,29 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   `analyze_rev`) gets `analyze: []` once, then nothing; a 1.x station's run stays on its
   `stations.analyze_*` columns until its first 2.x sync (`analysis.adopt`). A Core without an
   analysis player owes nothing (`analysis.run_of` gives `can` False).
+- File fingerprints (`fingerprints.py`, `media.fingerprinted`; radio.lua `Fingerprint`): sha1 (lowercase
+  hex) of the size as decimal text, a newline, the first, middle (from size // 2 - 32 KiB) and last
+  64 KiB (the whole file when no longer than 192 KiB), made with `Crypto.Digest("sha1", …)` (raw or hex)
+  over `io.open(path, "rb")` + seek. Once per size: Forget measured clears it (fingerprinted again).
+  Checked at boot (the digest of "abc", a test read of a listed file; no file yet: again from
+  `Chores`); off = logged once, no top-level `fingerprint_rev` sent, identity stays name + size. The
+  reply carries top-level `fingerprint` [{station, key}] (at most 20) and `fingerprint_rev` when the
+  rev differs (cached on `cores.fp_owed` / `fp_rev` / `fp_at` like the analysis list; made again on
+  a result, `fingerprints.stale()` (library upload) or after 60 s; owed: present, known size, no
+  fingerprint at that size, not failed since the last scan / 24 h, station not faulted; index
+  `library_fingerprint_owed`). Results are `fingerprint` events {dir, file, size, fp} | {dir, file,
+  error} of the listed station and every other station on the Core listing the same media path (one
+  read); a listed file of a station that is not built is reported (`station not built`), never passed
+  silently (the list would stall). On the server
+  (`media.fingerprinted`, in the event's savepoint): recorded on the library row (`fingerprint`,
+  `fingerprint_size`, `fingerprint_at`, `fingerprint_error`); another `media_files` row with that
+  fingerprint = the same file (the library row moves to it; the row left, when not fingerprinted,
+  merges in what the target lacks (levels via `events.LEVEL_SET`, then cleared on the row left: once)
+  and goes when unused); a row with another fingerprint = another file (a new row); else the row takes
+  it (a unique violation from another station's transaction: follow that row). `media_files`: one row
+  per fingerprint, one per (file, size) only while not fingerprinted; `media.link` puts a library row
+  fingerprinted at its size on its fingerprint's row. Lock order: the station's own library row,
+  then at most two `media_files` rows by primary key, locked in id order.
 - Ads: the server sends `ads` {due, mix, next, next_why, ident, no_bumpers} when `ads_rev` differs
   (`ads.py`); the Core only plays the plan (without one, every ad is a mix-in). The plan
   is cached per station (`ads.cached_plan`: made again when the station's events were

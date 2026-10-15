@@ -5,6 +5,87 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [2.4.0] - 2026-10-15
+
+**Run the probe's section F on the Core first** (`qsys/probe/probe.lua`
+0.2.0; `RUN_PLAYBACK_PROBE = false` is enough): its last line says whether
+this Core can fingerprint files. **Then redeploy both: the server first**
+(`git pull && sudo systemctl restart qsysradio`; migration 0019; the 2.3.0
+Core plays on meanwhile, its files known by name + size), **then the Core**:
+paste radio.lua into the same Text Controller and keep your `CFG` values
+(nothing new to set). Take a backup first: 2.3.0 does not run on the 2.4.0
+schema.
+
+### Added
+- **File fingerprints**: a file is known by its content, so its figures
+  (quiet start / end, level, trims, analysis) follow it when it is renamed
+  or moved between zones, and two different files with the same name and
+  size are told apart. The fingerprint is the SHA-1 of the file's size, its
+  first 64 KiB, 64 KiB from its middle and its last 64 KiB (the whole file
+  up to 192 KiB): the middle tells apart files alike at both ends, such as
+  spots of one length with digital silence at each end. Until a file has
+  one, and on a Core that cannot make them, it is known by its name and
+  size as before. A file is fingerprinted once per size: one replaced by
+  another of exactly the same length keeps the old fingerprint and figures
+  until **Forget measured** on it, which now also has it fingerprinted
+  again.
+  - radio.lua: `Fingerprint` makes them with `Crypto.Digest("sha1", …)`
+    (raw or hex) over `io.open(path, "rb")` + `seek`, for the files the
+    server lists (top-level `fingerprint` / `fingerprint_rev`, at most 20),
+    one every 0.5 s on a global timer of its own (`Hashing`) that runs only
+    while files are listed; at most 192 KiB read per file, no file written.
+    Each result is a `fingerprint` event of the listed station and of every
+    other station on the Core that lists the same file (one read); a file
+    that cannot be read is reported with its error, and so is a listed file
+    of a station that is not built (`station not built`), so the list moves
+    on. Checked at boot (the
+    digest of `abc`, a test read of a listed file): if `Crypto`, its sha1
+    or `seek` is missing or wrong, fingerprints are off (`! fingerprint:
+    off (…)`, once) and the Core sends no `fingerprint_rev`; nothing else
+    changes.
+  - Server: `fingerprints.py` lists each Core's files owed a fingerprint
+    (present, of known size, none at their size, its station not faulted;
+    an error or a size other than the library's waits for the next scan or
+    a day), cached on the Core's row like the analysis list, only for a Core
+    that sends `fingerprint_rev`. `media.fingerprinted` applies each one:
+    another file row with that fingerprint is the same file (the station's
+    file moves to it; the row it leaves, a name-and-size guess, gives it
+    what it lacked, levels counted together once, and goes once unused); a
+    row with another fingerprint is another file (a row of its own,
+    measured afresh); a row without one takes it. Two Cores claiming the
+    same fingerprint at once: the second follows the first's row.
+  - Migration 0019: `media_files.fingerprint` (one row per fingerprint; one
+    per name + size only while not fingerprinted), `library.fingerprint`,
+    `fingerprint_size`, `fingerprint_at`, `fingerprint_error` (index
+    `library_fingerprint_owed`), `cores.fp_owed` / `fp_rev` / `fp_at`;
+    `library_figures` made again with the new columns.
+- Probe 0.2.0, section F: checks `Crypto.Digest("sha1", …)` (correct? raw
+  bytes or hex?), `io.open` "rb" + `seek` on media files, and times
+  fingerprinting 20 files (ms and CPU ms each), with a verdict.
+- MockCore 0.7.0: simulated file contents (`io.open` of a library file,
+  with `seek`; `content` = the same file under another name; `middle` =
+  another middle third; `unreadable`),
+  a `Crypto.Digest` stand-in (a real SHA-1: raw, hex, or none), files
+  without `seek`; `dir.get("media/Audio")` without the slash.
+  `scenario_fingerprint.lua`: fingerprints only while listed, the timer
+  stopping, the reply, an unreadable file, the off switch (no Crypto, a
+  wrong digest, no seek), Tick and Fast allocating nothing, flat memory,
+  the probe's section F. `scenario_regressions.lua`: a not-built station's
+  listed file is reported (the list moved on), two spots alike at both ends
+  get two fingerprints.
+
+### Changed
+- `media.link` (library upload): a file fingerprinted at its size is on its
+  fingerprint's row (kept, or back on it when a scan finds that size
+  again); any other file takes the row of its name and size (the one not
+  fingerprinted first).
+- Forget measured also clears the files' fingerprints (every station's
+  copy), so they are fingerprinted again.
+- The Core sync's per-Core lists (analysis, fingerprints) run through one
+  loop (`control.CORE_JOBS`), each in its own transaction as before.
+- radio.lua: `Station:track(key)` and `Station:keyOf(path)`, shared by the
+  analysis players and the fingerprints.
+
 ## [2.3.0] - 2026-10-15
 
 **Redeploy the server** (`git pull && sudo systemctl restart qsysradio`; no
