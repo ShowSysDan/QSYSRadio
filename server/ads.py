@@ -17,7 +17,8 @@ one whose length makes the song change fall just after the slot opens.
 The plan is cached per station (cached_plan): made again when the station's
 events come in, when anything it is made from changes (stale()), when it
 changes by the clock (a slot opens) or every 30 s; not on every sync of every
-station.
+station. A one-player station (breaks.one_player) has no breaks: its plan
+names only the next song.
 """
 import hashlib
 import json
@@ -206,7 +207,21 @@ def plan(cur, station):
     """The Core's plan, its rev and until (when it changes by the clock alone: an ad or ID slot opens, a due
     slot's window closes, a hold ends, the hour turns): {'due': [ads owed, longest waiting first], 'mix':
     [ads], 'next': song to play next, 'next_why': 'rotation' | 'ad', 'ident': station ID owed, 'no_bumpers':
-    True while bumpers are held}. Held ads: none owed or mixed in."""
+    True while bumpers are held}. Held ads: none owed or mixed in. A one-player station's: only next / next_why."""
+    if breaks.one_player(cur, station):
+        cur.execute("SELECT date_trunc('hour', NOW()) + INTERVAL '1 hour'")
+        out, upcoming, changes = {}, [], [cur.fetchone()[0]]
+    else:
+        out, upcoming, changes = _breaks_plan(cur, station)
+    song, why = next_song(cur, station, min(upcoming) if upcoming else None)
+    if song:
+        out['next'], out['next_why'] = song, why
+    return out, hashlib.sha1(json.dumps(out).encode()).hexdigest()[:12], min(changes)
+
+
+def _breaks_plan(cur, station):
+    """plan()'s breaks: (out without the next song, the upcoming ad / ID slots [(datetime, window s)], the times
+    the plan changes by the clock)."""
     rows, hour_start = schedule(cur, station)
     rows = rows.values()
     hold = breaks.holds(cur, station)
@@ -231,10 +246,7 @@ def plan(cur, station):
         changes.append(ids['due_until'])
     if 'bumpers' in hold:
         out['no_bumpers'] = True
-    song, why = next_song(cur, station, min(upcoming) if upcoming else None)
-    if song:
-        out['next'], out['next_why'] = song, why
-    return out, hashlib.sha1(json.dumps(out).encode()).hexdigest()[:12], min(changes)
+    return out, upcoming, changes
 
 
 def cached_plan(cur, station, fresh=False):
@@ -292,6 +304,7 @@ def save_rule(conn, station, payload, user):
             raise BadRequest(f'plays per hour must be a whole number from 1 to {PER_HOUR_MAX}')
     with conn.cursor() as cur:
         db.lock_station(cur, station)
+        breaks.refuse_one_player(cur, station, 'Advertisement schedule')
         cur.execute("SELECT 1 FROM library WHERE station = %s AND key = %s AND kind = 'ad' AND present",
                     (station, key or ''))
         if not cur.fetchone():

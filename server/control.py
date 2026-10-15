@@ -75,6 +75,9 @@ def _clean_state(state):
             s[key] = {}
     for key in ('automation', 'stop_after', 'bumper_requested', 'ad_requested'):
         s[key] = s.get(key) is True
+    players = s.pop('players', None)  # one or two (radio.lua 2.2.0); missing before it: two
+    if type(players) is int and players in (1, 2):
+        s['players'] = players
     if 'fault' in s:                # the Core could not build or run the station: why (it retries by itself)
         s['fault'] = text(s['fault'], 300)
     return s
@@ -113,7 +116,7 @@ def _station_sync(cur, station, part, core, version, boot, now):
     state = _clean_state(part.get('state'))
     reply, lines = {}, []
     db.lock_station(cur, station)
-    cur.execute("""SELECT boot, COALESCE(analyze_from, analyze_run_at, analyze_auto_at) IS NOT NULL AS job
+    cur.execute("""SELECT boot, players, COALESCE(analyze_from, analyze_run_at, analyze_auto_at) IS NOT NULL AS job
                    FROM stations WHERE station = %s""", (station,))
     prev = cur.fetchone()
     if prev and prev['boot'] != boot:
@@ -130,7 +133,11 @@ def _station_sync(cur, station, part, core, version, boot, now):
                        meters = EXCLUDED.meters, core = COALESCE(EXCLUDED.core, stations.core)""",
                 (station, version, boot, settings_rev, json.dumps(meters) if meters else None, core))
     if state is not None:
-        cur.execute('UPDATE stations SET state = %s, state_at = NOW() WHERE station = %s', (json.dumps(state), station))
+        players = state.get('players')       # a fault state has none: the count stays
+        cur.execute('UPDATE stations SET state = %s, state_at = NOW(), players = COALESCE(%s, players) WHERE station = %s',
+                    (json.dumps(state), players, station))
+        if players and prev and prev['players'] != players:
+            ads.stale(cur, station)           # one player: no breaks in its plan (or breaks again)
     accepted = 0
     evs = [] if part.get('events') == {} else part.get('events')       # Lua encodes an empty table as {}
     if evs is not None:
@@ -358,13 +365,14 @@ def core_library(conn, payload):
 
 def stations(conn):
     with conn.cursor() as cur:
-        cur.execute(f"""SELECT station, last_seen, radio_version, core,
+        cur.execute(f"""SELECT station, last_seen, radio_version, core, players,
                                last_seen > NOW() - INTERVAL '{cores.ONLINE_S} seconds' AS online,
                                state->'automation' = 'true'::jsonb AS automation,
                                state->'stop_after' = 'true'::jsonb AS stop_after,
                                left(state->>'fault', 300) AS fault
                         FROM stations ORDER BY last_seen DESC""")
         return [{'station': r['station'], 'online': r['online'], 'version': r['radio_version'], 'core': r['core'],
+                 'players': r['players'],
                  'automation': bool(r['automation']), 'stop_after': bool(r['stop_after']), 'fault': r['fault'],
                  'last_seen': iso(r['last_seen'])} for r in cur.fetchall()]
 
@@ -382,9 +390,10 @@ def resolve_station(conn, station):
 
 def status(conn, station):
     """Live Core state + recent commands for the dashboard. state_age_s says
-    how old the Core's elapsed/remaining figures are."""
+    how old the Core's elapsed/remaining figures are. players: 1 = songs only
+    (no ads, holds or IDs to show)."""
     with conn.cursor() as cur:
-        cur.execute("""SELECT station, state, radio_version, boot, core, last_seen, library_at, meters,
+        cur.execute("""SELECT station, state, radio_version, boot, core, last_seen, library_at, meters, players,
                               EXTRACT(EPOCH FROM NOW() - last_seen) AS age,
                               EXTRACT(EPOCH FROM NOW() - state_at) AS state_age
                        FROM stations WHERE station = %s""", (station,))
@@ -399,14 +408,16 @@ def status(conn, station):
                  'note': c['note']} for c in cur.fetchall()]
         state = _clean_state(r['state']) or {}
         _fill_durations(cur, station, state)
-        next_ad = ads.next_ad(cur, station)
-        holds = breaks.holds_view(cur, station)
-        ids = breaks.idents(cur, station)
+        single = r['players'] == 1
+        next_ad = {'owed': 0, 'at': None} if single else ads.next_ad(cur, station)
+        holds = {} if single else breaks.holds_view(cur, station)
+        ids = {'due': None, 'next_at': None, 'keys': []} if single else breaks.idents(cur, station)
         analyze = analysis.view(cur, station)
     age = float(r['age'])
     return {'station': r['station'], 'online': age < cores.ONLINE_S, 'age_s': round(age, 1),
             'state_age_s': round(float(r['state_age']), 2) if r['state_age'] is not None else None,
-            'version': r['radio_version'], 'boot': r['boot'], 'core': r['core'], 'last_seen': iso(r['last_seen']),
+            'version': r['radio_version'], 'boot': r['boot'], 'core': r['core'], 'players': r['players'],
+            'last_seen': iso(r['last_seen']),
             'library_at': iso(r['library_at']), 'state': state, 'meters': r['meters'], 'commands': cmds, 'next_ad': next_ad,
             'holds': holds, 'ident': {'due': ids['due'], 'next_at': iso(ids['next_at']), 'count': len(ids['keys'])},
             'analysis': analyze}
@@ -440,6 +451,8 @@ def add_command(conn, station, cmd, args, user):
     clean = {}
     with conn.cursor() as cur:
         key = text(args.get('key'), 1000)
+        if cmd in ('bumper_now', 'ad_now'):
+            breaks.refuse_one_player(cur, station, label)
         if needs_key or (cmd in ('bumper_now', 'ad_now') and key):
             item = _library_item(cur, station, key or '')
             if not item:
@@ -450,6 +463,8 @@ def add_command(conn, station, cmd, args, user):
                 raise BadRequest('Ad break now needs an ad')
             if cmd == 'queue_add' and item['kind'] != 'music':
                 raise BadRequest('only music can be queued; use Play now for imaging and ads')
+            if item['kind'] != 'music':
+                breaks.refuse_one_player(cur, station, label)
             clean['key'] = item['key']
             label += ': ' + (' - '.join(x for x in (item['artist'], item['title']) if x) or item['file'])
         if cmd == 'queue_add':
@@ -627,19 +642,21 @@ def settings_view(conn, station):
         every, own = core_settings.layers(cur, station)
         r = None
         if station:
-            cur.execute('SELECT state, settings_rev FROM stations WHERE station = %s', (station,))
+            cur.execute('SELECT state, settings_rev, players FROM stations WHERE station = %s', (station,))
             r = cur.fetchone()
     if not station:
         spec = [x for x in core_settings.SPEC if x[0] not in core_settings.STATION_ONLY]
         return {'scope': 'all', 'station': None, 'settings': _setting_rows(spec, every, {}, lambda n: {
             'all': every.get(n), 'source': 'all' if n in every else 'default', 'station_only': False})}
-    spec = [x for x in core_settings.SPEC if x[0] not in core_settings.ALL_ONLY]     # the whole Core's: All stations
+    players = r['players'] if r else 2          # one player: songs only, its break settings and folders left out
+    spec = [x for x in core_settings.SPEC if x[0] not in core_settings.ALL_ONLY      # the whole Core's: All stations
+            and not (players == 1 and x[0] in core_settings.BREAK_ONLY)]
     values = {**every, **own}
     running = ((_clean_state(r['state']) if r else None) or {}).get('settings') or {}
     for name in core_settings.SERVER_ONLY:          # the server's own: "running" is what it uses
         running[name] = values.get(name, core_settings.DEFAULTS[name])
     rev, rev_core = core_settings.rev(core_settings.for_core(values)), r and r['settings_rev']
-    return {'scope': 'station', 'station': station, 'rev': rev, 'core_rev': rev_core, 'in_sync': rev_core == rev,
+    return {'scope': 'station', 'station': station, 'players': players, 'rev': rev, 'core_rev': rev_core, 'in_sync': rev_core == rev,
             'settings': _setting_rows(spec, own, running, lambda n: {
                 'all': every.get(n), 'own': own.get(n), 'station_only': n in core_settings.STATION_ONLY,
                 'source': 'station' if n in own else 'all' if n in every else 'default'})}

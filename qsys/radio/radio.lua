@@ -1,16 +1,17 @@
--- QSYSRadio deck controller (Q-SYS Lua 5.3): every station on this Core (two Audio Players each) and its file
--- analysis players. Docs: README.md.
+-- QSYSRadio deck controller (Q-SYS Lua 5.3): every station on this Core (two Audio Players each, or one for a
+-- background-music zone) and its file analysis players. Docs: README.md.
 -- Station settings are edited on the server's web page and pushed here; SETTINGS below are only the
 -- fallback until the server has been reached once.
-RADIO_VERSION = "2.1.0"
+RADIO_VERSION = "2.2.0"
 
 CFG = {
   SERVER_URL = "",     -- e.g. "http://10.0.0.20:5410"; "" = run standalone
   SERVER_TOKEN = "",   -- RADIO_API_TOKEN from the server's .env
   AUTOSTART = true,
   CORE_ID = "",        -- "" = the design name; names this Core to the server
-  STATIONS = {         -- id: unique, never ""; players: its two Audio Players; meter / meters: their peak + rms channels
+  STATIONS = {         -- id: unique, never ""; players: its two Audio Players (or one); meter / meters: their peak + rms channels
     { id = "Main", players = { "Audio_Player23", "Audio_Player24" }, meter = "PlayerMeter", meters = { 1, 2 } },
+    -- { id = "Lobby", players = { "Lobby_Player" }, meter = "ZoneMeter", meters = { 3 } },   -- one player: songs only, no breaks
   },
   ANALYZERS = {        -- file analysis: an Audio Player routed nowhere + a meter channel like the stations'; {} = none
     { player = "Analysis_Player", meter = "AnalysisMeter", meter_idx = 1 },
@@ -437,17 +438,23 @@ end
 -- its players and meter from CFG; then the first library scan
 function Station:build()
   local cfg = self.cfg
-  local players, meters = cfg.players, type(cfg.meters) == "table" and cfg.meters or { 1, 2 }
-  if type(players) ~= "table" or #players ~= 2 or players[1] == players[2] then error("players must name two Audio Players", 0) end
+  local players, meters = cfg.players, cfg.meters
+  if type(players) ~= "table" or #players < 1 or #players > 2 or players[1] == players[2] then
+    error("players must name one or two Audio Players", 0)
+  end
+  if meters == nil then meters = { 1, 2 } end    -- no list: channels 1 (and 2); a list names every player's channel
+  for i = 1, #players do
+    if type(meters) ~= "table" or type(meters[i]) ~= "number" then error("meters must name a channel for each player", 0) end
+  end
   for _, p in ipairs(players) do                 -- a player belongs to one station (its handlers are that station's)
     local owner = Radio.players[p]
     if owner and owner ~= self.id then error("player '" .. tostring(p) .. "' is station " .. owner .. "'s", 0) end
   end
   local ok, meter = pcall(Component.New, cfg.meter)
   if not ok or not meter then error("meter '" .. tostring(cfg.meter) .. "' not found", 0) end
-  self.decks[1] = Deck.new(self, "A", players[1], meter, tostring(cfg.meter), meters[1])
-  self.decks[2] = Deck.new(self, "B", players[2], meter, tostring(cfg.meter), meters[2])
-  Radio.players[players[1]], Radio.players[players[2]] = self.id, self.id
+  self.single = #players == 1            -- one player: the song fades out, then the next one loads on it; no breaks
+  for i, p in ipairs(players) do self.decks[i] = Deck.new(self, i == 1 and "A" or "B", p, meter, tostring(cfg.meter), meters[i]) end
+  for _, p in ipairs(players) do Radio.players[p] = self.id end
   self:scan()
 end
 
@@ -521,12 +528,15 @@ function Station:listAudio(dirRel, kind, learned)
   return out
 end
 
+-- a one-player station plays songs only (no bumpers, ads or IDs)
+function Station:uses(kind) return kind == "music" or not self.single end
+
 function Station:scan()
   local lib, S = self.lib, self.settings
   lib.root = self.decks[1]:root()
   local byKey, learned = {}, {}
   for _, kind in ipairs(KIND_ORDER) do
-    lib[kind] = self:listAudio(S[KINDS[kind].dir], kind, learned)
+    lib[kind] = self:listAudio(self:uses(kind) and S[KINDS[kind].dir] or "", kind, learned)
     for _, tr in ipairs(lib[kind]) do byKey[tr.key] = tr end
   end
   lib.byKey, lib.gen = byKey, lib.gen + 1
@@ -538,6 +548,7 @@ function Station:scan()
     self.emptyNoted = false
     if self.automation and not self:busy() then self:kick() end
   end
+  if self.single then return log("%s: library: %d music in %s (one player: no breaks)", self.id, #lib.music, self:mediaPath(S.music_dir)) end
   log("%s: library: %d music in %s, %d imaging in %s, %d ads in %s", self.id, #lib.music, self:mediaPath(S.music_dir),
     #lib.imaging, self:mediaPath(S.imaging_dir), #lib.ad, self:mediaPath(S.ads_dir))
 end
@@ -580,8 +591,8 @@ function Station:levelTrim(L)
   return round(g, 1)
 end
 
-function Station:busy() return self.decks[1]:isBusy() or self.decks[2]:isBusy() end
-function Station:otherDeck(d) return d == self.decks[1] and self.decks[2] or self.decks[1] end
+function Station:busy() local d = self.decks; return d[1]:isBusy() or (d[2] ~= nil and d[2]:isBusy()) end
+function Station:otherDeck(d) return d == self.decks[1] and self.decks[2] or self.decks[1] end   -- one player: itself
 local function isSpot(state) return state == "bumper" or state == "ad" end
 
 function Station:refillBag() self.bag = shuffled(self.lib.music) end
@@ -669,6 +680,7 @@ end
 -- what plays between this song and the next: the server's station ID (if owed), ads (if due),
 -- then a bumper (if due, no ID and bumpers not held)
 function Station:planBreak()
+  if self.single then return nil end
   local plan, S = self.adPlan or {}, self.settings
   local spots, ident = self:adBreak() or {}, self.lib.byKey[plan.ident or ""]
   if ident and ident.kind == "imaging" then
@@ -710,8 +722,14 @@ function Station:finishTrack(d, reason)
   emit(self, KINDS[tr.kind].event .. "_end", ev)
 end
 
-function Station:fadeAndFinish(d, seconds, reason)
-  d:fadeOut(seconds, function(x) self:finishTrack(x, reason); x:stop() end)
+-- after: start the next song on the same deck once it has faded out (a one-player station), with these opts
+function Station:fadeAndFinish(d, seconds, reason, after)
+  d:fadeOut(seconds, function(x)
+    self:finishTrack(x, reason)
+    x:stop()
+    if after and self.stopAfter then self:goOff("stop_after_current")   -- asked for during the fade: nothing follows
+    elseif after then self:startTrack(x, self:nextSong(true), after) end
+  end)
 end
 
 function Station:startTrack(deck, track, opts, attempt)
@@ -794,8 +812,10 @@ function Station:transition(reason)
     self.freeDeck, self.breakList = live, spots
     self:startTrack(other, table.remove(spots, 1), {})
     if reason == "end" or reason == "fade" then fadeS = S.bumper_fade_s end   -- the song dips under the break
-  else
+  elseif other ~= live then
     self:startTrack(other, self:nextSong(true), { fadeIn = S.fade_in_s })
+  else                                 -- one player: the next song loads once this one has faded out
+    return self:fadeAndFinish(live, fadeS, outReason, { fadeIn = S.fade_in_s })
   end
   self:fadeAndFinish(live, fadeS, outReason)
 end
@@ -877,9 +897,8 @@ function Station:crossfadeCheck(live, t)
 end
 
 function Station:tick(t)
-  local d1, d2, S = self.decks[1], self.decks[2], self.settings
-  d1:sample(t, S)
-  d2:sample(t, S)
+  local decks, S = self.decks, self.settings
+  for i = 1, #decks do decks[i]:sample(t, S) end
   if not self.automation then return end
 
   local live, spot = self.live, self.spotDeck
@@ -903,14 +922,14 @@ function Station:tick(t)
   end
 
   -- dead-air guard (backs off while the library is empty)
-  if d1:isBusy() or d2:isBusy() then
+  if self:busy() then
     self.idleSince = nil
   else
     self.idleSince = self.idleSince or t
     if t - self.idleSince >= (self.emptyNoted and 30 or S.dead_air_s) then
       self.idleSince = nil
-      if #self.lib.music == 0 and #self.queue == 0 then self:scan() end
-      self:kick(not self.emptyNoted)
+      if #self.lib.music == 0 and #self.queue == 0 then self:scan() end   -- music back: the scan starts it
+      if not self:busy() then self:kick(not self.emptyNoted) end
     end
   end
 end
@@ -1177,6 +1196,7 @@ end
 
 -- bumper now / ad break now, optionally with a chosen file (kind = "imaging" | "ad")
 local function breakNow(st, kind, args)
+  if st.single then return false, "this station has one player (no bumpers or ads)" end
   local ok, err = running(st)
   if not ok then return false, err end
   if isSpot(st.state) then return false, "a break is playing" end
@@ -1293,13 +1313,14 @@ function Station:snapshot(t)
     info.state, info.live = d.state, (d == self.live) or nil
     if d.playStart and (d.state == "playing" or d.state == "fading") then
       info.elapsed, info.gain, info.trim = round(t - d.playStart, 1), d.playGain and round(d.playGain, 1), d.trim
+      if d.state == "fading" and d.fade then info.fade_left = round(math.max(0, d.fade.t0 + d.fade.dur - t), 1) end
       local rem = d:remainingEst(t)
       info.remaining = rem and round(rem, 1)
     end
     info.duration = d.duration and round(d.duration, 1) or info.duration
     return info
   end
-  local S, lib = self.settings, self.lib
+  local S, lib, decks = self.settings, self.lib, self.decks
   local nxt, queued, why = self:nextSong()
   local nextUp = trackInfo(nxt)
   if nextUp then nextUp.queued, nextUp.pick = queued, why end
@@ -1307,7 +1328,7 @@ function Station:snapshot(t)
   for i, q in ipairs(self.queue) do queue[i] = trackInfo(q) end
   return {
     automation = self.automation, state = self.state, stop_after = self.stopAfter,
-    decks = { A = deck(self.decks[1]), B = deck(self.decks[2]) }, next_up = nextUp, queue = queue,
+    decks = { A = deck(decks[1]), B = decks[2] and deck(decks[2]) }, players = #decks, next_up = nextUp, queue = queue,
     next_bumper = trackInfo(self.nextBumper), bumper_requested = self.bumperRequested,
     tracks_since_bumper = self.tracksSinceBumper, bumper_every = S.bumper_every_n_tracks,
     next_ad = trackInfo(self.nextAd), ad_requested = self.adRequested, tracks_since_ad = self.tracksSinceAd,
@@ -1393,7 +1414,7 @@ function Station:applySettings(s, rev, fromFile)
   for _, kind in ipairs(KIND_ORDER) do
     local key = KINDS[kind].dir
     new[key] = normDir(new[key])
-    rescan = rescan or new[key] ~= self.settings[key]
+    rescan = rescan or (self:uses(kind) and new[key] ~= self.settings[key])
   end
   self.settings, self.saved, self.settingsRev, self.rev = new, saved, tostring(rev or ""), self.rev + 1
   log("%s: settings: %d server value(s) applied (rev %s)%s", self.id, n, self.settingsRev, fromFile and " from file" or "")
@@ -1508,7 +1529,7 @@ function Station:syncPart(t)
     return part
   end
   local d = self.decks
-  part.meters = { A = meterReadout(d[1]), B = meterReadout(d[2]) }
+  part.meters = { A = meterReadout(d[1]), B = d[2] and meterReadout(d[2]) or nil }
   if fresh then part.state = self:snapshot(t) end
   return part
 end

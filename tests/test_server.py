@@ -582,6 +582,56 @@ def test_three_stations_on_one_core_end_to_end(app, tmp_path, monkeypatch):
     assert sql("SELECT mem_kb > 0 FROM qsr_test.cores WHERE core = 'E2ECORE'", fetch=True)[0][0]
 
 
+def test_one_player_zone_end_to_end(app, tmp_path, monkeypatch):
+    """radio.lua running a two-player station and a one-player zone (MockCore) against this server: the zone
+    reports one player, uploads its music only, gets plans naming only the next song and never plays a break (a
+    bumper every song asked for); the station beside it plays its bumpers."""
+    lupa = pytest.importorskip('lupa.lua53')
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    os.symlink(os.path.join(repo, 'qsys'), tmp_path / 'qsys')
+    monkeypatch.chdir(tmp_path)
+    client = app.test_client()
+    L = lupa.LuaRuntime(unpack_returned_tuples=True)
+    L.execute('dofile("qsys/test/mock_core.lua")')
+    if L.eval('MockCore.zones') is None:
+        pytest.skip('this MockCore has no one-player zones')
+    L.execute("""local wiring, cfg = MockCore.stations(1, { ids = { "OPR" } })
+                 local zw, zc = MockCore.zones(1, { ids = { "OPZ" } })
+                 wiring[#wiring + 1], cfg[2] = zw[1], zc[1]
+                 local function songs(p, n)
+                   local o = {}
+                   for i = 1, n do o[i] = { name = string.format("%s Artist%d - Song%02d.mp3", p, i % 5, i), duration = 25 + i % 9, level = -10 } end
+                   return o
+                 end
+                 MockCore.setup{ seed = 3, players = wiring, dirs = { ["Radio/"] = songs("R", 12), ["Zone/"] = songs("Z", 12),
+                   ["Imaging/"] = { { name = "id.wav", duration = 5, level = -6 } } } }
+                 OP_CFG = cfg""")
+
+    def handler(req):
+        r = client.post(req.Url.split('radio-server', 1)[1], data=req.Data,
+                        headers=dict(req.Headers.items()), content_type='application/json')
+        return r.status_code, r.get_data(as_text=True)
+    L.globals().MockCore.httpHandler = handler
+    admin = signed_in(app, 'admin')
+    for st, folder in (('OPR', 'Radio/'), ('OPZ', 'Zone/')):       # both with an imaging folder and a bumper every song
+        sync(app, station=st, boot='before')
+        assert admin.post('/api/v1/settings', headers=WEB, json={'settings': {'music_dir': folder, 'imaging_dir': 'Imaging/',
+                          'bumper_every_n_tracks': 1}, 'scope': 'station', 'station': st}).status_code == 200
+    L.execute("""MockCore.loadRadio(function(C) C.SERVER_URL, C.SERVER_TOKEN, C.CORE_ID, C.STATIONS, C.ANALYZERS =
+                                                  "http://radio-server", "tok", "OPCORE", OP_CFG, {} end)""")
+    L.eval('MockCore.run')(400)
+    kinds = {st: dict(sql("SELECT kind, count(*) FROM qsr_test.play_log WHERE station = %s AND boot <> 'before' GROUP BY kind",
+                          (st,), fetch=True)) for st in ('OPR', 'OPZ')}
+    assert kinds['OPZ'].get('music', 0) >= 10 and set(kinds['OPZ']) == {'music'}, kinds
+    assert kinds['OPR'].get('imaging', 0) >= 3, kinds
+    players, plan = sql("SELECT players, plan FROM qsr_test.stations WHERE station = 'OPZ'", fetch=True)[0]
+    assert players == 1 and set(plan) <= {'next', 'next_why'}, plan
+    assert sql("SELECT players FROM qsr_test.stations WHERE station = 'OPR'", fetch=True)[0][0] == 2
+    assert sql("SELECT DISTINCT kind FROM qsr_test.library WHERE station = 'OPZ' AND present", fetch=True) == [['music']]
+    now = signed_in(app, 'viewer').get('/api/v1/now?station=OPZ&ahead=5').json['station']
+    assert set(now['state']['decks']) == {'A'} and set(now['meters']) == {'A'} and all(x['kind'] == 'music' for x in now['ahead'])
+
+
 def test_coming_up_forecast(app):
     songs = [{'key': f'M/{c}.mp3', 'dir': 'M/', 'file': f'{c}.mp3', 'kind': 'music', 'artist': c.upper()} for c in 'abcdefghij']
     spots = [{'key': 'Ads/h.wav', 'dir': 'Ads/', 'file': 'h.wav', 'kind': 'ad'}, {'key': 'I/b.wav', 'dir': 'I/', 'file': 'b.wav', 'kind': 'imaging'}]
@@ -1505,6 +1555,72 @@ def test_ads_plan_is_cached(app, monkeypatch):
         admin.post('/api/v1/settings', json={'settings': {'ad_fit_tolerance_s': None}}, headers=WEB)
 
 
+def test_one_player_station(app):
+    """A one-player station (radio.lua 2.2.0: a background-music zone) plays songs only. stations.players comes from
+    its state; its plan names only the next song; Bumper now, Ad break now, holds, ad rules and IDs are refused;
+    the dashboard, Settings and Coming up leave its breaks out. Back to two players, breaks again."""
+    songs = [{'key': f'M/{c}.mp3', 'dir': 'M/', 'file': f'{c}.mp3', 'kind': 'music', 'artist': c.upper()} for c in 'abcdef']
+    spots = [{'key': 'I/id.wav', 'dir': 'I/', 'file': 'id.wav', 'kind': 'imaging'},
+             {'key': 'Ads/x.wav', 'dir': 'Ads/', 'file': 'x.wav', 'kind': 'ad'}]
+    library_post(app, 'OP1', songs + spots, ads_dir='Ads/')          # its library from when it had two players
+    op, admin = signed_in(app, 'operator'), signed_in(app, 'admin')
+    assert op.post('/api/v1/ads', json={'station': 'OP1', 'key': 'Ads/x.wav', 'mode': 'hourly', 'per_hour': 4}, headers=WEB).status_code == 200
+    assert op.post('/api/v1/hold', json={'station': 'OP1', 'what': 'bumpers', 'until': None}, headers=WEB).status_code == 200
+    two = dict(STATE, players=2)
+    first = batch(app, {'station': 'OP1', 'ads_rev': '', 'state': two}).json['stations']['OP1']
+    assert first['ads']['mix'] == [] and first['ads']['no_bumpers'] is True and 'next' in first['ads']
+    assert sql("SELECT players FROM qsr_test.stations WHERE station = 'OP1'", fetch=True)[0][0] == 2
+
+    one = dict(STATE, players=1, decks={'A': {'state': 'playing', 'live': True, 'kind': 'music', 'key': 'M/a.mp3',
+                                              'file': 'a.mp3', 'artist': 'A', 'remaining': 60, 'duration': 200}},
+               settings={'bumper_every_n_tracks': 1, 'ad_every_n_tracks': 1, 'crossfade_s': 4})
+    r = batch(app, {'station': 'OP1', 'ads_rev': first['ads_rev'], 'state': one}).json['stations']['OP1']
+    assert set(r['ads']) == {'next', 'next_why'} and r['ads']['next'].startswith('M/'), r['ads']   # the cached plan made again
+    assert sql("SELECT players FROM qsr_test.stations WHERE station = 'OP1'", fetch=True)[0][0] == 1
+    batch(app, {'station': 'OP1', 'state': {'automation': False, 'state': 'fault', 'fault': 'x'}})    # a fault state has no count
+    assert sql("SELECT players FROM qsr_test.stations WHERE station = 'OP1'", fetch=True)[0][0] == 1
+    for bad in (True, 3, '1'):                                       # anything but 1 or 2 is not a count
+        batch(app, {'station': 'OP1', 'state': dict(one, players=bad)})
+        assert sql("SELECT players FROM qsr_test.stations WHERE station = 'OP1'", fetch=True)[0][0] == 1, bad
+    batch(app, {'station': 'OP1', 'state': one})
+
+    # what is about breaks is refused, with a clear message; songs are not
+    cmd = lambda c, **a: op.post('/api/v1/control', json={'station': 'OP1', 'cmd': c, 'args': a}, headers=WEB)
+    for refused in (cmd('bumper_now'), cmd('ad_now'), cmd('bumper_now', key='I/id.wav'), cmd('play_now', key='Ads/x.wav'),
+                    op.post('/api/v1/hold', json={'station': 'OP1', 'what': 'ads', 'until': None}, headers=WEB),
+                    op.post('/api/v1/ads', json={'station': 'OP1', 'key': 'Ads/x.wav', 'mode': 'off'}, headers=WEB),
+                    op.post('/api/v1/library/ident', json={'station': 'OP1', 'key': 'I/id.wav', 'ident': True}, headers=WEB)):
+        assert refused.status_code == 400 and 'one player' in refused.json['error'], refused.json
+    assert cmd('play_now', key='M/b.mp3').status_code == 200 and cmd('skip').status_code == 200
+    assert op.post('/api/v1/hold', json={'station': 'OP1', 'what': 'bumpers', 'until': 'off'}, headers=WEB).status_code == 200
+
+    # the panel: one player, no holds / ads / IDs; Settings without the break settings and folders; Coming up: songs only
+    sync_now = op.get('/api/v1/now?station=OP1&ahead=8').json
+    st = sync_now['station']
+    assert st['players'] == 1 and st['holds'] == {} and st['next_ad'] == {'owed': 0, 'at': None} and st['ident']['count'] == 0
+    assert {s['station']: s['players'] for s in sync_now['stations']}['OP1'] == 1
+    assert len(st['ahead']) == 5 and all(x['kind'] == 'music' for x in st['ahead']), st['ahead']   # every other song, no breaks
+    gaps = [(datetime.fromisoformat(b['at']) - datetime.fromisoformat(a['at'])).total_seconds() for a, b in zip(st['ahead'], st['ahead'][1:])]
+    assert all(g == pytest.approx(210, abs=1) for g in gaps), gaps   # songs never played: 3:30 each, no crossfade overlap
+    # its song fading out (its only deck, still on air): Coming up goes on, the next song from the fade's end
+    batch(app, {'station': 'OP1', 'state': dict(one, decks={'A': dict(one['decks']['A'], state='fading', fade_left=3.0)})})
+    ahead = op.get('/api/v1/now?station=OP1&ahead=3').json['station']['ahead']
+    first = (datetime.fromisoformat(ahead[0]['at']) - datetime.now(timezone.utc)).total_seconds() if ahead else None
+    assert len(ahead) == 3 and all(x['kind'] == 'music' for x in ahead) and 0 < first <= 3.5, (first, ahead)
+    batch(app, {'station': 'OP1', 'state': one})
+    view = admin.get('/api/v1/settings?station=OP1').json
+    names = {x['name'] for x in view['settings']}
+    assert view['players'] == 1 and 'music_dir' in names and 'crossfade_s' in names and not names & core_settings.BREAK_ONLY
+    batch(app, {'station': 'OP2', 'state': two})
+    view = admin.get('/api/v1/settings?station=OP2').json                  # a two-player station's: all of them
+    assert view['players'] == 2 and {'bumper_every_n_tracks', 'imaging_dir', 'ads_dir'} <= {x['name'] for x in view['settings']}
+
+    # two players again: breaks again
+    r = batch(app, {'station': 'OP1', 'ads_rev': r['ads_rev'], 'state': two}).json['stations']['OP1']
+    assert 'mix' in r['ads'] and op.post('/api/v1/ads', json={'station': 'OP1', 'key': 'Ads/x.wav', 'mode': 'off'},
+                                         headers=WEB).status_code == 200
+
+
 def test_core_memory_warning(app):
     """Per Core, on the lowest Lua memory of each 10-minute window (one sample includes garbage not yet
     collected, so it saws up and down): the settled low is the lowest window low after the first 10 minutes
@@ -2086,6 +2202,32 @@ def test_migration_0017_moves_the_analysis_job_to_the_core():
         assert [tuple(r) for r in own] == [('A', 'crossfade_s')]
     finally:
         sql('DROP SCHEMA IF EXISTS qsr_test_m17 CASCADE')
+
+
+def test_migration_0018_counts_each_stations_players():
+    """Every station has two players until its Core (radio.lua 2.2.0) reports one; only 1 or 2 fit."""
+    sql('DROP SCHEMA IF EXISTS qsr_test_m18 CASCADE; CREATE SCHEMA qsr_test_m18')
+    conn = db.connect(search_path=False)
+    try:
+        for version, _, path, _ in migrate.discover():
+            if version > 18:
+                break
+            if version == 18:
+                with conn.cursor() as cur:
+                    cur.execute("SET LOCAL search_path TO qsr_test_m18; INSERT INTO stations (station) VALUES ('A'), ('B')")
+            with conn.cursor() as cur:
+                cur.execute('SET LOCAL search_path TO qsr_test_m18')
+                cur.execute(path.read_text(encoding='utf-8'))
+            conn.commit()
+    finally:
+        conn.close()
+    try:
+        assert [tuple(r) for r in sql('SELECT station, players FROM qsr_test_m18.stations ORDER BY 1', fetch=True)] == [('A', 2), ('B', 2)]
+        with pytest.raises(Exception, match='stations_players_check'):
+            sql("UPDATE qsr_test_m18.stations SET players = 3 WHERE station = 'A'")
+        sql("UPDATE qsr_test_m18.stations SET players = 1 WHERE station = 'A'")
+    finally:
+        sql('DROP SCHEMA IF EXISTS qsr_test_m18 CASCADE')
 
 
 def test_syslog_set_on_the_settings_page(app):

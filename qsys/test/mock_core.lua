@@ -1,7 +1,7 @@
 --[[---------------------------------------------------------------------------
   MockCore :: an offline stand-in for the Q-SYS Lua runtime
   File:    qsys/test/mock_core.lua
-  Version: 0.5.0
+  Version: 0.6.0
 
   Enough of Component / Timer / dir / Design / Network / Controls / json / io
   to run radio.lua (and probe.lua) under plain Lua 5.3 with a simulated
@@ -14,7 +14,8 @@
       the file's crest (default 3 dB) under peak.N
     - `playing` goes false at end of file (and `stopped` true)
     - files load from root + directory (MockCore.dirs is relative to Audio/)
-  Any number of players, meters and mixers by name (spec.players: the wiring),
+  Any number of players, meters and mixers by name (spec.players: the wiring; MockCore.stations / MockCore.zones
+  build two-player stations and one-player zones),
   analysis players (a player + meter channel routed nowhere: MockCore.analyzers),
   and a fake server for the 2.1 Core protocol (batched sync, library in parts,
   the per-Core analysis list: MockCore.analysisQueue).
@@ -340,6 +341,20 @@ function MockCore.stations(n, opts)
       wiring[#wiring + 1] = { name = id .. "_" .. deck, label = id .. deck, meter = id .. "_Meter", channel = k, mixer = id .. "_Mix", input = k }
     end
     cfg[i] = { id = id, players = { id .. "_A", id .. "_B" }, meter = id .. "_Meter", meters = { 1, 2 } }
+  end
+  return wiring, cfg
+end
+
+-- n one-player stations (background-music zones): ids <prefix>1.. (or opts.ids; prefix "Z"), player <id>_P (label <id>)
+-- on channel opts.first (1), opts.first + 1, ... of one shared meter opts.meter ("ZoneMeter"), no mixer. Returns the
+-- wiring (spec.players) and the CFG.STATIONS entries.
+function MockCore.zones(n, opts)
+  opts = opts or {}
+  local wiring, cfg, meter, first = {}, {}, opts.meter or "ZoneMeter", opts.first or 1
+  for i = 1, n do
+    local id = opts.ids and opts.ids[i] or ((opts.prefix or "Z") .. i)
+    wiring[i] = { name = id .. "_P", label = id, meter = meter, channel = first + i - 1 }
+    cfg[i] = { id = id, players = { id .. "_P" }, meter = meter, meters = { first + i - 1 } }
   end
   return wiring, cfg
 end

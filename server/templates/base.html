@@ -38,8 +38,8 @@
     <div class="tabs">
       <a href="{{ url_for('dashboard') }}" class="tab {{ 'active' if page == 'dashboard' }}"><svg viewBox="0 0 24 24"><path d="M3 3h8v10H3zm10 0h8v6h-8zM3 15h8v6H3zm10-4h8v10h-8z"/></svg><span>Dashboard</span></a>
       <a href="{{ url_for('library_kind', which='music') }}" class="tab {{ 'active' if page == 'music' }}"><svg viewBox="0 0 24 24"><path d="M12 3v10.6A4 4 0 1 0 14 17V7h4V3z"/></svg><span>Music</span><b class="tab-n" data-count="music"></b></a>
-      <a href="{{ url_for('library_kind', which='imaging') }}" class="tab {{ 'active' if page == 'imaging' }}"><svg viewBox="0 0 24 24"><path d="M3 10h2v4H3zm4-3h2v10H7zm4-4h2v18h-2zm4 4h2v10h-2zm4 3h2v4h-2z"/></svg><span>Imaging &amp; IDs</span><b class="tab-n" data-count="imaging"></b></a>
-      <a href="{{ url_for('library_kind', which='ads') }}" class="tab {{ 'active' if page == 'ad' }}"><svg viewBox="0 0 24 24"><path d="M18 3v18l-6-4H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h6zM6 17h3l1 4H7z"/></svg><span>Advertisements</span><b class="tab-n" data-count="ad"></b></a>
+      <a href="{{ url_for('library_kind', which='imaging') }}" class="tab {{ 'active' if page == 'imaging' }}" data-breaks><svg viewBox="0 0 24 24"><path d="M3 10h2v4H3zm4-3h2v10H7zm4-4h2v18h-2zm4 4h2v10h-2zm4 3h2v4h-2z"/></svg><span>Imaging &amp; IDs</span><b class="tab-n" data-count="imaging"></b></a>
+      <a href="{{ url_for('library_kind', which='ads') }}" class="tab {{ 'active' if page == 'ad' }}" data-breaks><svg viewBox="0 0 24 24"><path d="M18 3v18l-6-4H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h6zM6 17h3l1 4H7z"/></svg><span>Advertisements</span><b class="tab-n" data-count="ad"></b></a>
       <a href="{{ url_for('log_page') }}" class="tab {{ 'active' if page == 'log' }}"><svg viewBox="0 0 24 24"><path d="M4 4h16v2H4zm0 5h16v2H4zm0 5h10v2H4zm0 5h10v2H4zm13-4 4 3-4 3z"/></svg><span>Play log</span></a>
       {% if user and user.is_admin %}<a href="{{ url_for('settings_page') }}" class="tab {{ 'active' if page == 'settings' }}"><svg viewBox="0 0 24 24"><path d="M3 6h9v2H3zm13 0h5v2h-5zm-2-2h2v6h-2zM3 16h5v2H3zm9 0h9v2h-9zm-2-2h2v6h-2z"/></svg><span>Settings</span></a>{% endif %}
     </div>

@@ -116,7 +116,7 @@
   function renderDecks() {
     const st = core();
     if (st) {
-      R.setHTML($('decks'), deckHtml('A', st.decks.A) + deckHtml('B', st.decks.B));
+      R.setHTML($('decks'), deckHtml('A', st.decks.A) + (R.onePlayer() ? '' : deckHtml('B', st.decks.B)));
       $('decks-note').textContent = '';
       return;
     }
@@ -124,7 +124,8 @@
     const on = (last && last.on_air) || [];
     $('decks-note').textContent = on.length ? 'Core offline: from the play log' : '';
     R.setHTML($('decks'), on.length ? on.slice(0, 2).map((p) => deckHtml(p.deck || '?', { file: p.file, dir: p.directory,
-      artist: p.artist, title: p.title, kind: p.kind, state: 'playing', live: true })).join('') : deckHtml('A', null) + deckHtml('B', null));
+      artist: p.artist, title: p.title, kind: p.kind, state: 'playing', live: true })).join('')
+      : deckHtml('A', null) + (R.onePlayer() ? '' : deckHtml('B', null)));
   }
 
   const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
@@ -260,7 +261,8 @@
         $('ad-meter').style.width = ad.pct;
       }
       R.setHTML($('lib-big'), (num(lib.music) || 0) + ' <small>songs</small>');
-      $('lib-sub').textContent = plural(imaging, 'bumper') + ' · ' + plural(adCount, 'advertisement') + ' · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
+      $('lib-sub').textContent = (R.onePlayer() ? 'songs only (one player)' : plural(imaging, 'bumper') + ' · ' + plural(adCount, 'advertisement')) +
+        ' · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
       $('core-meter').style.width = '100%';
     } else {
       ['bump', 'ad', 'lib'].forEach((k) => { $(k + '-big').textContent = '–'; R.marquee($(k + '-sub'), ' '); });

@@ -1,6 +1,7 @@
 # QSYSRadio: notes for Claude
 
-Radio automation, two decks per station: ONE radio.lua on the Q-SYS Core
+Radio automation, two decks per station (or one: a background-music zone,
+songs only): ONE radio.lua on the Q-SYS Core
 (`qsys/`) runs every station in `CFG.STATIONS` and does real time;
 a Flask + PostgreSQL server (`server/`) does everything else (play log, web
 control panel, settings, library, sign-in, syslog). README.md has the design.
@@ -51,6 +52,10 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   and reply part run under `guard` (pcall); a station failing 5 ticks in a
   row or failing to build is faulted (decks stopped, `station_fault`,
   rebuilt from its CFG entry after a back-off); the others never notice.
+- A station has one or two decks (`st.single`: one player, songs only, no
+  breaks). One code path with a one-deck case (`otherDeck` is the deck
+  itself, the next song loads once the fade-out ends); never a copy of the
+  transition logic, and loops over `st.decks`, never `decks[2]` blindly.
 - Every list has a cap (`K.outbox_max`, `events_max`, `history_max`,
   `queue_max`, `analyze_max`); nothing may grow with uptime. The Core
   reports `mem_kb` every sync; `scenario_multi.lua` checks memory is flat.
@@ -149,7 +154,9 @@ control panel, settings, library, sign-in, syslog). README.md has the design.
   `next` is the song to play next, picked on the server (`next_song`: least
   recently played, or by length to land the break on an ad slot); the Core
   takes it after the operator queue, once, and uses its own shuffle only when
-  the server has named nothing.
+  the server has named nothing. A one-player station (`stations.players` = 1,
+  from its state) gets `next` only; its break commands, holds, ad rules and
+  IDs are refused (`breaks.one_player` / `refuse_one_player`).
 
 ## Web panel
 - Pages poll through `Radio.status()` (one loop per page, 8 s timeout);

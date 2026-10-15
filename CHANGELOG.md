@@ -5,6 +5,91 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [2.2.0] - 2026-10-15
+
+**Redeploy both: the server first** (`git pull && sudo systemctl restart
+qsysradio`; migration 0018), **then the Core**: paste radio.lua into the same
+Text Controller, keep your `CFG` values and add an entry per background-music
+zone (wire its player and meter channel in Designer first).
+
+### Added
+- **One-player stations** (background-music zones: one Audio Player, songs
+  only), from the same radio.lua as the radio stations. A `CFG.STATIONS`
+  entry with one player:
+  ```lua
+  { id = "Lobby", players = { "Lobby_Player" }, meter = "ZoneMeter", meters = { 3 } },
+  ```
+  It needs only the player and a meter channel; several zones can share
+  one meter on different channels. An entry with no player or more than two
+  is a bad entry: faulted (`players must name one or two Audio Players`)
+  and retried like any other. `meters` names one channel per player; left
+  out, it is channels 1 and 2 (1 for one player). A list that does not name
+  a number for each player faults the station (`meters must name a channel
+  for each player`), so a deck never reads another station's channel.
+  - **Everything a station has for songs:** the fair rotation (the
+    server's pick, else the local shuffle with artist separation), the
+    queue, level matching, the quiet start skipped, silence detection, the
+    learned quiet end and fade-outs. Its files are measured by the Core's
+    analysis players like any other station's.
+  - **The song change:** at the point where a two-player station starts its
+    crossfade, the song fades out over `crossfade_s` to its learned quiet
+    end, then the next song loads on the same player and plays (with
+    `fade_in_s` if set). The gap is the load time only (about 0.1 s). Skip
+    and Play now fade over `skip_fade_s`, silence at the end over
+    `silence_fade_s`, Stop over `stop_fade_s`; a song shorter than its fade
+    plays to its end. Stop after current, the queue, Rescan and the
+    dead-air guard work as on two players (Stop after current pressed while
+    the song fades out stops the station when the fade ends); a file that
+    cannot load is skipped for the next song. While it fades, the deck is
+    still the live one: its state gives `fade_left` (seconds of the fade to
+    go), the Dashboard and nav rail keep showing it on air, and Coming up
+    starts the next song when the fade ends.
+  - **No breaks:** its imaging and ads folders are not read, it plans no
+    bumper, ad or station ID, and Bumper now / Ad break now answer "this
+    station has one player". Its state says `players: 1` and reports deck A
+    only (`decks`, `meters`).
+  - One code path in radio.lua with a one-deck case (the deck is its own
+    "other deck"; the next song loads once the fade-out ends). `Tick` and
+    `Fast` still allocate nothing.
+- **Server:** `stations.players` (migration 0018), from the station's state
+  (2 until a 2.2.0 Core says otherwise; a fault state leaves it). A
+  one-player station's ads plan names only the next song (`{next,
+  next_why}`), and a change of the count makes its cached plan again. The
+  server refuses (400, "this station has one player: it plays songs only
+  …") Bumper now, Ad break now, Play now on an imaging file or ad, pausing
+  ads or bumpers (resuming an old pause is allowed), ad schedules and
+  station ID marks for it. Coming up lists songs only, each starting when
+  the one before has faded out. `/api/v1/now` and the station list carry
+  `players`; the dashboard skips the ad, hold and ID queries for it.
+- **Panel:** for a one-player station the Dashboard shows one deck, no Next
+  bumper / Next ad break cards and no Bumper now / Ad break now; the Imaging
+  & IDs and Advertisements tabs are hidden (opened by a link they say the
+  station plays songs only); Settings, in that station's scope, leaves out
+  the Bumpers & advertisements group, the imaging and ads folders and the
+  ad timing tolerance, and says why.
+- **MockCore 0.6.0:** `MockCore.zones(n, opts)` wires one-player zones on a
+  shared meter. `scenario_single.lua`: a zone beside a two-player station
+  for an hour (rotation and artist separation, level matching, the quiet
+  start skipped, the hand-over at the learned quiet end with only the load
+  between songs, silence at the end, a song shorter than its fade, skip /
+  play now / play next / stop after current (also pressed during the end
+  fade) / stop / start, an unsupported
+  file and a load that never completes, an empty folder that gets files,
+  never a break even when asked, the radio station unaffected), no
+  allocation in `Tick` / `Fast`, and four hours of three zones and a
+  station with flat memory. `live_core.py --zones N` runs N zones beside
+  the stations.
+
+### Fixed
+- **Two songs at once after an empty music folder got files** (radio.lua):
+  the dead-air guard's rescan started a song, then the guard started
+  another on the other deck, and both played to the end. Now the guard
+  starts nothing when the rescan already did. Regression case in
+  `scenario_regressions.lua`.
+- **A short `meters` list** is no longer read as channel 1 and 2: a station
+  whose list does not name a channel for each of its players is faulted
+  (regression case in `scenario_regressions.lua`).
+
 ## [2.1.0] - 2026-10-15
 
 ### Added

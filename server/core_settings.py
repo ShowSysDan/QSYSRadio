@@ -112,6 +112,8 @@ REQUIRED = {'music_dir'}
 SERVER_ONLY = {'ad_fit_tolerance_s', 'ident_schedule', 'ident_window_min', 'analyze_at'}   # the server's own; not sent to the Core
 STATION_ONLY = {'music_dir', 'imaging_dir', 'ads_dir'}      # each station its own folders; never set for all stations
 ALL_ONLY = {'analyze_at'}       # the whole Core's (its analysis players serve every station on it): never set per station
+# what only breaks use: a one-player station (songs only) has none, and its Settings page leaves them out
+BREAK_ONLY = {s[0] for s in SPEC if s[2] == 'Bumpers & advertisements'} | {'imaging_dir', 'ads_dir', 'ad_fit_tolerance_s'}
 PREFIX = 'core.'
 
 

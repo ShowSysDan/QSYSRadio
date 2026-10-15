@@ -515,5 +515,41 @@ check(waited, "nothing measured while its station is not built: the file stays l
 check(rebuilt.built and not rebuilt.fault and rebuilt.lib.root == "Audio/Radio/" and analyzed("A - Song1.flac")
   and count("analysis") == 1, "built again: measured under its real root, once")
 
+print("-- a meters list that does not name a channel for each player faults the station (2.2.0 dev read channel 2, or 1,")
+print("   instead: another station's audio measured, its figures shared with every station through the server)")
+boot(songs(2, 40), {}, nil, function(cfg)
+  cfg.STATIONS[1].meters = { 2 }                                           -- two players, one channel
+  for i, w in ipairs({ { "Zone_P", "ZoneMeter", 1 }, { "Zone2_P", "ZoneMeter", 2 }, { "Zone3_P", "Zone3Meter", 4 } }) do
+    MockCore.wire{ name = w[1], label = "Z" .. i, meter = w[2], channel = w[3] }
+  end
+  MockCore.wire{ name = "Spare", label = "S", meter = "Zone3Meter", channel = 1 }
+  cfg.STATIONS[2] = { id = "Z1", players = { "Zone_P" }, meter = "ZoneMeter", meters = {} }      -- one player, no channel
+  cfg.STATIONS[3] = { id = "Z2", players = { "Zone2_P" }, meter = "ZoneMeter", meters = { "2" } }
+  cfg.STATIONS[4] = { id = "Z3", players = { "Zone3_P" }, meter = "Zone3Meter" }                 -- no list: channel 1
+  cfg.STATIONS[5] = { id = "Z4", players = { "Spare" }, meter = "Zone3Meter", meters = { 1 } }
+end)
+local MSG = "meters must name a channel for each player"
+local byId = Radio.byId
+check(byId.Main.fault == MSG and byId.Z1.fault == MSG and byId.Z2.fault == MSG,
+  "two players with one channel, one player with none or a non-number: faulted (" .. tostring(byId.Main.fault) .. ")")
+check(not byId.Z3.fault and byId.Z3.decks[1].peak == MockCore.meters.Zone3Meter["peak.1"] and not byId.Z4.fault,
+  "no meters list: the default channel (1) for a one-player station")
+
+print("-- files arriving in an empty music folder: one song starts, not two (2.1.0 and before: the dead-air guard's rescan")
+print("   started one, then the guard itself started another on the other deck, both on air for a whole song)")
+boot({}, {})
+MockCore.at(40, function() MockCore.dirs["Test/Tuning/"] = songs(3, 60) end)
+local both = 0
+local function overlap()
+  if MockCore.players.Audio_Player23.playing and MockCore.players.Audio_Player24.playing then both = both + 1 end
+  MockCore.at(MockCore.clock + 0.25, overlap)
+end
+MockCore.at(41, overlap)
+MockCore.run(100)
+local starts = evs("track_start")
+check(starts[1] and starts[1].at < 72 and (not starts[2] or starts[2].at > starts[1].at + 40) and both <= 20,
+  string.format("one song starts at the guard's rescan (t=%s); both players on air for %.2f s (a crossfade's worth at most)",
+    starts[1] and starts[1].at or "-", both * 0.25))
+
 print("")
 print(fails == 0 and "ALL CHECKS PASSED" or (fails .. " CHECK(S) FAILED"))

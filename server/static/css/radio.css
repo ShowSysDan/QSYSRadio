@@ -129,6 +129,9 @@ body[data-page="dashboard"] .now { display: none; }
 .kpi { grid-column: span 3; padding: 13px 18px 0; display: flex; flex-direction: column; min-width: 0; }
 .bento.five { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .bento.five .kpi { grid-column: auto; }
+/* a one-player station (songs only): no bumper / ad cards, buttons or tabs; one deck */
+body.one-player [data-breaks] { display: none !important; }
+body.one-player .bento.five { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .tile { position: relative; overflow: hidden; --tint: var(--accent); border-radius: 12px; padding: 18px 20px;
   background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,0) 55%), var(--surface);
   border: 1px solid var(--border); box-shadow: var(--hl), var(--lift); }
@@ -216,6 +219,7 @@ button.sent-bad { animation: sent-bad .9s ease-out; }
 
 /* ── Decks (instance-card style) ────────────────────────────────────────── */
 .decks { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+body.one-player .decks { grid-template-columns: 1fr; }
 .dk { position: relative; overflow: hidden; border-radius: 12px; padding: 12px 14px 0; display: grid; grid-template-columns: auto minmax(0, 1fr);
   grid-template-rows: 1fr auto; min-height: 200px;
   background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,0) 55%), var(--surface2); border: 1px solid var(--border); box-shadow: var(--hl); }

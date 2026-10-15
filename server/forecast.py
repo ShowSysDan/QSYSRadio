@@ -4,6 +4,8 @@ air and time left, operator queue, bumper / ad counters), the ad schedule and
 the library, following the rules the Core plays by. A reference only: the
 Core decides at each song change (mix-in ads and bumpers are its own random
 pick, shown here without a name), and the list is rebuilt on every poll.
+A one-player station (state players = 1) has no breaks: songs only, each
+starting when the one before has faded out.
 """
 from datetime import datetime, timedelta, timezone
 
@@ -30,18 +32,24 @@ def forecast(cur, station, state, age_s, n=10):
     if not state.get('automation'):
         return []
     s = _settings(cur, station, state)
+    single = state.get('players') == 1       # songs only; the next starts once this one has faded out
     cur.execute("""SELECT key, kind, file, artist, title, duration_s, COALESCE(trail_set_s, trail_s) AS trail_s,
                           COALESCE(lead_set_s, lead_in_s) AS lead_in_s, last_played FROM library_figures
                    WHERE station = %s AND present AND NOT unsupported""", (station,))
     lib = {r['key']: dict(r) for r in cur.fetchall()}
-    sched, hour_start = ads.schedule(cur, station)
+    if single:
+        sched, hour_start, hold, ids = {}, None, {}, {'keys': [], 'due': None, 'window_s': 0}
+    else:
+        sched, hour_start = ads.schedule(cur, station)
+        hold, ids = breaks.holds(cur, station), breaks.idents(cur, station)
     now = datetime.now(timezone.utc)
+    fade = 0.0 if single else float(s['crossfade_s'])       # how much earlier than its quiet end the next song starts
 
     def length(key, guess):
         r = lib.get(key) or {}
         return r.get('duration_s') or guess
 
-    song_air = ads.airtime({n: float(s[n]) for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})
+    song_air = ads.airtime({'crossfade_s': fade, **{n: float(s[n]) for n in ('lead_skip_max_s', 'lead_skip_keep_s')}})
     spot_air = ads.airtime({n: float(s[n]) if n != 'crossfade_s' else 0.0
                             for n in ('crossfade_s', 'lead_skip_max_s', 'lead_skip_keep_s')})   # no crossfade, quiet ends skipped
 
@@ -49,8 +57,6 @@ def forecast(cur, station, state, age_s, n=10):
         r = lib.get(key) or {}
         return song_air(dict(r, duration_s=length(key, SONG_GUESS_S), lead_in_s=r.get('lead_in_s'), trail_s=r.get('trail_s')))
 
-    hold = breaks.holds(cur, station)
-    ids = breaks.idents(cur, station)
     every = breaks.EVERY_MIN.get(s['ident_schedule'], 0) if ids['keys'] else 0
     taken_idents = set()
 
@@ -83,13 +89,17 @@ def forecast(cur, station, state, age_s, n=10):
     decks = [d for d in (state.get('decks') or {}).values() if isinstance(d, dict)]
     live = next((d for d in decks if d.get('live') and d.get('state') == 'playing'), None) or \
         next((d for d in decks if d.get('state') == 'playing'), None)
-    if not live or _num(live.get('remaining'), None) is None:
+    fading = None if live or not single else next((d for d in decks if d.get('live') and d.get('state') == 'fading'), None)
+    if fading:                         # one player, its song fading out: the next one starts when the fade ends
+        live, left = fading, max(0.0, _num(fading.get('fade_left')) - age_s)
+    elif not live or _num(live.get('remaining'), None) is None:
         return []
-    left = max(0.0, _num(live.get('remaining')) - age_s)
-    if live.get('kind') == 'music':
-        left -= s['crossfade_s'] + ((lib.get(live.get('key')) or {}).get('trail_s') or 0)
     else:
-        left -= s['bumper_tail_s']
+        left = max(0.0, _num(live.get('remaining')) - age_s)
+        if live.get('kind') == 'music':
+            left -= fade + ((lib.get(live.get('key')) or {}).get('trail_s') or 0)
+        else:
+            left -= s['bumper_tail_s']
     t = now + timedelta(seconds=max(0.0, left))
 
     out, played = [], {live.get('key')}
@@ -115,7 +125,7 @@ def forecast(cur, station, state, age_s, n=10):
         if state.get('stop_after') and not out:
             out.append({'kind': 'stop', 'why': 'stop', 'title': 'Station stops', 'at': t.isoformat()})
             break
-        if not in_break:               # a song change: is a break due here?
+        if not in_break and not single:     # a song change: is a break due here?
             minute = (t - hour_start).total_seconds() / 60
             owed = []
             for key, r in sched.items():
@@ -175,7 +185,7 @@ def forecast(cur, station, state, age_s, n=10):
             if not eligible:
                 break
             # as the server will pick when it gets there: by length for an ad slot within two songs, else the oldest
-            slot = next_slot(t)
+            slot = None if single else next_slot(t)
             share = lambda f: eligible[:max(1, min(ads.POOL, int(len(eligible) * f)))]
             timed = lambda pool: [(r['key'], air(r['key'])) for r in pool if r['duration_s']]
             key, why = ads.choose(eligible[0]['key'], timed(share(0.25)), timed(share(0.5)),

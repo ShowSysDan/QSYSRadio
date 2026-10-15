@@ -136,17 +136,23 @@
       if (!d.core_rev) { b.className = 'banner wait'; b.textContent = 'No Core has reported yet. Settings are sent when it connects.'; }
       else if (d.in_sync) { b.className = 'banner ok'; b.textContent = '✓ The Core is running these settings.'; }
       else { b.className = 'banner wait'; b.textContent = '… Waiting for the Core to apply the latest settings (it syncs every second).'; }
-      const music = d.settings.find((s) => s.name === 'music_dir');
-      note.hidden = d.scope === 'station' && !(music && music.own == null);
+      const music = d.settings.find((s) => s.name === 'music_dir'), one = d.scope === 'station' && d.players === 1;
+      const noFolder = music && music.own == null;
+      note.hidden = d.scope === 'station' && !noFolder && !one;
+      const songsOnly = one ? d.station + ' has one player: it plays songs only, so the bumper and advertisement settings and ' +
+        'folders are left out here. ' : '';
       if (d.scope === 'all') {
         note.className = 'banner';
         note.textContent = 'Every station uses these unless it sets its own. The folders (music, imaging, advertisements) are set per station.';
-      } else if (music) {
+      } else if (noFolder) {
         // the folder the Core reports once it runs these settings (its radio.lua may have been edited)
         const dir = d.in_sync && music.running != null ? music.running : music.default;
         note.className = 'banner wait';
-        note.textContent = d.station + ' has no music folder of its own: it plays radio.lua\'s fallback folder (' + fmt(dir) +
+        note.textContent = songsOnly + d.station + ' has no music folder of its own: it plays radio.lua\'s fallback folder (' + fmt(dir) +
           '). Set Music folder under Library.';
+      } else if (one) {
+        note.className = 'banner';
+        note.textContent = songsOnly;
       }
     });
   $('scope').addEventListener('click', (e) => {

@@ -170,12 +170,15 @@
 
   // ── what is on air (the dashboard and the nav rail) ──────────────────────
   R.playing = (d) => d && (d.state === 'playing' || d.state === 'fading');
+  // a one-player station's only deck stays on air while it fades out (before the next song loads on it)
   R.liveDeck = (st) => {
     if (!st || !st.decks) return null;
     const ds = ['A', 'B'].map((id) => st.decks[id]).filter(R.playing);
-    return ds.find((d) => d.live && d.state === 'playing') || ds.find((d) => d.state === 'playing') || null;
+    return ds.find((d) => d.live && d.state === 'playing') || ds.find((d) => d.state === 'playing') || ds.find((d) => d.live) || null;
   };
   R.core = () => (R.last && R.last.station && R.last.station.online ? R.last.station.state : null);
+  // a one-player station (a background-music zone): songs only; body.one-player hides everything marked data-breaks
+  R.onePlayer = () => !!(R.last && R.last.station && R.last.station.players === 1);
   // seconds since the Core measured elapsed/remaining (server-side age + time since we fetched)
   R.age = () => (R.num(R.last && R.last.station && R.last.station.state_age_s) || 0) + (Date.now() - (R.last ? R.last.receivedAt : Date.now())) / 1000;
 
@@ -196,6 +199,7 @@
   }
   function header(d) {
     const s = d && d.station, st = R.core(), lib = (st && st.library) || {};
+    document.body.classList.toggle('one-player', R.onePlayer());
     document.querySelectorAll('.tab-n[data-count]').forEach((el) => {
       const n = R.num(lib[el.dataset.count]);
       if (el.textContent !== (n == null ? '' : String(n))) el.textContent = n == null ? '' : n;

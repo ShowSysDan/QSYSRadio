@@ -367,6 +367,7 @@
     canAnalyze = !!a.can;
     if (!started) { started = true; load(false); }
     analysisLine(s && s.analysis, (R.core() || {}).fault);
+    if ($('lib-one')) $('lib-one').hidden = !R.onePlayer();       // Imaging / Advertisements of a songs-only station
     if (!s) return;
     const p = d.recent[0] || {};
     const now = [s.library_at, p.id, p.ended_at, a.last, a.left, a.can, a.online].join('|');
