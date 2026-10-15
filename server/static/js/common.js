@@ -241,9 +241,11 @@
   };
   // ~30 frames a second: the bar follows the reported rms like a damped spring (no corners; quicker up than down)
   // and sways gently around it while there is sound (wider for music with more dynamics: peak well over rms);
-  // the peak line holds 1 s, then falls
+  // the peak line holds 1 s, then falls. Stops when no meter is left on the page
   const put = (obj, prop, v) => { if (obj[prop] !== v) obj[prop] = v; };
   function animate(t) {
+    for (const key in bars) if (!bars[key].bar.isConnected) delete bars[key];    // its deck or card was drawn again or removed
+    if (!Object.keys(bars).length) { animating = false; return; }
     requestAnimationFrame(animate);
     const dt = Math.min(0.1, (t - frameAt) / 1000), s = t / 1000;
     if (dt < 0.03) return;
@@ -284,6 +286,7 @@
       if (loop.onData) loop.onData(d);
     } catch (e) {
       setPill('stopped', 'server offline');
+      for (const key in bars) bars[key].rms = bars[key].peak = R.METER_FLOOR;    // no readings: the meters glide down, still
       if (loop.onData) loop.onData(null, e);
     } finally {
       loop.busy = false;

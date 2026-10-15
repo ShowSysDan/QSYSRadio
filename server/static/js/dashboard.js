@@ -179,14 +179,12 @@
     lamp.className = st && st.automation && lv ? 'onair-lamp' : 'lamp-off';
     lamp.textContent = st && st.automation && lv ? 'LIVE' : (s && !s.online ? 'NO CORE' : 'OFF');
     $('air-rem').className = lv ? 't-big red' : 't-big dimmed';
-    if (lv) {
-      $('air-sub').textContent = R.whoLine(lv);
-    } else {
+    if (!lv) {
       $('air-rem').textContent = '-:--';
       $('air-meter').style.width = '0';
-      $('air-sub').textContent = !s ? 'No Core has connected yet' : (!s.online ? 'Core offline · last seen ' + R.ago(s.last_seen)
-        : (st && st.fault ? 'Station fault (see above)' : st && !st.automation ? 'Automation stopped' : 'Between tracks'));
     }
+    R.marquee($('air-sub'), lv ? R.whoLine(lv) : !s ? 'No Core has connected yet' : (!s.online ? 'Core offline · last seen ' + R.ago(s.last_seen)
+      : (st && st.fault ? 'Station fault (see above)' : st && !st.automation ? 'Automation stopped' : 'Between tracks')));
     const n = nextItem(st), stopping = st && st.stop_after;
     R.marquee($('next-title'), stopping ? 'Nothing (stopping)' : (n ? R.who(n).title : '–'));
     R.marquee($('next-sub'), stopping ? 'Stop after current is armed' : (n ? (n.artist || '') + (num(n.duration) ? '  ·  ' + R.clock(n.duration) : '') : ' '));
@@ -229,11 +227,17 @@
         $('ad-meter').style.width = ad.pct;
       }
       R.setHTML($('lib-big'), (num(lib.music) || 0) + ' <small>songs</small>');
-      $('lib-sub').textContent = (R.onePlayer() ? 'songs only (one player)' : plural(imaging, 'bumper') + ' · ' + plural(adCount, 'advertisement')) +
+      // plain text, never the ticker (its "Core up" changes with every report): cut with "…", the whole line on hover
+      const libNote = (R.onePlayer() ? 'songs only (one player)' : plural(imaging, 'bumper') + ' · ' + plural(adCount, 'advertisement')) +
         ' · Core up ' + R.clock(st.uptime) + (num(st.outbox) > 20 ? ' · ' + st.outbox + ' events queued' : '');
+      $('lib-sub').textContent = libNote;
+      $('lib-sub').title = libNote;
       $('core-meter').style.width = '100%';
     } else {
-      ['bump', 'ad', 'lib'].forEach((k) => { $(k + '-big').textContent = '–'; R.marquee($(k + '-sub'), ' '); });
+      ['bump', 'ad', 'lib'].forEach((k) => R.setHTML($(k + '-big'), '–'));    // the same cache as online: written again on return
+      ['bump', 'ad'].forEach((k) => R.marquee($(k + '-sub'), ' '));
+      $('lib-sub').textContent = '\u00a0';    // keeps its line
+      $('lib-sub').title = '';
       $('core-meter').style.width = '0';
     }
     $('core-info').textContent = s ? '· ' + s.station + (s.core ? ' on ' + s.core : '') + ' · radio.lua ' + (s.version || '?') + (s.online ? '' : ' · offline')
