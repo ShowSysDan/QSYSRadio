@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [2.4.2] - 2026-10-15
+
+The rest of the Dashboard's Core-outage path, found by checking 2.4.1.
+
+### Fixed
+- **The Library card's note is always plain text** (it ends in "…", the
+  whole line on hover). It was a ticker while the Core was offline and
+  text while online, which made 2.4.0 throw on the second outage (2.4.1
+  guarded the ticker) and left the note cut mid-letter after any outage.
+- **Next bumper, Next ad break and Library stayed at "–"** after a Core
+  outage when their figure was the same as before it (written past the
+  cache that skips unchanged figures). They come back with the Core.
+- **Meters with no readings.** While the server cannot be reached, the
+  deck meters (Dashboard and Stations) glide down and stop instead of
+  swaying on the last reading. Their animation stops when no meter is
+  left on the page and forgets meters that were drawn again.
+- README: install step 2 expects the current version; the ticker bullet
+  names the lines that scroll and says the meters keep moving with reduced
+  motion; a stale "animated by dashboard.js" comment in radio.css.
+
+### Changed
+- **The On air card's title scrolls** like the other titles when it is too
+  long, instead of ending in "…".
+
+Redeploy the server: `git pull && sudo systemctl restart qsysradio` (reload
+open panel pages). radio.lua only changed its version number: paste it
+when convenient.
+
 ## [2.4.1] - 2026-10-15
 
 The 1.4.1 follow-ups that were left out when 1.4.1 was merged.
