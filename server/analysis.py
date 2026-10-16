@@ -74,9 +74,10 @@ def _run(since, run_at, retry_at, at):
 
 
 def on_core(s='stations'):
-    """SQL: is the stations row s on its Core now (synced in the last GONE_MIN minutes)? A station taken out of
-    its Core's CFG.STATIONS keeps its core, but none of its files is listed, shown queued or counted as going."""
-    return f"{s}.last_seen > NOW() - INTERVAL '{GONE_MIN} minutes'"
+    """SQL: is the stations row s on its Core now (synced in the last GONE_MIN minutes, not archived)? A station
+    taken out of its Core's CFG.STATIONS keeps its core, but none of its files is listed, shown queued or counted
+    as going."""
+    return f"{s}.last_seen > NOW() - INTERVAL '{GONE_MIN} minutes' AND {s}.archived_at IS NULL"
 
 
 def _core_of(cur, station):

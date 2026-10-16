@@ -935,7 +935,11 @@ def test_analysis_list_is_per_core(app):
     sql("UPDATE qsr_test.cores SET owed_at = NULL WHERE core = 'PCA'")
     a = analyzer_sync(app, {'station': 'PA1'}, core='PCA', rev=a['analyze_rev']).json
     assert a['analyze'] == [f('PA1', 'I/i1.wav'), f('PA1', 'M/p1.mp3')]
-    # ... and its page says so: not Analyzing, no row queued (its files are never listed), not even one asked for
+    # ... it is archived: no page, nothing asked for it
+    assert op.get('/api/v1/now?station=PA2').json['station'] is None
+    assert op.post('/api/v1/analyze', json={'station': 'PA2', 'key': 'Zone/p2.mp3'}, headers=WEB).status_code == 400
+    # ... and while not archived (its Core quiet too), its page says so: not Analyzing, no row queued (its files are never listed), not even one asked for
+    sql("UPDATE qsr_test.stations SET archived_at = NULL WHERE station = 'PA2'")
     assert op.post('/api/v1/analyze', json={'station': 'PA2', 'key': 'Zone/p2.mp3'}, headers=WEB).status_code == 200
     assert (view('PA2')['gone'], view('PA2')['can'], view('PA2')['active'], view('PA2')['left']) == (True, False, False, 1)
     assert not any(i['analyze_queued'] for i in op.get('/api/v1/library?station=PA2').json['items'])
@@ -2135,6 +2139,35 @@ def test_stations_overview(app):
     assert page.status_code == 200 and b'id="st-grid"' in page.data and b'js/stations.js' in page.data
     assert b'href="/stations"' in viewer.get('/').data
     assert app.test_client().get('/stations').status_code == 302
+
+
+def test_station_left_out_of_cfg_is_archived(app):
+    """A station its Core no longer lists (taken out of CFG.STATIONS) and not heard from for a while is archived:
+    hidden from the station list, the Stations page and the header, commands refused, its rows kept; listed again,
+    it is back. A station that moved to another Core, or only missed a sync, stays."""
+    assert batch(app, {'station': 'AR-Keep'}, {'station': 'AR-Drop'}, {'station': 'AR-Move'}, core='ARCORE').status_code == 200
+    sql("UPDATE qsr_test.stations SET last_seen = NOW() - INTERVAL '1 minute' WHERE station LIKE 'AR-%%'")
+    batch(app, {'station': 'AR-Move'}, core='ARCORE2')                      # moved: now the other Core's
+    with logged() as lines:
+        batch(app, {'station': 'AR-Keep'}, core='ARCORE')
+    assert any('station=AR-Drop archived: core=ARCORE' in m for _, m in lines), lines
+    rows = sql("SELECT station, archived_at IS NOT NULL FROM qsr_test.stations WHERE station LIKE 'AR-%%' ORDER BY 1", fetch=True)
+    assert [tuple(r) for r in rows] == [('AR-Drop', True), ('AR-Keep', False), ('AR-Move', False)]
+    op = signed_in(app, 'operator')
+    assert 'AR-Drop' not in {s['station'] for s in op.get('/api/v1/now').json['stations']}
+    assert op.get('/api/v1/now?station=AR-Drop').json['station'] is None
+    d = op.get('/api/v1/stations-overview').json
+    assert 'AR-Drop' not in {s['station'] for s in d['stations']} and {'station': 'AR-Drop', 'core': 'ARCORE'} in d['archived']
+    assert op.post('/api/v1/control', json={'station': 'AR-Drop', 'cmd': 'skip'}, headers=WEB).status_code != 200
+    # a station just heard from is not archived by a body without it (one sync is not the Core's whole list)
+    batch(app, {'station': 'AR-Keep'}, {'station': 'AR-New'}, core='ARCORE')
+    batch(app, {'station': 'AR-Keep'}, core='ARCORE')
+    assert not sql("SELECT archived_at FROM qsr_test.stations WHERE station = 'AR-New'", fetch=True)[0][0]
+    # back in CFG.STATIONS: back on the panel
+    with logged() as lines:
+        batch(app, {'station': 'AR-Keep'}, {'station': 'AR-Drop'}, core='ARCORE')
+    assert any('station=AR-Drop listed by its Core again' in m for _, m in lines)
+    assert 'AR-Drop' in {s['station'] for s in op.get('/api/v1/now').json['stations']}
 
 
 def test_batched_sync_of_14_stations_is_quick(app):

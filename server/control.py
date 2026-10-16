@@ -116,7 +116,8 @@ def _station_sync(cur, station, part, core, version, boot, now):
     state = _clean_state(part.get('state'))
     reply, lines = {}, []
     db.lock_station(cur, station)
-    cur.execute("""SELECT boot, players, COALESCE(analyze_from, analyze_run_at, analyze_auto_at) IS NOT NULL AS job
+    cur.execute("""SELECT boot, players, COALESCE(analyze_from, analyze_run_at, analyze_auto_at) IS NOT NULL AS job,
+                          archived_at IS NOT NULL AS archived
                    FROM stations WHERE station = %s""", (station,))
     prev = cur.fetchone()
     if prev and prev['boot'] != boot:
@@ -130,8 +131,10 @@ def _station_sync(cur, station, part, core, version, boot, now):
                    VALUES (%s, %s, %s, %s, NOW(), %s, %s)
                    ON CONFLICT (station) DO UPDATE SET radio_version = EXCLUDED.radio_version,
                        boot = EXCLUDED.boot, settings_rev = EXCLUDED.settings_rev, last_seen = NOW(),
-                       meters = EXCLUDED.meters, core = COALESCE(EXCLUDED.core, stations.core)""",
+                       meters = EXCLUDED.meters, core = COALESCE(EXCLUDED.core, stations.core), archived_at = NULL""",
                 (station, version, boot, settings_rev, json.dumps(meters) if meters else None, core))
+    if prev and prev['archived']:
+        lines.append((20, f'station={station} listed by its Core again: back on the panel'))
     if state is not None:
         players = state.get('players')       # a fault state has none: the count stays
         cur.execute('UPDATE stations SET state = %s, state_at = NOW(), players = COALESCE(%s, players) WHERE station = %s',
@@ -182,6 +185,24 @@ def _station_sync(cur, station, part, core, version, boot, now):
 
 
 _failed_logged = {}         # station (or core:<id>) -> monotonic time its failure was last logged
+
+
+def archive_missing(cur, core, listed):
+    """Archive this Core's stations its sync no longer lists (taken out of its CFG.STATIONS) and not heard from for
+    cores.ONLINE_S: hidden from the panel instead of shown offline; their rows stay, and a station listed again
+    comes back (_station_sync). A station moved to another Core is that Core's (stations.core) and not archived.
+    Each station's lock first, in name order. Returns log lines."""
+    cur.execute(f"""SELECT station FROM stations WHERE core = %s AND archived_at IS NULL AND station <> ALL(%s)
+                      AND last_seen < NOW() - INTERVAL '{cores.ONLINE_S} seconds' ORDER BY station""", (core, list(listed)))
+    names = [r[0] for r in cur.fetchall()]
+    for name in names:
+        db.lock_station(cur, name)
+    if not names:
+        return []
+    cur.execute(f"""UPDATE stations SET archived_at = NOW() WHERE station = ANY(%s) AND core = %s AND archived_at IS NULL
+                      AND last_seen < NOW() - INTERVAL '{cores.ONLINE_S} seconds'""", (names, core))
+    return [(20, f'station={n} archived: core={core} no longer lists it in CFG.STATIONS (hidden from the panel)')
+            for n in names]
 
 
 def _part_failed(conn, name, exc):
@@ -269,6 +290,15 @@ def core_sync(conn, payload, now, log):
         except Exception as exc:          # noqa: BLE001 (one station's failure is that station's alone)
             reply, lines = _part_failed(conn, station, exc)
         replies[station] = reply
+        log(lines)
+    if core:
+        listed = {text(p.get('station'), 200) for p in parts if isinstance(p, dict)} - {None}
+        try:
+            with conn.cursor() as cur:
+                lines = archive_missing(cur, core, listed)
+            conn.commit()
+        except Exception as exc:          # noqa: BLE001 (the stations' replies stand; tried again next sync)
+            lines = _part_failed(conn, f'core:{core} archive', exc)[1]
         log(lines)
     out = {'stations': replies}
     for name, job, field in CORE_JOBS:
@@ -378,7 +408,7 @@ def stations(conn):
                                state->'automation' = 'true'::jsonb AS automation,
                                state->'stop_after' = 'true'::jsonb AS stop_after,
                                left(state->>'fault', 300) AS fault
-                        FROM stations ORDER BY last_seen DESC""")
+                        FROM stations WHERE archived_at IS NULL ORDER BY last_seen DESC""")
         return [{'station': r['station'], 'online': r['online'], 'version': r['radio_version'], 'core': r['core'],
                  'players': r['players'],
                  'automation': bool(r['automation']), 'stop_after': bool(r['stop_after']), 'fault': r['fault'],
@@ -386,12 +416,12 @@ def stations(conn):
 
 
 def resolve_station(conn, station):
-    """The requested station, or the most recently seen one."""
+    """The requested station, or the most recently seen one; an archived station (archive_missing) is none."""
     with conn.cursor() as cur:
         if station:
-            cur.execute('SELECT station FROM stations WHERE station = %s', (station,))
+            cur.execute('SELECT station FROM stations WHERE station = %s AND archived_at IS NULL', (station,))
         else:
-            cur.execute('SELECT station FROM stations ORDER BY last_seen DESC LIMIT 1')
+            cur.execute('SELECT station FROM stations WHERE archived_at IS NULL ORDER BY last_seen DESC LIMIT 1')
         r = cur.fetchone()
         return r['station'] if r else None
 
@@ -441,13 +471,13 @@ OVERVIEW_COMMANDS_MAX = 50
 
 def overview(conn, station=None, command_ids=()):
     """Every station at a glance (the Stations page), by name, in a fixed number of queries however many stations
-    there are: the stations, the open play of each (from the play log: what was on air when its Core went quiet),
+    there are: the stations (not archived: archive_missing; those are named in `archived`), the open play of each (from the play log: what was on air when its Core went quiet),
     the Cores (cores.view) and the commands the page is waiting on (command_ids). Each station's row has the
     shape of status() for what the header needs (online, state, state_age_s, players), so `station` (the
     requested one, else the most recently seen; None when the requested one does not exist) serves the header.
     Only what the page shows: the Core's state cut to its decks, what is next and the library counts."""
     with conn.cursor() as cur:
-        cur.execute("""SELECT station, core, players, radio_version, last_seen, meters,
+        cur.execute("""SELECT station, core, players, radio_version, last_seen, meters, archived_at IS NOT NULL AS archived,
                               EXTRACT(EPOCH FROM NOW() - last_seen) AS age,
                               EXTRACT(EPOCH FROM NOW() - state_at) AS state_age,
                               jsonb_build_object('automation', state->'automation', 'state', state->'state',
@@ -456,6 +486,8 @@ def overview(conn, station=None, command_ids=()):
                                                  'next_up', state->'next_up', 'library', state->'library') AS state
                        FROM stations ORDER BY station""")
         rows = cur.fetchall()
+        archived = [{'station': a['station'], 'core': a['core']} for a in rows if a['archived']]
+        rows = [r for r in rows if not r['archived']]
         cur.execute("""SELECT DISTINCT ON (station) station, artist, title, file
                        FROM play_log WHERE ended_at IS NULL AND started_at > NOW() - INTERVAL '1 day'
                        ORDER BY station, started_at DESC, id DESC""")
@@ -489,7 +521,7 @@ def overview(conn, station=None, command_ids=()):
     if current:                          # the header's analysis chip, as status() gives it (one station: fixed cost)
         with conn.cursor() as cur:
             current = dict(current, analysis=analysis.view(cur, current['station']))
-    return {'stations': out, 'station': current, 'cores': machines, 'commands': commands}
+    return {'stations': out, 'station': current, 'cores': machines, 'commands': commands, 'archived': archived}
 
 
 def _fill_durations(cur, station, state):

@@ -272,11 +272,17 @@
     clearTimeout(loop.timer);
     if (loop.busy) return;
     loop.busy = true;
+    let again = false;
     try {
       const sent = Date.now();
       const d = await R.api(R.withStation(loop.path ? loop.path + '?cmds=' + [...watching.keys()].join(',')
         : '/api/v1/now?plays=' + loop.plays + (loop.ahead ? '&ahead=' + loop.ahead : '')));
       d.receivedAt = Date.now();
+      if (R.station && d.stations && !d.stations.some((s) => s.station === R.station)) {
+        R.pick('');                     // archived (no Core lists it): back to the most recent station
+        again = true;
+        return;
+      }
       R.last = d;
       setClock(d.clock, sent, d.receivedAt);
       fillStations(d.stations || [], d.station && d.station.station);
@@ -290,7 +296,7 @@
       if (loop.onData) loop.onData(null, e);
     } finally {
       loop.busy = false;
-      loop.timer = setTimeout(tick, document.hidden ? Math.max(loop.ms, 5000) : loop.ms);
+      loop.timer = setTimeout(tick, again ? 0 : document.hidden ? Math.max(loop.ms, 5000) : loop.ms);
     }
   }
   R.status = (ms, plays, onData, ahead, path) => { loop = Object.assign(loop, { ms, plays, onData, ahead, path }); tick(); };

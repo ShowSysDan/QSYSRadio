@@ -5,6 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/). Every change
 ships as its own version: the top section always matches `VERSION`.
 
+## [2.5.0] - 2026-10-16
+
+### Added
+- **Stations taken out of `CFG.STATIONS` are archived** instead of shown
+  offline. Every sync names all of the Core's stations, so a station of
+  that Core it no longer names, and not heard from for 10 s, is archived:
+  it leaves the Stations page, the header's drop-down and every other page
+  (a page that had it as its station falls back to the most recent one;
+  commands and settings for it are refused). The Stations page's top line
+  counts the archived stations (hover: their names and Cores) and the
+  journal logs `station=… archived: core=… no longer lists it`. Nothing is
+  deleted: its play log, library and settings stay, and once a Core lists
+  it again it is back with all of them (`listed by its Core again`). A
+  station whose Core is offline still shows OFFLINE (the Core cannot say
+  what it runs); one moved to another Core goes with it.
+  - Migration 0020: `stations.archived_at`. `control.archive_missing` runs
+    after the stations' parts of each 2.x sync, in its own transaction,
+    each station's lock first in name order. Archived stations are not
+    on their Core for analysis and fingerprinting either.
+
+Redeploy the server: `git pull && sudo systemctl restart qsysradio`
+(migration 0020; reload open panel pages). radio.lua only changed its
+version number: paste it when convenient.
 ## [2.4.2] - 2026-10-15
 
 The rest of the Dashboard's Core-outage path, found by checking 2.4.1.
