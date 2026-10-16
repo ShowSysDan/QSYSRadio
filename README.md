@@ -1,6 +1,6 @@
 # Q-SYS Radio Automation
 
-Version **2.4.2** · see [CHANGELOG.md](CHANGELOG.md)
+Version **2.5.0** · see [CHANGELOG.md](CHANGELOG.md)
 
 Radio-station automation built on a Q-SYS Core: one script runs every
 station on the Core, each station with two decks, or one for a
@@ -15,9 +15,9 @@ station settings, the library, syslog.
 | Component | State |
 |---|---|
 | `qsys/probe` — discovery script | **0.2.0** — done; section F checks file fingerprints (Crypto.Digest, io seek) on the real Core |
-| `qsys/radio` — deck controller | **2.4.2** — stable; every station on the Core from one script (two players, or one for a background-music zone), each faulted and rebuilt on its own; file analysis on analysis players of its own (nothing on air touched); file fingerprints (off by itself on a Core that cannot make them); standalone or server-linked; all features pass the MockCore suites |
-| `qsys/test` — MockCore simulator | **2.4.2** — offline Core stand-in (any number of players, analysis players, one-player zones, simulated file contents and Crypto.Digest) + a live simulated Core with several stations and zones for demos |
-| `server` — Flask + Postgres | **2.4.2** — stable; own schema, migrate-on-start, play log, control panel (with every station at a glance), shared sign-in, settings by station, per-file figures shared by every station (a file known by its fingerprint once its Core has made one), one sync a second per Core (each station its own transaction), file analysis per Core, syslog; pytest suite against real PostgreSQL |
+| `qsys/radio` — deck controller | **2.5.0** — stable; every station on the Core from one script (two players, or one for a background-music zone), each faulted and rebuilt on its own; file analysis on analysis players of its own (nothing on air touched); file fingerprints (off by itself on a Core that cannot make them); standalone or server-linked; all features pass the MockCore suites |
+| `qsys/test` — MockCore simulator | **2.5.0** — offline Core stand-in (any number of players, analysis players, one-player zones, simulated file contents and Crypto.Digest) + a live simulated Core with several stations and zones for demos |
+| `server` — Flask + Postgres | **2.5.0** — stable; own schema, migrate-on-start, play log, control panel (with every station at a glance), shared sign-in, settings by station, per-file figures shared by every station (a file known by its fingerprint once its Core has made one), one sync a second per Core (each station its own transaction), file analysis per Core, syslog; pytest suite against real PostgreSQL |
 
 ## Architecture
 
@@ -371,7 +371,13 @@ The Core always asks; nothing connects to the Core. Both requests carry
   is cached on the Core's row, see [File analysis](#file-analysis) and
   [File fingerprints](#file-fingerprints)). The database
   gone answers 503 for the whole request and the Core backs off (2 s,
-  doubling to 30 s).
+  doubling to 30 s). The body names every station of the Core's
+  `CFG.STATIONS` (faulted ones too), so a station of this Core
+  (`stations.core`) that it no longer names and that has not been heard
+  from for 10 s is archived (`stations.archived_at`, in a transaction of
+  its own after the stations' parts, each station's lock first, in name
+  order; `control.archive_missing`): hidden from the panel, its rows kept.
+  Its next part, from any Core, clears it.
 - **`POST /api/v1/core/library`, after each scan:** the station's files in
   parts of at most 1,000, `{station, boot, scan, part, parts, music_dir,
   imaging_dir, ads_dir, items: [{key, dir, file, kind, artist, title,
@@ -533,7 +539,7 @@ cd QSYSRadio
 cat VERSION
 ```
 
-Expect the version, e.g. `2.4.2`.
+Expect the version, e.g. `2.5.0`.
 
 - If `cat` says `No such file or directory`, the clone has no server: check
   that you cloned `ShowSysDan/QSYSRadio` and are on `main`
@@ -619,7 +625,8 @@ migrate: applied 0003_stations_commands_library.sql
 migrate: applied 0004_events_unique_per_station.sql
 ...
 migrate: applied 0019_file_fingerprints.sql
-migrate: schema "qsysradio" at version 0019
+migrate: applied 0020_archived_stations.sql
+migrate: schema "qsysradio" at version 0020
 ==> systemd service...
 [INFO]  Wrote /etc/systemd/system/qsysradio.service
 [INFO]  Service is running.
@@ -639,7 +646,7 @@ Keep the two `CFG` lines for step 10.
   networks, use the one the Core can reach.
 - Print the token again any time: `grep ^RADIO_API_TOKEN= ~/QSYSRadio/.env`.
 - Re-running is safe: the secrets in `.env` are kept and only pending
-  migrations run (`... at version 0019 (nothing to do)`: the number of the
+  migrations run (`... at version 0020 (nothing to do)`: the number of the
   last file in `server/migrations/`).
 - Without sudo (`./install.sh`) it sets up the venv, `.env` and the database,
   ends with `Done (no systemd service without sudo).` and prints no `CFG`
@@ -668,13 +675,13 @@ Expect:
 
 - `Active: active (running)`. `activating (auto-restart)` means it fails and
   retries every 5 s; the journal says why.
-- In the journal: `migrate: schema "qsysradio" at version 0019 (nothing to do)`
-  (install.sh already applied them), `[qsysradio] 2.4.2 starting on port
+- In the journal: `migrate: schema "qsysradio" at version 0020 (nothing to do)`
+  (install.sh already applied them), `[qsysradio] 2.5.0 starting on port
   5410 (4x8)` and gunicorn's `Listening at: http://0.0.0.0:5410`. No
   `sign-in will not work` line.
 - From curl:
   ```
-  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":19,"schema_version":19,"version":"2.4.2"}
+  {"app":"qsysradio","ok":true,"schema":"qsysradio","schema_expected":20,"schema_version":20,"version":"2.5.0"}
   ```
   An empty line instead means nothing is listening on 5410 (curl `-s` hides
   its own error): the service is not running, and the journal says why.
@@ -871,7 +878,7 @@ and the Core one analysis player or more for all of them:
    Settings page (choose it in the header first).
 7. **Check the Core.** In the script's Debug Output (times are UTC):
    ```
-   16:00:01 radio 2.4.2 starting on Core 8 Flex (<design name>)
+   16:00:01 radio 2.5.0 starting on Core 8 Flex (<design name>)
    16:00:01 Main: library: 19 music in media/Audio/Test/Tuning/, 3 imaging in media/Audio/Test/Imaging/, 0 ads in media/Audio/
    16:00:01 Studio2: library: 19 music in media/Audio/Test/Tuning/, …
    16:00:01 Lobby: library: 19 music in media/Audio/Test/Tuning/ (one player: no breaks)
@@ -882,7 +889,7 @@ and the Core one analysis player or more for all of them:
    for the whole Core prints every 30 s.
 8. **Check the server.** Within seconds, next to Transport on the
    dashboard, `· no Core connected (set CFG.SERVER_URL in radio.lua)`
-   becomes `· Main on <design name> · radio.lua 2.4.2`, and under On air "No
+   becomes `· Main on <design name> · radio.lua 2.5.0`, and under On air "No
    Core has connected yet" becomes the playing track (artist – title). The
    header's drop-down lists every station. The journal shows
    `INFO BOOT station=Main ...` and then `PLAY` lines:
@@ -919,7 +926,7 @@ cp -p ~/QSYSRadio/.env ~/qsysradio-env-$(date +%F)
 pg_restore -l ~/qsysradio-$(date +%F).dump | grep -c 'TABLE DATA'
 ```
 
-The last line prints the number of tables (12 in 2.4.2).
+The last line prints the number of tables (12 in 2.5.0).
 
 - `-n qsysradio` is required. The role may not read the rest of the database,
   and a whole-database dump fails with `permission denied`.
@@ -1018,6 +1025,11 @@ Every start (`start.sh`) does three things in order:
   Dashboard's Core-outage path fixed): the server only, as above (no
   migration), then reload open panel pages. radio.lua changed only its
   version number: paste it when convenient.
+- **From 2.4.2 to 2.5.0** (stations taken out of `CFG.STATIONS` archived):
+  the server only, as above (migration 0020), then reload open panel
+  pages. radio.lua changed only its version number: paste it when
+  convenient. A station already taken out of its Core's `CFG.STATIONS` is
+  archived within seconds of the restart.
 - Re-run `sudo ./install.sh` only when the changelog says so.
 - `.env` is not tracked by git and is kept. If `git pull` refuses because
   files were edited in the clone, `git status` shows them.
@@ -1371,7 +1383,18 @@ MockCore scenarios and `live_core.py`.
   had on air. Operators get Start, Skip and Stop (Stop asks first) per
   card, with the Dashboard's pressed / sent / done feedback and toasts
   naming the station; viewers see the page without them. The card of the
-  header's station has a cyan edge. One poll a second serves every card
+  header's station has a cyan edge. **A station taken out of its Core's
+  `CFG.STATIONS` is archived**, not shown offline: once its Core syncs
+  without it and it has not been heard from for 10 s, it leaves the
+  Stations page, the header's drop-down and every other page (a page that
+  had it as the header's station falls back to the most recent one; its
+  commands and settings are refused). The line at the top counts the
+  archived ones (hover: their names and Cores) and the journal says
+  `station=… archived`. Nothing is deleted: its play log, library and
+  settings stay, and the moment a Core lists it again (the same id) it is
+  back with all of them. A station whose Core is offline stays on the page
+  as OFFLINE (the Core cannot say what it runs); one moved to another
+  Core moves with it. One poll a second serves every card
   (`GET /api/v1/stations-overview`: at most four queries however many
   stations there are); the countdowns run on between polls.
 - **Dashboard:** a red **Station fault** banner when the Core had to stop the

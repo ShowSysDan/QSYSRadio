@@ -103,7 +103,7 @@
     }
   }
 
-  function summary(list) {
+  function summary(list, archived) {
     const n = { on: 0, stopped: 0, offline: 0, fault: 0 };
     for (const s of list) {
       if (!s.online) n.offline++;
@@ -113,7 +113,9 @@
     }
     const part = (v, word, cls) => '<span class="' + (v && cls ? cls : '') + '"><b>' + v + '</b> ' + word + '</span>';
     return part(list.length, list.length === 1 ? 'station' : 'stations') + part(n.on, 'on air', 'ok') + part(n.stopped, 'stopped') +
-      part(n.offline, 'offline', 'warn') + part(n.fault, 'faulted', 'bad');
+      part(n.offline, 'offline', 'warn') + part(n.fault, 'faulted', 'bad') +
+      (archived.length ? '<span title="No longer in their Core\'s CFG.STATIONS: hidden until listed again (' +
+        esc(archived.map((a) => a.station + (a.core ? ' on ' + a.core : '')).join(', ')) + ')"><b>' + archived.length + '</b> archived</span>' : '');
   }
 
   function render(d, err) {
@@ -133,7 +135,7 @@
           stop: q('[data-cmd="stop_now"]') });
       });
     }
-    R.setHTML(sum, summary(list));
+    R.setHTML(sum, summary(list, d.archived || []));
     list.forEach((s) => renderCard(s, cards.get(s.station)));
     tick();
   }
